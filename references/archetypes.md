@@ -1,0 +1,126 @@
+# Docs archetypes
+
+Most docs fall into one of six archetypes. Classify the docs you're given *before* fetching anything — the archetype tells you which discovery sources to try first, which to skip, and where the hidden failure modes are. Doing this wrong burns tokens on low-value crawls; doing this right often makes Phase 1 nearly free.
+
+How to use this file: read the "Recognize" bullets for each archetype against the entry URL the user gave you. Often multiple archetypes co-apply (FuseSoC is both *multi-source scattered* and has *docs-in-code* via its CLI) — pick the primary one, note any secondary archetype, and combine strategies.
+
+---
+
+## 1. Well-structured docs site
+
+A modern hosted docs site with a working search index, a version selector, a visible sidebar, and a dedicated /reference/ section.
+
+**Recognize by**: the URL is a dedicated docs host (`docs.<tool>.com`, `<tool>.dev/docs`), the landing page has a search bar and sidebar on desktop, the HTML source contains navigation links (not a JS shell), usually built with Docusaurus, Mintlify, Nextra, or similar.
+
+**Real examples**: Stripe, FastAPI, Tailwind CSS, tRPC, Prisma.
+
+**Strategy**: try `<host>/llms-full.txt` first — if present it's usually the whole corpus in one file and Phase 1 collapses to a single fetch. If not, the sitemap is reliable. You rarely need GitHub or a headless browser. OpenAPI spec is often published and worth grabbing for API references.
+
+**Pitfall**: these sites often have both "guides" (tutorials) and "reference" (API spec) as separate trees with few cross-links. Confirm both trees are in your URL set.
+
+---
+
+## 2. Sparse README + examples
+
+A small library where the entire "docs" are the README plus a `/examples/` folder. No hosted docs site, or the hosted site is a thin auto-generated API reference.
+
+**Recognize by**: docs link in repo points back to the README or to godoc.org / docs.rs (auto-generated); project has fewer than ~50 stars or is a single maintainer; `/examples` folder in repo; no `docs/` folder or only a stub.
+
+**Real examples**: most hobby CLI tools, many Rust crates with only `docs.rs`, niche Python packages.
+
+**Strategy**: GitHub-first, always. Fetch `README.md` raw, then `ls` the repo for `/examples/`, `/demo/`, `/sample/`, `/docs/` in that order. For each example file in those directories, fetch and include verbatim — the runnable code is the doc. Also check the package registry page (PyPI / npm / crates.io) — the description field there sometimes has content not in the README. Check `docs.rs/<pkg>` for Rust crates (this is usually richer than anywhere else).
+
+**Pitfall**: the README often assumes prerequisites it doesn't list. Read the examples' imports and setup to infer install and env-var requirements that are never stated.
+
+---
+
+## 3. Multi-source scattered
+
+Docs intentionally split across multiple locations — a main docs site *and* a GitHub wiki *and* READMEs in companion repos *and* inline CLI help. Often the result of an evolving project where no single source is canonical.
+
+**Recognize by**: the hosted docs site references "see the wiki" or "see the examples repo"; the GitHub repo has a `/doc/` folder distinct from the README; there's a separate "companion" tool with its own docs (e.g. FuseSoC + Edalize, Poetry + poetry-core); explicit "this section needs updating" notes in the hosted docs; multiple docs versions visible with content drift between them.
+
+**Real examples**: **FuseSoC** (see `case-study-fusesoc.md`), Yosys, Waybar, most of the Linux systems-tooling ecosystem (iwd, Hyprland plugins).
+
+**Strategy**: enumerate sources *exhaustively* before fetching anything. Typical source set:
+- Hosted docs (readthedocs / GitHub Pages): grab the sitemap and the PDF/htmlzip bundle if ReadTheDocs hosts it.
+- GitHub main repo: `README`, `/doc`, `/docs`, `NEWS`, `CHANGELOG`, `/tests/userguide` or similar "literal include" source directories.
+- GitHub wiki: `<repo>/wiki` — but beware, wikis are often semi-deprecated and just redirect to the hosted docs (don't spend tokens crawling a deprecated wiki).
+- Companion tool repos and "example template" repos (often named `<tool>-template` or `<tool>-examples`).
+- CLI help output if the tool ships a CLI.
+- Package registry page.
+
+Unify by deduplicating aggressively — the same content often appears in 2-3 places with slight edits.
+
+**Pitfall**: the #1 trap here is spending effort on one source before realizing another source has better content. Always enumerate first, *then* fetch. Also: deprecated sources lie. If the wiki homepage says "content moved to docs site," don't bother crawling it.
+
+---
+
+## 4. OpenAPI-only
+
+The "docs" are essentially just a REST API specification — maybe rendered through Swagger UI or Redoc — with little prose beyond endpoint descriptions.
+
+**Recognize by**: docs URL renders a Swagger UI or Redoc page (distinctive layout, try-it-out buttons); OpenAPI spec at `/openapi.json`, `/openapi.yaml`, `/swagger.json`, `/api-docs`; no conceptual guides, only endpoint-by-endpoint reference.
+
+**Real examples**: many internal-turned-public APIs, self-hosted tools (Miniflux), some fintech APIs, machine-generated SDK docs.
+
+**Strategy**: parse the OpenAPI spec programmatically, not the rendered Swagger UI (the UI is worthless to fetch — it's a React app that loads the spec). Every path, method, parameter, schema, and example comes out structured. For prose context — what the tool does, auth flow, how to get credentials — supplement from the landing page and the package registry description.
+
+**Pitfall**: OpenAPI specs miss non-endpoint context: rate limits, webhook formats, idempotency conventions. Those almost always live in a separate "guides" page or — commonly — only in a PDF developer guide the company sends by email. Flag these explicitly as gaps; don't silently skip.
+
+---
+
+## 5. SPA / JS-rendered
+
+The docs site is a single-page application. A plain HTTP fetch returns a near-empty HTML shell. All content is loaded client-side.
+
+**Recognize by**: raw HTML of the docs root is under ~10 KB or contains no visible links; `<div id="root">` or `<div id="app">` with nothing inside; `<noscript>` warns about JavaScript; Network tab shows XHR calls to a JSON API for content.
+
+**Real examples**: Notion-hosted docs, some Mintlify sites (though most Mintlify docs also render server-side), GitBook sites, Linear's docs, various Webflow-hosted dev docs.
+
+**Strategy**: skip straight to the config file on the repo side before reaching for a browser.
+- **Mintlify**: look for `docs.json` in the repo root — it declares the full navigation. (Pre-2025 Mintlify used `mint.json`, which is deprecated but still appears in older repos.) Also try `<host>/llms-full.txt` first — Mintlify ships this by default for many customers and it's usually the whole corpus in one file.
+- **GitBook**: sitemap usually still works even when HTML doesn't.
+- **Docusaurus**: `sidebars.js` in the repo has the structure.
+- **MkDocs**: `mkdocs.yml` in the repo has the page list.
+- **Notion-backed**: no config file exists; headless browser is the only option.
+
+If no config file is discoverable or the site isn't a known framework, use a headless browser (chrome-use, Playwright MCP, Puppeteer MCP). Be conservative: render the sidebar and the handful of pages you need, not the whole site.
+
+**Pitfall**: a headless browser can get trapped in infinite scrollers, cookie banners, or JS-driven pagination. Set a hard page-count cap and fall back to "ask the user for the sidebar HTML" if it hits the cap.
+
+**See**: `case-study-resend-spa.md` for a focused walkthrough of the probe order (`llms-full.txt` → framework config → sitemap → headless browser).
+
+---
+
+## 6. Non-English partial
+
+The docs are in a non-English language, and the entry URL points to a specific subpage rather than the section root. Common in regional fintech, e-government APIs, and tooling from non-English software ecosystems.
+
+**Recognize by**: the URL has a language segment (`/ru/`, `/zh/`, `/ja/`, `/uz/`); page content language differs from what the user's writing in; the given URL looks like a deep subpage (has 3+ path segments after the language code) without obvious sibling links rendered.
+
+**Real examples**: Didox (Uzbekistan, Russian-language fintech), many CN cloud provider APIs (Alibaba Cloud, Tencent Cloud), Russian enterprise software (1C, Yandex Cloud), various regional banking APIs.
+
+**Strategy**: combines the partial-URL handling and language preservation rules.
+- Fetch the given page *and* the section root (`<host>/<lang>/`) *and* the docs root (`<host>/`).
+- Most regional sites do render the sidebar server-side — check each of the three for link harvest before reaching for a browser.
+- Preserve all identifiers, endpoint paths, parameter names, and error codes in the original language; never translate them.
+- Translate only prose; mark first use of each translated technical term with `[EN]`.
+- Record the language in the consolidated `docs.md` header (e.g. `language: ru`) so the handoff knows to preserve conventions.
+
+**Pitfall**: auto-translation tools applied to code examples break them (they translate Python/YAML keys, string literals, etc.). Strict rule: code blocks are never translated, even when the surrounding prose is.
+
+**See**: `case-study-yandex-nonenglish.md` for the two hard decisions — choosing between parallel EN/RU versions, and preserving identifiers when prose gets translated.
+
+---
+
+## Archetype combinations
+
+Real tools often sit at the intersection of two archetypes. When you identify one, check whether a second applies, and layer the strategies:
+
+- **Multi-source + docs-in-code**: FuseSoC, Yosys — the main docs are scattered *and* a CLI help command supplements them. Harvest both; CLI help often has the single-most-detailed option descriptions.
+- **Non-English + SPA**: some Chinese cloud APIs. Apply language preservation *and* headless browser fallback.
+- **OpenAPI-only + non-English**: regional fintech APIs where the spec is auto-generated and the prose is thin and localized. Prioritize parsing the spec; supplement prose in original language.
+- **Sparse README + OpenAPI**: common for small self-hosted services. README for install/auth, OpenAPI for the actual API surface.
+
+When in doubt, default to the **multi-source scattered** strategy — it's the most thorough and wastes the fewest decisions. The cost is more fetches; the benefit is not missing a source.
