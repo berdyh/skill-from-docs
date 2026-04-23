@@ -10,7 +10,7 @@ Turn a tool's documentation into a Claude Code skill that a coding agent can use
 Two phases:
 
 1. **Harvest** — exhaustively collect the tool's documentation into one consolidated markdown file with source provenance.
-2. **Wrap** — invoke the `skill-creator` skill on the consolidated file to produce the final integration skill.
+2. **Wrap** — invoke the Anthropic `skill-creator:skill-creator` skill on the consolidated file to produce the final integration skill (or fall back to `references/integration-skill-template.md` if the plugin isn't installed).
 
 The wrapping is easy. The hard part is the harvest: a single docs URL is almost always one leaf of a larger tree, and a naive fetch misses 60–90% of the surface. The value of this skill is forcing exhaustive discovery before anything else, then enforcing a completeness check before handoff.
 
@@ -26,6 +26,23 @@ Before touching the network, get explicit answers for these four. If any are mis
 4. **Integration scope** — minimal "hello world" call, full CRUD, OAuth flow, webhook handler, production-ready setup. Don't over-scope.
 
 If the user has not provided any docs at all, ask for a URL or repo. Do not invent one.
+
+---
+
+## Phase 0.5 — Preflight tool check
+
+Before starting Phase 1, verify the tools this workflow depends on are actually available in the current session. Failing loudly here is much cheaper than failing partway through a 200-URL harvest or at the Phase 2 handoff. Check each row; if a required tool is missing, stop and report — don't improvise around it.
+
+| Tool | Required for | If missing |
+|---|---|---|
+| `WebFetch` | Phase 1 Step 2 — fetching every discovered URL | Stop. Ask the user to enable it; without it Phase 1 can't proceed. |
+| `WebSearch` | Phase 1 Step 4 — gap-filling searches | Proceed, but flag any still-empty checklist items as "couldn't verify, WebSearch unavailable" rather than guessing. |
+| Browser-automation skill or MCP (see Phase 1 Step 1 fallback list) | Phase 1 fallback for SPA / JS-rendered docs only | Proceed. Only block if Step 0 classifies the docs as SPA *and* no browser tool is available — in that case ask the user to paste the rendered sidebar HTML. |
+| `skill-creator:skill-creator` skill | Phase 2 — wrapping `docs.md` into the final skill | Proceed through Phase 1. At handoff, fall back to `references/integration-skill-template.md` and produce the target skill files directly. |
+| `sphobjinv` (optional) | Parsing ReadTheDocs `objects.inv` in Phase 1 | Skip that discovery probe. Sitemap coverage is usually sufficient. |
+| Target tool's own CLI | Phase 1 Step 1 item 7 — iterating `<tool> --help` | Skip. Fall back to reading the argparse/clap tree from the tool's source in its repo. |
+
+Record the result in one short line to the user before starting Phase 1 (e.g. "Preflight: WebFetch ✓, WebSearch ✓, skill-creator missing — will fall back at handoff"). That line makes the eventual failure modes legible rather than surprising.
 
 ---
 
@@ -78,12 +95,18 @@ For the detailed per-platform patterns (Docusaurus, Mintlify, ReadTheDocs, MkDoc
 - Most docs sites expose the full sidebar on every page — extract it from one of those three.
 - If the sidebar is client-rendered and returns empty from a plain fetch, that's the signal to use a headless browser (see below).
 
-**When to fall back to a headless browser** (chrome-use / Playwright / Puppeteer MCP):
+**When to fall back to a browser tool.** Signals:
 - Plain fetch of the docs root returns a nearly-empty HTML shell (React/Vue SPA).
 - Sitemap and llms.txt are both absent *and* sidebar links don't appear in raw HTML.
 - Docs are behind a JS-triggered auth / cookie wall.
 
-Only use the browser when plain fetch fails. It's much slower and more fragile.
+Which tool to reach for, in priority order:
+
+1. **A locally-installed browser-automation skill** — e.g. `browse`, `gstack`, or whatever appears in `available_skills`. These don't need a separate MCP handshake and are usually the fastest path when present.
+2. **A browser MCP server** if one is configured — `chrome-use`, Playwright MCP, Puppeteer MCP.
+3. **Ask the user to paste the rendered HTML** of the docs sidebar as a last resort.
+
+If multiple are available, prefer whichever is already proven in the current session (e.g. the skill you used to open a page earlier in this conversation) — it avoids re-probing that a second tool is configured correctly. Only use the browser when plain fetch fails; it's much slower and more fragile.
 
 ### Step 2 — Fetch exhaustively
 
@@ -109,7 +132,7 @@ Merge `raw/*.md` into one `docs.md`. Use the template in `references/doc-templat
 
 ### Step 4 — Completeness check
 
-Before moving to Phase 2, verify `docs.md` covers every item below. For each missing item, do targeted web search *before* giving up.
+Before moving to Phase 2, verify `docs.md` covers every item below. For each missing item, use `WebSearch` *before* giving up.
 
 - [ ] Installation — every supported method (pip / npm / cargo / brew / docker / from source)
 - [ ] Authentication and configuration — tokens, env vars, config files, OAuth flow
@@ -121,7 +144,7 @@ Before moving to Phase 2, verify `docs.md` covers every item below. For each mis
 - [ ] Gotchas the docs warn about explicitly
 - [ ] Tool version number and docs retrieval date
 
-Useful gap-filling searches: `"<tool> getting started"`, `"<tool> example <language> site:github.com"`, `"<tool> API reference"`, `"<tool> rate limit"`. Prefer official sources, then maintainer blogs, then community content. Mark every web-sourced section with its URL in the same provenance comment format.
+Useful `WebSearch` queries for gap-filling: `"<tool> getting started"`, `"<tool> example <language> site:github.com"`, `"<tool> API reference"`, `"<tool> rate limit"`. Prefer official sources, then maintainer blogs, then community content. Mark every web-sourced section with its URL in the same provenance comment format.
 
 If any checklist item is still empty after web search, surface the gap to the user before Phase 2 rather than producing a skill with silent holes.
 
@@ -129,7 +152,7 @@ If any checklist item is still empty after web search, surface the gap to the us
 
 ## Phase 2 — Create the skill
 
-Invoke the `skill-creator` skill, passing the consolidated `docs.md` as the primary input. See `references/integration-skill-template.md` for the exact target structure.
+Invoke the Anthropic `skill-creator:skill-creator` skill (installed via the official `skill-creator` plugin), passing the consolidated `docs.md` as the primary input. If that skill is not available in this session (the preflight check in Phase 0.5 will have surfaced this), fall back to `references/integration-skill-template.md` and produce the target skill directory and files directly — the template is self-contained enough for that. Either way, see that template for the exact target structure.
 
 Summary of what the output skill should look like:
 

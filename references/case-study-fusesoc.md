@@ -184,7 +184,7 @@ Surface the partial items to the user. Decide together whether to block Phase 2 
 
 ## Phase 2 — Create the skill
 
-Invoke `skill-creator` with `docs.md` as primary input. Target output:
+Invoke `skill-creator:skill-creator` (Anthropic's official skill-creator plugin) with `docs.md` as primary input. If the plugin isn't installed, fall back to `references/integration-skill-template.md` and produce the files directly. Target output:
 
 ```
 fusesoc-integration/

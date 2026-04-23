@@ -85,7 +85,7 @@ The docs site is a single-page application. A plain HTTP fetch returns a near-em
 - **MkDocs**: `mkdocs.yml` in the repo has the page list.
 - **Notion-backed**: no config file exists; headless browser is the only option.
 
-If no config file is discoverable or the site isn't a known framework, use a headless browser (chrome-use, Playwright MCP, Puppeteer MCP). Be conservative: render the sidebar and the handful of pages you need, not the whole site.
+If no config file is discoverable or the site isn't a known framework, reach for a browser tool — in priority order: a locally-installed browser-automation skill (e.g. `browse`, `gstack`), then a browser MCP (chrome-use, Playwright, Puppeteer), then asking the user to paste the rendered sidebar HTML. Be conservative: render the sidebar and the handful of pages you need, not the whole site.
 
 **Pitfall**: a headless browser can get trapped in infinite scrollers, cookie banners, or JS-driven pagination. Set a hard page-count cap and fall back to "ask the user for the sidebar HTML" if it hits the cap.
 

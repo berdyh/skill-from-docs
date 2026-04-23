@@ -19,6 +19,8 @@ The result is integration skills that are accurate, bounded in scope, and mainta
 
 ## Install
 
+**Requires** Anthropic's `skill-creator` plugin for Phase 2 handoff. Install via Claude Code's plugin marketplace (the skill falls back to writing files directly from `references/integration-skill-template.md` if the plugin isn't present, but the plugin path is the one this skill is tuned for).
+
 Clone into your Claude Code skills directory:
 
 ```sh

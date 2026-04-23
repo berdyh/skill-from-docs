@@ -54,7 +54,7 @@ Cheapest and most complete first:
 
 - URL pattern: `<project>.readthedocs.io/en/<version>/`
 - Sitemap reliably present at `<host>/sitemap.xml`.
-- `objects.inv` (Sphinx inventory) at `<host>/objects.inv` — binary, but parseable with `sphobjinv` for a full symbol list.
+- `objects.inv` (Sphinx inventory) at `<host>/objects.inv` — binary; if `sphobjinv` is installed (`pip install sphobjinv`) it yields a full symbol list. Otherwise skip — the sitemap usually covers the same ground.
 - For offline reading: `<host>/_/downloads/en/<version>/htmlzip/` gives a complete zip of the docs.
 
 ### MkDocs / Material for MkDocs
@@ -81,11 +81,13 @@ Cheapest and most complete first:
 - Sitemap and llms.txt both absent.
 - Docs are gated behind a cookie banner or auth wall that blocks WebFetch.
 
-Specific options (availability varies by Claude Code install):
-- chrome-use (Claude's Chrome extension)
-- Playwright MCP server
-- Puppeteer MCP server
-- As a last resort, ask the user to paste the rendered HTML of the nav sidebar.
+Specific options in priority order (availability varies by Claude Code install):
+
+1. **A locally-installed browser-automation skill** — e.g. `browse`, `gstack`, or whatever appears in `available_skills`. Usually the fastest because there's no MCP handshake.
+2. **A browser MCP server** if one is configured — `chrome-use` (Claude's Chrome extension), Playwright MCP, or Puppeteer MCP.
+3. **As a last resort, ask the user to paste the rendered HTML** of the nav sidebar.
+
+If multiple are available, prefer whichever is already proven in the current session — it avoids re-probing that a second tool is configured correctly.
 
 ## Deduplication
 
