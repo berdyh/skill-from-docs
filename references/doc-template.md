@@ -1,6 +1,6 @@
 # docs.md template
 
-The consolidated doc produced in Phase 1 follows this structure. Filename: `./skill-from-docs-workspace/<tool-slug>/docs.md`.
+The consolidated doc produced in Phase 1 follows this structure. Filename: `~/.claude/skill-from-docs/<tool-slug>/docs.md`.
 
 ## Required header
 
@@ -140,6 +140,29 @@ Never silently skip. The TODO markers are what the next phase and future refresh
 - Always triple-fenced with language tag.
 - Never paraphrase code. Copy byte-for-byte from the source.
 - If docs showed pseudocode, mark it `# pseudocode` in a comment.
+
+## Images
+
+Image content from the harvest gets inlined into `docs.md` next to its original reference. The per-image sidecar at `~/.claude/skill-from-docs/<tool-slug>/images/<source-slug>-<n>.md` carries the full transcription; `docs.md` carries enough to be self-contained.
+
+For images that passed the text-bearing heuristic (transcribed):
+
+```markdown
+The build pipeline has three stages, illustrated below:
+
+> **Figure 1.** Three-column flowchart. Left column "Source" feeds into middle column "Compile" (boxes labelled `parse`, `typecheck`, `codegen`); middle column feeds into right column "Output" (boxes labelled `bundle`, `minify`, `emit`). An arrow from `typecheck` loops back to `parse` labelled "errors".
+
+<!-- image: see images/build-pipeline-fig01.md (source: https://example.com/img/pipeline.png) -->
+```
+
+For decorative or icon-shaped images that did not pass the heuristic, keep the original reference and append a transclusion comment:
+
+```markdown
+![pip logo](https://example.com/pip-icon.png)
+<!-- image: skipped, decorative; see images/pip-icon-fig07.md -->
+```
+
+The intent: a downstream agent reading `docs.md` should see image-derived content as prose, not as a broken `![alt](url)` reference. The sidecar exists for skill-creator's anti-hallucination check (image-derived claims are still traceable) and for refreshes.
 
 ## Non-English docs
 

@@ -1,27 +1,37 @@
 # skill-from-docs
 
-A Claude Code skill that turns a tool's documentation into another Claude Code skill — one that teaches a coding agent to install, configure, and integrate that tool into real projects.
+A Claude Code **discovery skill** — it exhaustively harvests a tool's documentation into a consolidated markdown bundle, then hands that bundle off to `skill-creator:skill-creator` to produce the actual integration skill.
 
-Hand the skill a docs URL, a GitHub repo, or an OpenAPI spec. It exhaustively harvests the docs into a single markdown file with source provenance, then wraps that file in a structured integration skill. The output is ready to drop into `~/.claude/skills/` and use immediately.
+This skill never writes a SKILL.md itself. It does the mechanical, expensive part (find every doc page, fetch them, transcribe diagrams, dedupe, flag gaps); skill-creator's interview owns the judgement-heavy part (name, scope, body structure, references layout). Two implementations of "what a skill looks like" was the original bug, so this one stops cleanly at the boundary.
+
+Hand it a docs URL, a GitHub repo, or an OpenAPI spec. It produces a workspace at `~/.claude/skill-from-docs/<tool-slug>/` containing:
+
+- `docs.md` — every meaningful doc page consolidated, with per-section source URLs and inlined image transcriptions
+- `handoff.json` — pre-filled answers for skill-creator's interview (tool summary, declared scope, content-shape signals, coverage checklist, provenance index)
+- `images/` + `images-manifest.json` — per-image transcribed sidecars
+- `raw/` + `url-queue.json` — raw fetched pages and the URL queue (used by the "Refresh" cache option)
+
+skill-creator reads from this workspace, runs its standard interview (overriding the pre-filled answers as needed), and produces the final `~/.claude/skills/<name>/` skill.
 
 ## Why
 
-Claude Code agents are good at using well-documented tools they were trained on. They are mediocre at using tools whose docs are sparse, scattered across a readthedocs site plus a GitHub wiki plus a `/examples` folder, written in a language other than English, or rendered by a JavaScript SPA.
+Claude Code agents are good at using well-documented tools they were trained on. They are mediocre at using tools whose docs are sparse, scattered across a readthedocs site plus a GitHub wiki plus a `/examples` folder, written in a language other than English, image-heavy, or rendered by a JavaScript SPA.
 
 The core value of this skill is *discipline during harvest*:
 
 - **Classify the docs** into one of six archetypes before fetching anything, so the right discovery strategy is used first instead of last.
 - **Enumerate all sources** before crawling any of them, to avoid spending effort on the wrong one.
+- **Transcribe text-bearing diagrams** through a heuristic-gated vision pass — flowcharts and architecture sketches often carry content the prose only hints at.
 - **Preserve source URLs** per section, so the generated skill is refreshable when the upstream docs change.
-- **Verify against hallucination** after handoff — every endpoint and method in the produced skill must trace back to harvested text, or it gets deleted.
+- **Surface signals, not decisions.** The handoff packet describes what the docs contain (parallel-shaped sections, OpenAPI presence, languages used). It does not pre-decide the resulting skill's name, body length, or references layout.
 
-The result is integration skills that are accurate, bounded in scope, and maintainable.
+The result is integration skills that are accurate, bounded in scope, and maintainable — produced by skill-creator from a packet that has done the hard reading.
 
 ## Install
 
-**Requires** Anthropic's `skill-creator` plugin for Phase 2 handoff. Install via Claude Code's plugin marketplace (the skill falls back to writing files directly from `references/integration-skill-template.md` if the plugin isn't present, but the plugin path is the one this skill is tuned for).
+**Requires** Anthropic's `skill-creator` plugin. The handoff in Phase 2 is the only way this skill produces output — there is no fallback. If `skill-creator` isn't installed, the skill aborts during preflight before touching the network. Install it via Claude Code's plugin marketplace first.
 
-Clone into your Claude Code skills directory:
+Then clone into your Claude Code skills directory:
 
 ```sh
 # user-scoped (all projects)
@@ -46,34 +56,21 @@ Or more minimally:
 > Make a skill from these docs: <url>
 ```
 
-The skill will confirm four things before touching the network (tool name, entry URL/repo, target language, integration scope), then run the two-phase workflow. Output goes into `./skill-from-docs-workspace/<tool-slug>/` during work and produces a ready-to-install integration skill at the end.
+The skill will confirm four things before touching the network (tool name, entry URL/repo, target language, integration scope), then run the harvest. All workspace artifacts live at `~/.claude/skill-from-docs/<tool-slug>/` — never in the current project directory. Re-running against the same tool surfaces the existing workspace and lets you choose **re-use** (default), **refresh** (re-fetch using cached URL queue), or **start clean** (wipe and re-harvest from scratch).
 
-## What it produces
-
-For a tool called `<X>`, you end up with a skill shaped like:
-
-```
-<X>-integration/
-├── SKILL.md                 # install → auth → minimal example → patterns → troubleshooting
-└── references/
-    ├── api.md               # the full harvested docs, with source provenance per section
-    └── examples/            # runnable code examples, if multiple
-```
-
-Every claim in `SKILL.md` traces back to a section in `references/api.md`. Every section in `references/api.md` carries a `<!-- source: <url> retrieved: <date> -->` comment, so when the upstream docs change you can re-fetch just the affected sections and diff.
+When the harvest is done, skill-creator is invoked against the workspace path. Its interview produces the final skill at `~/.claude/skills/<name>/`. The harvest workspace stays around as the audit trail and the basis for future refreshes.
 
 ## Anatomy
 
 ```
 skill-from-docs/
-├── SKILL.md                                  # main workflow: classify → harvest → wrap → verify
+├── SKILL.md                                  # main workflow: classify → harvest → handoff
 ├── README.md
 ├── LICENSE
 └── references/
     ├── archetypes.md                         # six docs archetypes + per-archetype strategy
     ├── discovery.md                          # per-platform patterns (ReadTheDocs, Mintlify, ...)
     ├── doc-template.md                       # structure for the consolidated docs.md
-    ├── integration-skill-template.md         # structure for the output skill
     ├── case-study-fusesoc.md                 # deep walkthrough: multi-source scattered
     ├── case-study-resend-spa.md              # vignette: SPA / JS-rendered
     └── case-study-yandex-nonenglish.md       # vignette: non-English partial
@@ -96,9 +93,10 @@ Full recognition signals and strategies in `references/archetypes.md`.
 
 ## Limits
 
-- This skill covers harvesting and wrapping. It does not cover running the produced skill, evaluating its quality quantitatively, or iterating it against a test set — for those, use `skill-creator` directly on the harvested `docs.md`.
+- This skill covers harvesting only. It does not produce a SKILL.md, choose an output structure, or evaluate the resulting skill — those live in `skill-creator`.
 - Docs that are truly private (behind SSO, not on the public internet) are out of scope; the skill will surface the access problem rather than try to bypass it.
 - Harvesting is bounded by a completeness checklist, not infinite crawling. If a section is genuinely undocumented upstream, the skill flags it with a `TODO` marker rather than inventing content.
+- Image extraction is heuristic-gated. Decorative icons are skipped; diagrams and figures get a vision pass. The heuristic is conservative — if a diagram is missed, refresh and the user can flag it.
 
 ## Contributing
 

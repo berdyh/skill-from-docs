@@ -1,18 +1,18 @@
 ---
 name: skill-from-docs
-description: Build a new Claude Code skill from a tool or library's documentation so a coding agent can install, configure, and integrate that tool into other projects. Use whenever the user provides a docs URL, a GitHub repo, a library name, or an OpenAPI spec and wants a reusable integration skill — phrases like "make a skill from these docs", "turn this API's docs into a skill", "I want a skill for integrating <tool>", "read the docs for <library> and build a skill", or pasting a single docs subpage and asking for full coverage. Also triggers when the docs are partial, multi-page, JS-rendered, or in a non-English language and require crawling, headless-browser rendering, or web-search supplementation to be complete before a skill can be written.
+description: Exhaustively harvest a tool or library's documentation into a consolidated markdown bundle (including image-text extraction) and hand it off to `skill-creator:skill-creator`, which then produces the actual integration skill. Use whenever the user provides a docs URL, a GitHub repo, a library name, or an OpenAPI spec and wants a reusable integration skill — phrases like "make a skill from these docs", "turn this API's docs into a skill", "I want a skill for integrating <tool>", "read the docs for <library> and build a skill", or pasting a single docs subpage and asking for full coverage. Also triggers when the docs are partial, multi-page, JS-rendered, image-heavy, or in a non-English language and require crawling, headless-browser rendering, vision, or web-search supplementation to be complete before a skill can be written. This skill is discovery-only: it never produces a SKILL.md itself; that decision belongs to skill-creator.
 ---
 
 # skill-from-docs
 
-Turn a tool's documentation into a Claude Code skill that a coding agent can use to integrate that tool into other projects.
+Exhaustively harvest a tool's documentation, then hand the result off to `skill-creator:skill-creator` to produce the actual integration skill.
 
 Two phases:
 
-1. **Harvest** — exhaustively collect the tool's documentation into one consolidated markdown file with source provenance.
-2. **Wrap** — invoke the Anthropic `skill-creator:skill-creator` skill on the consolidated file to produce the final integration skill (or fall back to `references/integration-skill-template.md` if the plugin isn't installed).
+1. **Harvest** — collect every meaningful page of the tool's documentation into one consolidated markdown file with source provenance, plus a transcribed sidecar for any text-bearing images.
+2. **Handoff** — invoke `skill-creator:skill-creator` against the harvested workspace. skill-creator decides the resulting skill's name, structure, and body. This skill never writes a SKILL.md.
 
-The wrapping is easy. The hard part is the harvest: a single docs URL is almost always one leaf of a larger tree, and a naive fetch misses 60–90% of the surface. The value of this skill is forcing exhaustive discovery before anything else, then enforcing a completeness check before handoff.
+This split is deliberate. Harvesting is the hard, mechanical part — a single docs URL is almost always one leaf of a larger tree, and a naive fetch misses 60–90% of the surface. Skill structuring is judgement-heavy and skill-creator already owns it through its progressive-disclosure interview. Two implementations of "what a skill looks like" is one too many, so this skill pre-decides nothing about the output skill. It only describes what the docs contain; skill-creator's interview decides what the skill becomes.
 
 ---
 
@@ -31,24 +31,68 @@ If the user has not provided any docs at all, ask for a URL or repo. Do not inve
 
 ## Phase 0.5 — Preflight tool check
 
-Before starting Phase 1, verify the tools this workflow depends on are actually available in the current session. Failing loudly here is much cheaper than failing partway through a 200-URL harvest or at the Phase 2 handoff. Check each row; if a required tool is missing, stop and report — don't improvise around it.
+Before starting Phase 1, verify the tools this workflow depends on are actually available in the current session, and check whether a previous harvest of this tool already exists. Failing loudly here is much cheaper than failing partway through a 200-URL harvest, and catching a cached workspace prevents re-harvesting the same docs for the third time this week.
+
+### Tool checks
+
+Check each row; if a required tool is missing, stop and report — don't improvise around it.
 
 | Tool | Required for | If missing |
 |---|---|---|
-| `WebFetch` | Phase 1 Step 2 — fetching every discovered URL | Stop. Ask the user to enable it; without it Phase 1 can't proceed. |
+| `WebFetch` | Phase 1 Step 2 — fetching every discovered URL | **Hard fail.** Without it Phase 1 can't proceed. Ask the user to enable it and abort. |
+| `skill-creator:skill-creator` skill | Phase 2 — handoff that produces the actual skill | **Hard fail.** This skill is discovery-only; without skill-creator there is no destination for the harvest. Abort with this exact message: *"skill-creator plugin is required. Install it (e.g. via `claude plugin install skill-creator`), then re-run /skill-from-docs. Aborting before any harvest runs to avoid wasted work."* Do not produce a partial skill. Do not write any harvest artifacts. There is no fallback template. |
 | `WebSearch` | Phase 1 Step 4 — gap-filling searches | Proceed, but flag any still-empty checklist items as "couldn't verify, WebSearch unavailable" rather than guessing. |
 | Browser-automation skill or MCP (see Phase 1 Step 1 fallback list) | Phase 1 fallback for SPA / JS-rendered docs only | Proceed. Only block if Step 0 classifies the docs as SPA *and* no browser tool is available — in that case ask the user to paste the rendered sidebar HTML. |
-| `skill-creator:skill-creator` skill | Phase 2 — wrapping `docs.md` into the final skill | Proceed through Phase 1. At handoff, fall back to `references/integration-skill-template.md` and produce the target skill files directly. |
+| Vision-capable Read on saved images | Phase 1 Step 2.5 — image-text extraction | Proceed but skip Step 2.5; flag any image-heavy archetypes (2/3/6) in the handoff packet so skill-creator knows the diagrams were not transcribed. |
 | `sphobjinv` (optional) | Parsing ReadTheDocs `objects.inv` in Phase 1 | Skip that discovery probe. Sitemap coverage is usually sufficient. |
 | Target tool's own CLI | Phase 1 Step 1 item 7 — iterating `<tool> --help` | Skip. Fall back to reading the argparse/clap tree from the tool's source in its repo. |
 
-Record the result in one short line to the user before starting Phase 1 (e.g. "Preflight: WebFetch ✓, WebSearch ✓, skill-creator missing — will fall back at handoff"). That line makes the eventual failure modes legible rather than surprising.
+The two hard-fail rows are non-negotiable. The skill-creator hard-fail is the single most important policy in this skill: any local fallback that produces a SKILL.md re-encodes structural decisions that conflict with skill-creator's progressive-disclosure design, and a 200-URL harvest with no destination is wasteful — both are prevented by failing fast here.
+
+### Cache detection
+
+Compute the workspace path: `~/.claude/skill-from-docs/<tool-slug>/`. Slug convention: `<host>-<path-tail>` based on the entry-point URL, so two unrelated tools that share a name (e.g. two GitHub repos both named `agent-tools`) end up at distinct paths. Examples:
+
+- `https://github.com/humanlayer/12-factor-agents/tree/main/content` → `github.com-humanlayer-12-factor-agents/`
+- `https://docs.stripe.com/api` → `docs.stripe.com/`
+- `https://api-docs.didox.uz/ru/integration-registration` → `api-docs.didox.uz/`
+
+If the workspace path already exists, read its `harvest_metadata.retrieved_date` from `handoff.json` (or `mtime` of `docs.md` as a fallback) and prompt the user with three options:
+
+1. **Re-use cached harvest** (default) — skip Phase 1 entirely, jump to Phase 2 handoff. Fast, free.
+2. **Refresh** — re-fetch every URL from the cached URL queue, but skip rediscovery. Medium speed.
+3. **Start clean** — wipe the workspace and re-harvest from scratch. Slowest; only when the cache is known stale or the source moved.
+
+Never silently re-harvest. Cache hits are the common case; surface them.
+
+### Preflight summary
+
+Record the result in one short line before starting Phase 1, e.g. *"Preflight: WebFetch ✓, skill-creator ✓, WebSearch ✓, vision ✓; no existing workspace — fresh harvest"* or *"Preflight: tools ✓; existing workspace from 2026-04-12, re-using"*. That line makes the eventual failure modes (and cache decisions) legible rather than surprising.
 
 ---
 
 ## Phase 1 — Harvest
 
-Target output: `./skill-from-docs-workspace/<tool-slug>/docs.md` — one consolidated file with every meaningful subsection, each annotated with its source URL.
+Target workspace: `~/.claude/skill-from-docs/<tool-slug>/` — a user-scoped, deterministic directory created on first run. **Never use a relative path or write into the current project directory.** The harvest must not pollute the user's working repo; cross-project re-use of cached harvests depends on this canonical location.
+
+Slug rules: `<host>-<path-tail>` based on the entry-point URL host (so two GitHub repos named `agent-tools` don't collide). Disambiguator examples are listed in Phase 0.5 cache detection.
+
+Workspace layout at the end of Phase 1:
+
+```
+~/.claude/skill-from-docs/<tool-slug>/
+├── docs.md                  # consolidated harvest with provenance + inlined image transcriptions
+├── handoff.json             # pre-filled answers for skill-creator's interview (Step 5)
+├── images/                  # per-image transcribed sidecars
+│   ├── <slug>-fig01.md
+│   └── ...
+├── images-manifest.json     # image → source URL → docs.md anchor map
+├── raw/                     # raw fetched pages (kept for refresh + audit)
+│   └── <slug>.md
+└── url-queue.json           # discovered URLs (used by "Refresh" cache option)
+```
+
+Lifecycle: workspaces persist after handoff. Two reasons — a future refresh against upstream changes is cheap when the cache exists, and the workspace is the audit trail for skill-creator's anti-hallucination check. Cleanup is never automatic; users own deletion (`rm -rf ~/.claude/skill-from-docs/<tool-slug>/`). Workspaces are typically <50 MB; aggressive eviction isn't worth the risk of nuking a working set the user wanted to refresh.
 
 ### Step 0 — Classify the docs
 
@@ -67,7 +111,7 @@ Read `references/archetypes.md` for the recognition signals, real-world examples
 
 For fully worked walkthroughs on realistic cases, the `references/` directory contains:
 
-- `case-study-fusesoc.md` — deep walkthrough of the *multi-source scattered* archetype, end-to-end across all four steps. Read this before attempting multi-source cases; it teaches decisions the rules can't capture.
+- `case-study-fusesoc.md` — deep walkthrough of the *multi-source scattered* archetype, end-to-end through the harvest. Read this before attempting multi-source cases; it teaches decisions the rules can't capture.
 - `case-study-resend-spa.md` — focused vignette on the *SPA / JS-rendered* archetype. Covers the probe order that prevents the common "reach for a headless browser too early" mistake.
 - `case-study-yandex-nonenglish.md` — focused vignette on the *non-English partial* archetype. Covers the parallel-language-version decision and identifier preservation.
 
@@ -110,24 +154,53 @@ If multiple are available, prefer whichever is already proven in the current ses
 
 ### Step 2 — Fetch exhaustively
 
-Run the URL queue from Step 1. For each URL:
+Run the URL queue from Step 1. Persist the queue to `~/.claude/skill-from-docs/<tool-slug>/url-queue.json` so the "Refresh" cache option in Phase 0.5 can re-use it. For each URL:
 
 1. Fetch it (WebFetch, or headless browser if needed).
-2. Save the raw content to `./skill-from-docs-workspace/<tool-slug>/raw/<slug>.md`.
-3. Scan the fetched content for newly-referenced doc URLs (inline links, "see also", API-reference cross-links).
-4. Add any new same-host doc URLs to the queue.
+2. Save the raw content to `~/.claude/skill-from-docs/<tool-slug>/raw/<slug>.md`.
+3. Scan the fetched content for newly-referenced doc URLs (inline links, "see also", API-reference cross-links). Add any new same-host doc URLs to the URL queue.
+4. **Also collect every image reference** — `![alt](url)`, `<img src>`, and any markdown links pointing at `.png|.jpg|.jpeg|.gif|.webp|.svg`. Append each to a separate `image-queue` (with the alt text and a few sentences of surrounding prose for context). Step 2.5 will work that queue.
 
-Stop when a full pass over the queue produces no new URLs. Many docs sites split "guides" and "reference" into separate trees with few internal links — confirm both trees are covered. If the tool has an OpenAPI spec, parse it and make sure every path and schema has a home in the consolidated doc.
+Stop when a full pass over the URL queue produces no new URLs. Many docs sites split "guides" and "reference" into separate trees with few internal links — confirm both trees are covered. If the tool has an OpenAPI spec, parse it and make sure every path and schema has a home in the consolidated doc.
+
+### Step 2.5 — Image extraction (heuristic-gated)
+
+Many tools' docs lean on diagrams (architecture sketches, sequence diagrams, flowcharts, screenshots with annotated callouts) for content that the prose only hints at. Skipping these silently drops content that is often more dense than the surrounding text. But pushing every favicon and decorative banner through vision is wasteful, so gate carefully.
+
+**Step 2.5 is skipped entirely** when Step 0 classified the docs as **Archetype 4 (OpenAPI-only)** — those docs almost never carry diagram content; what looks like an "endpoint icon" is decorative.
+
+**For all other archetypes:**
+
+1. Walk the `image-queue` from Step 2.
+2. For each image, apply the **text-bearing heuristic** — trigger the vision pass if *any* of these match:
+   - Filename contains `diagram`, `figure`, `fig`, `chart`, `flow`, `arch`, `sequence`, `architecture`, `topology`.
+   - Alt text length > 30 characters (decorative icons usually have ≤ 10-char alts or empty alts).
+   - Image is referenced from prose containing "see figure", "as shown", "diagram below", "the following diagram", "illustrated above/below".
+   - HTTP HEAD reports `Content-Length` > 30 KB (decorative icons are typically ≤ 20 KB).
+3. **Archetype-aware budget tightening:**
+   - Archetypes 1 (well-structured) and 5 (SPA): if the image-queue exceeds 50 entries and the heuristic matches < 25 % of them, only run the vision pass on heuristic matches and capture alt+caption-only for the rest.
+   - Archetypes 2 (sparse), 3 (multi-source), and 6 (non-English): run vision on every heuristic match without further budget gating — these archetypes lean heaviest on diagrams.
+4. For each image flagged for vision:
+   1. Fetch the image with WebFetch and save to `~/.claude/skill-from-docs/<tool-slug>/images/_raw/<n>.<ext>`.
+   2. Open it with the multimodal `Read` tool to produce a transcription. Capture: visible text (verbatim, including labels on arrows and box titles), structural description ("3-column flowchart, left column 'Input', middle 'Process', right 'Output'"), any code or tables embedded in the image.
+   3. Write `images/<source-slug>-<n>.md` with sections: `source_url`, `alt_text`, `caption_context` (the surrounding prose from Step 2), and `transcription`.
+5. For images that fail the heuristic, write `images/<source-slug>-<n>.md` with only `source_url`, `alt_text`, `caption_context`, and `transcription: <skipped: did not pass text-bearing heuristic>`.
+6. Maintain `images-manifest.json`: an array of `{image_url, local_text_path, referenced_in_section, has_text_content}` records, one per image in the queue. Step 5 hands this off.
+
+**Inlining into `docs.md` happens in Step 3** — Step 2.5 only produces the per-image sidecars and the manifest.
+
+If the multimodal Read tool was missing in preflight, skip steps 4–5 entirely and record every image in the manifest with `has_text_content: unknown`. The handoff packet flags this so skill-creator knows the diagrams were not transcribed.
 
 ### Step 3 — Consolidate
 
-Merge `raw/*.md` into one `docs.md`. Use the template in `references/doc-template.md`. Core rules:
+Merge `raw/*.md` into one `docs.md` at `~/.claude/skill-from-docs/<tool-slug>/docs.md`. Use the template in `references/doc-template.md`. Core rules:
 
 - **Provenance.** Every top-level section ends with `<!-- source: <url> retrieved: <YYYY-MM-DD> -->`. This is what makes the skill refreshable later when the upstream docs change.
 - **Version + date header.** Top of the file records tool version (if known), docs site version, retrieval date, and docs language (e.g. `language: ru` if non-English).
 - **Code verbatim.** Never paraphrase code. Copy examples byte-for-byte. Correctness depends on exact identifier names, quoting, import paths.
 - **Prose, tighten.** Deduplicate auth boilerplate that repeats on every page. Strip marketing copy. Keep the technical substance.
 - **Language preservation.** If docs are non-English, keep identifiers, parameter names, endpoint paths, and error codes in the original. Translate only prose needed for comprehension, and mark translations with `[EN]`.
+- **Inline image transcriptions.** For every image referenced in `docs.md`, replace the original `![alt](url)` with the transcription text from `images/<source-slug>-<n>.md` (the `transcription` field), then immediately follow it with `<!-- image: see images/<source-slug>-<n>.md (source: <image_url>) -->`. This keeps `docs.md` self-contained for skill-creator while preserving the path back to the per-image sidecar. For images that did not pass the heuristic, leave the original `![alt](url)` and append `<!-- image: skipped, decorative; see images/<source-slug>-<n>.md -->`.
 - **Flag gaps explicitly.** Where a topic is referenced but not documented, leave `<!-- TODO: no official coverage of <topic>; see <source-hint> -->` so the next phase sees the gap instead of silently skipping it.
 
 ### Step 4 — Completeness check
@@ -146,29 +219,50 @@ Before moving to Phase 2, verify `docs.md` covers every item below. For each mis
 
 Useful `WebSearch` queries for gap-filling: `"<tool> getting started"`, `"<tool> example <language> site:github.com"`, `"<tool> API reference"`, `"<tool> rate limit"`. Prefer official sources, then maintainer blogs, then community content. Mark every web-sourced section with its URL in the same provenance comment format.
 
-If any checklist item is still empty after web search, surface the gap to the user before Phase 2 rather than producing a skill with silent holes.
+If any checklist item is still empty after web search, surface the gap to the user before Step 5 rather than handing off a packet with silent holes.
+
+### Step 5 — Build the handoff packet
+
+The harvest itself is now complete. Before invoking skill-creator, materialise a single JSON file at `~/.claude/skill-from-docs/<tool-slug>/handoff.json` that pre-fills the answers skill-creator's interview will ask. The handoff packet's job is to *describe* what was found in the docs — never to *decide* what the resulting skill looks like.
+
+Fields:
+
+- `version: 1` — handoff format version. Bump if fields change so skill-creator can branch on it.
+- `proposed_name` — `<tool-slug>-integration` as a *suggestion only*. skill-creator may rename during interview.
+- `tool_summary` — one paragraph pulled from the harvested docs explaining what the tool is and what problem it solves. Verbatim from the docs where possible.
+- `user_declared_scope` — verbatim from Phase 0 question 4 (e.g. "minimal create-payment-intent flow", "full OAuth + webhooks", "production-ready Node SDK setup").
+- `user_declared_languages` — from Phase 0 question 3 (array, e.g. `["python"]` or `["language-agnostic"]`).
+- `archetype_primary`, `archetype_secondary` — source-shape archetype IDs from Step 0 (1–6).
+- `content_shape_signals` — **neutral observations only**. Examples of acceptable signals: `top_level_h2_count`, `repeated_factor_like_sections: 15` (when the docs have 15 parallel-shaped chapters), `repeated_endpoint_like_sections`, `repeated_module_like_sections`, `has_openapi_spec`, `multi_language_docs`, `code_block_languages: ["python", "typescript"]`. **Do not** decide "this is N independent variants" or "this should be split per-resource"; that's skill-creator's call. Surface the signal; let the interview interpret.
+- `coverage_checklist` — Step 4 checklist with each item marked `covered`, `partial`, or `missing` plus the source URL(s).
+- `gap_list` — explicit unresolved gaps from Step 4, even after WebSearch. Empty array if none.
+- `provenance_index` — map of `docs.md` H2 section → list of source URLs. Used by skill-creator for its own anti-hallucination check.
+- `image_inventory` — array of `{image_url, local_text_path, referenced_in_section, has_text_content}` derived from `images-manifest.json`.
+- `suggested_test_cases` — 3–5 trigger phrases pulled from the docs ("create a payment intent", "add OAuth to my Express app", etc.), each marked as a *suggestion* not a directive.
+- `harvest_metadata` — `{retrieved_date, tool_version, raw_page_count, docs_md_token_count}`.
+
+Also update `images-manifest.json` to reflect the final state (any images excluded after the heuristic pass should be present with `has_text_content: false`).
+
+The full workspace at this point matches the layout in the Phase 1 intro. Hand off to Phase 2.
 
 ---
 
-## Phase 2 — Create the skill
+## Phase 2 — Handoff
 
-Invoke the Anthropic `skill-creator:skill-creator` skill (installed via the official `skill-creator` plugin), passing the consolidated `docs.md` as the primary input. If that skill is not available in this session (the preflight check in Phase 0.5 will have surfaced this), fall back to `references/integration-skill-template.md` and produce the target skill directory and files directly — the template is self-contained enough for that. Either way, see that template for the exact target structure.
+This skill never writes a SKILL.md. The handoff is a single invocation:
 
-Summary of what the output skill should look like:
+> Invoke `skill-creator:skill-creator` with `workspace_path=~/.claude/skill-from-docs/<tool-slug>/` (absolute path). The packet at that path contains `docs.md`, `handoff.json`, `images/`, `images-manifest.json`, and `raw/`. Treat `handoff.json` as pre-filled answers to the standard interview — confirm or override each with the user, but do not skip the interview. Do not pass `docs.md` as a blob — pass the path.
 
-- **Name**: `<tool-slug>-integration` (e.g. `stripe-integration`, `didox-integration`).
-- **Description** (for triggering): covers phrases like "integrate <tool>", "use <tool> in <language>", "set up <tool>", "add <tool> to my project". Include the specific language(s) actually covered.
-- **Body**, kept under ~400 lines, structured as:
-  1. Install
-  2. Authentication / configuration
-  3. Minimal working example (copy-paste-runnable)
-  4. Common integration patterns (3–5 realistic recipes)
-  5. Troubleshooting / common errors
-- **Bundled reference**: include `docs.md` as `references/api.md` in the produced skill so a using-agent has the full source of truth when the SKILL.md body is not detailed enough.
+If skill-creator's interview always starts cold (no workspace-path channel exists yet), tell the user this verbatim: *"skill-creator will ask you four questions next. The answers are pre-filled in `~/.claude/skill-from-docs/<tool-slug>/handoff.json` — `proposed_name`, `tool_summary`, `user_declared_scope`, `user_declared_languages`, plus content_shape_signals and provenance_index. Paste from there as it asks."*
 
-### Anti-hallucination verification
+**Do not pre-decide for skill-creator:**
+- The skill's name (only suggested).
+- The skill's body structure (number/order of H2 sections).
+- Whether references are monolithic (`references/api.md`) or split per variant (`references/factor-01.md`, `references/factor-02.md`, …). The `content_shape_signals` describe; skill-creator decides.
+- Which "common patterns" or recipes appear in the body.
+- The trigger description (only suggested phrases).
 
-After `skill-creator` produces the skill, read the whole SKILL.md and every reference file and check: is every endpoint, method name, parameter, env var, and error code traceable to a section in the harvested `docs.md`? If not, delete it. This is the single most important quality gate — generated integration skills fail in production when they reference APIs the tool does not actually have.
+**Hand-off note: anti-hallucination check.** After skill-creator produces the skill, it should walk every endpoint, method name, parameter, env var, and error code in the produced files and confirm each is traceable to a section in the harvested `docs.md` via `provenance_index`. Anything that fails this trace was hallucinated and must be removed. The handoff packet's `provenance_index` makes this check mechanical. This is the single most important quality gate downstream — but it lives in skill-creator's process, not here. (When skill-creator is missing, Phase 0.5 has already aborted, so we never reach this point with an undefined destination.)
 
 ---
 
@@ -178,6 +272,9 @@ After `skill-creator` produces the skill, read the whole SKILL.md and every refe
 - **Inventing endpoints or parameters** that "should probably exist" by analogy to similar tools. Not in docs → not in skill.
 - **Paraphrasing code examples.** Correctness depends on exact form. Copy verbatim.
 - **Dropping source language.** Silently translating identifiers or error codes breaks the skill. Keep originals, annotate with `[EN]` where helpful.
-- **Skipping the completeness check.** Missing auth or install sections make the final skill unusable.
-- **Over-scoping the final skill.** A skill covering "everything" is worse than one covering the user's declared integration scope well.
+- **Skipping the completeness check.** Missing auth or install sections make the handoff packet unusable downstream.
+- **Pre-deciding output shape during harvest.** This skill describes signals; skill-creator's interview decides structure. Do not collapse 15 parallel chapters into one section because "the body should be ~400 lines"; do not split a single API into per-resource files because "this looks like multiple variants". Surface the signals in `content_shape_signals` and let skill-creator interpret.
+- **Skipping image extraction on text-bearing diagrams.** A diagram with arrows, labels, or transcribed code is content, not decoration. Run the heuristic; trust it. The opposite mistake — running vision on every favicon — is what the heuristic exists to prevent.
+- **Writing harvest artifacts to a relative path.** Always write to `~/.claude/skill-from-docs/<tool-slug>/`. Relative paths pollute whichever project the user happens to be in and orphan the cache.
+- **Producing a SKILL.md as a fallback.** There is no fallback. If skill-creator is missing, Phase 0.5 aborts. Local fallback templates re-encode structural decisions that conflict with skill-creator and are how this skill ended up over-stepping in the first place.
 - **Scraping before discovery.** Slower, incomplete, and wastes tokens on the same sidebar HTML repeatedly.
