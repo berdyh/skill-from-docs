@@ -105,7 +105,7 @@ CLI      fusesoc --help; fusesoc <each subcommand> --help
 
 ## Phase 1, Step 2 — Fetch exhaustively
 
-Execute the list. Save each to `./skill-from-docs-workspace/fusesoc/raw/<slug>.md`.
+Execute the list. Save each to `~/.claude/skill-from-docs/readthedocs.io-fusesoc/raw/<slug>.md`.
 
 Watch for these during fetch:
 - **Version conflict.** ReadTheDocs has `stable` pinned at v2.4.5, `latest` at `2.4.5.devNN+g…`. Pick `stable` as canonical and note the dev version only in a "bleeding edge features" annotation. Do not mix content from both into the same section — that's how ghost features end up in the skill.
@@ -182,52 +182,32 @@ Surface the partial items to the user. Decide together whether to block Phase 2 
 
 ---
 
-## Phase 2 — Create the skill
+## Phase 2 — Handoff
 
-Invoke `skill-creator:skill-creator` (Anthropic's official skill-creator plugin) with `docs.md` as primary input. If the plugin isn't installed, fall back to `references/integration-skill-template.md` and produce the files directly. Target output:
+This case study illustrates discovery and harvest only. Phase 2 (the actual skill) belongs to `skill-creator:skill-creator`, invoked against the harvested workspace.
+
+What this skill produces at the end of Phase 1:
 
 ```
-fusesoc-integration/
-├── SKILL.md
-└── references/
-    ├── api.md            # the full docs.md, preserved
-    └── examples/
-        └── blinky.core   # the canonical minimal example
+~/.claude/skill-from-docs/readthedocs.io-fusesoc/
+├── docs.md                  # consolidated harvest with provenance
+├── handoff.json             # pre-filled answers for skill-creator's interview
+├── images/                  # transcribed sidecars for any diagrams
+├── images-manifest.json
+├── raw/                     # one file per fetched URL
+└── url-queue.json
 ```
 
-**SKILL.md frontmatter:**
+A `handoff.json` for FuseSoC would carry signals like:
 
-```yaml
----
-name: fusesoc-integration
-description: Integrate FuseSoC — the HDL package manager and build system — into Python projects. Covers pip install, writing .core files (CAPI2 YAML schema), using FuseSoC as a Python library to configure and run simulations (Icarus, Verilator, VHDL flows), managing local and remote core libraries, and the VLNV naming scheme. Use whenever the user wants to "integrate FuseSoC", "use FuseSoC from Python", "set up an HDL build pipeline", "run simulations programmatically", or asks how to work with .core files or CAPI2 schema.
----
-```
+- `archetype_primary: 3` (multi-source scattered), `archetype_secondary: 1` (well-structured docs site, partial)
+- `content_shape_signals` describing parallel patterns observed (e.g. `repeated_module_like_sections: 0`, `has_openapi_spec: false`, `code_block_languages: ["python", "yaml", "bash"]`, `top_level_h2_count: 12`) — neutral observations, no decision about output structure
+- `coverage_checklist` with the version-conflict and partial-error-code gaps marked explicitly
+- `provenance_index` mapping each consolidated section back to its ReadTheDocs / GitHub source URL — this is what skill-creator uses for its own anti-hallucination check
 
-**SKILL.md body, in order**:
+**Critical:** the case study does not — and must not — pre-decide that the FuseSoC skill should have seven body sections in that order, or that there should be a `references/examples/blinky.core`, or that the trigger description should mention "integrate FuseSoC". Those are outputs of skill-creator's interview, informed by the signals above. Two implementations of "what a skill looks like" was the bug; this case study now stops at the boundary.
 
-1. **What this integrates** — FuseSoC as a Python library for HDL build orchestration. Scope is simulation configuration; synthesis and Edalize usage are out of scope (link to `references/api.md` for full surface).
-2. **Install** — pip primary, Windows PATH note.
-3. **Authenticate** — N/A, with the remote-library git-credential caveat.
-4. **Minimal working example** — the `fusesocotb` quickstart, copy-paste-runnable.
-5. **Common patterns** — three: (a) adding a local core library, (b) running a simulation target from Python, (c) handling a dependency tree with `core-info`.
-6. **Troubleshooting** — the knowledgebase entries, CAPI1→CAPI2 migration, `.system` file deprecation.
-7. **Reference** — pointer to `references/api.md`.
-
-### Anti-hallucination verification pass
-
-Before declaring done, read the produced skill end-to-end and cross-check every claim against `references/api.md`:
-
-- Every CLI flag mentioned in SKILL.md exists in the captured CLI help output.
-- Every Python API call mentioned in SKILL.md (e.g. `from fusesoc.config import Config`) traces to a real import path in the repo.
-- Every `.core` file key used in examples exists in the CAPI2 schema section.
-- No invented YAML keys, no invented CLI subcommands, no version-drifted features (e.g. a feature only in `latest`/dev that's not in `stable`).
-
-Delete anything that doesn't trace. Add the verification comment at the top of SKILL.md:
-
-```markdown
-<!-- verified: all references traceable to references/api.md as of YYYY-MM-DD -->
-```
+skill-creator's own anti-hallucination pass (using `provenance_index`) catches version-drifted features, invented CLI flags, and ghost YAML keys. That pass lives in skill-creator, not here.
 
 ---
 
