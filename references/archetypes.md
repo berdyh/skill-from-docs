@@ -58,15 +58,37 @@ Unify by deduplicating aggressively — the same content often appears in 2-3 pl
 
 ## 4. OpenAPI-only
 
-The "docs" are essentially just a REST API specification — maybe rendered through Swagger UI or Redoc — with little prose beyond endpoint descriptions.
+The "docs" are essentially a REST API specification rendered through a JS-based viewer, with little prose beyond endpoint descriptions. The spec is the doc; everything else is supplementary.
 
-**Recognize by**: docs URL renders a Swagger UI or Redoc page (distinctive layout, try-it-out buttons); OpenAPI spec at `/openapi.json`, `/openapi.yaml`, `/swagger.json`, `/api-docs`; no conceptual guides, only endpoint-by-endpoint reference.
+**Recognize by**: a docs URL that renders one of the standard OpenAPI viewers. View-source signatures, one-liner each:
+- **Swagger UI**: `<script>` with `SwaggerUIBundle({` or `swagger-ui-init`.
+- **ReDoc**: `<redoc spec-url="...">` tag or `<script src="redoc.standalone.js">`.
+- **Stoplight Elements**: `<elements-api apiDescriptionUrl="...">` tag.
+- **Scalar**: `<script id="api-reference" data-url="...">`.
+- **RapiDoc**: `<rapi-doc spec-url="...">` tag.
 
-**Real examples**: many internal-turned-public APIs, self-hosted tools (Miniflux), some fintech APIs, machine-generated SDK docs.
+Common spec paths to probe directly: `/openapi.json`, `/openapi.yaml`, `/swagger.json`, `/v3/api-docs`, `/api-docs`, `/api/v1/openapi.json`, `/spec.json`.
 
-**Strategy**: parse the OpenAPI spec programmatically, not the rendered Swagger UI (the UI is worthless to fetch — it's a React app that loads the spec). Every path, method, parameter, schema, and example comes out structured. For prose context — what the tool does, auth flow, how to get credentials — supplement from the landing page and the package registry description.
+**Real examples**: Hetzner Cloud (see `case-study-hetzner-openapi.md`), Linear, Fly.io machines API, Miniflux, many internal-turned-public APIs, machine-generated SDK docs.
 
-**Pitfall**: OpenAPI specs miss non-endpoint context: rate limits, webhook formats, idempotency conventions. Those almost always live in a separate "guides" page or — commonly — only in a PDF developer guide the company sends by email. Flag these explicitly as gaps; don't silently skip.
+**Why it's its own archetype**: two failure modes archetype 1 (well-structured) doesn't have. First, **auto-generation noise** — descriptions are often unedited internal field comments, including literal `"string"` placeholders, multiple ID fields (`uuid` plus `legacy_id` plus `name`) where only one matters in practice, and `example` values that don't parse against their own schema. Second, **spec-vs-reality drift** — specs lie about `Link` headers, `RateLimit-*` headers, error envelope details, and `nullable` semantics. The rendered Swagger UI hides this; the consuming agent only learns about the gap when an integration breaks against a real response.
+
+**Strategy**: parse the spec programmatically — the rendered viewer is worthless to fetch. The discovery cascade lives in `openapi-harvest fetch`: direct fetch → common spec paths → renderer-config regex over view-source (the five viewers above) → community mirror fallback. Resolve `$ref`s with `prance[osv]` and emit a sidecar `source-map.json` so original JSON Pointers remain accurate after the flatten. Group endpoints by OpenAPI tag under per-tag H3 sub-sections beneath `## API reference` (per `doc-template.md`). Merge prose context — what the tool is, auth flow, rate limits, error semantics — from sibling narrative pages or the landing page. Every section carries a JSON Pointer provenance comment (`spec-pointer: /paths/~1v1~1locations/get`); community-mirror sources additionally carry `mirror: unofficial`.
+
+**Optional probing branch.** When the user has a token, `openapi-harvest auth` confirms the working auth pattern (bearer / API-key / Basic) and `openapi-harvest probe` captures a real response. `openapi-harvest quick-diff` then reports header gaps, type mismatches, and placeholder values. Probe captures become **scoped evidence sources** with their own provenance shape (`<!-- probe: METHOD URL status: N retrieved: DATE scope: LABEL fixture: PATH -->`), distinct from spec sources. Security caveats are non-negotiable: every outbound call requires `--allow-host HOST`, query-string auth is opt-in (`--include-query-auth`), Basic requires explicit `--basic-creds`, default redaction covers auth headers and sensitive body keys, the 401-capture probe uses a fixed bad-token string, redirects are blocked by default, and spec descriptions are sanitized against prompt-injection before consolidation. Full inventory in `references/probing-tools.md`.
+
+**Common gotchas**:
+- Literal `"string"` placeholder values in `example` fields. Treat as missing example, not a real default.
+- Multiple ID fields per resource (`uuid`, `id`, `legacy_id`, `name`). Note which one the API actually requires; consuming agents pick the wrong one consistently.
+- Headers the spec body schema can't represent: `Link`, `RateLimit-*`, `Retry-After`, `X-Request-ID`, `Sunset`, `Deprecation`, `Warning`. Surface from a captured probe; flag as `<!-- TODO: capture via probe -->` if no token.
+
+**Mirror staleness.** When the spec lives at a community mirror (GitHub raw URL), `openapi-harvest fetch` calls the GitHub commits API for the file's most recent commit date and warns on stderr if older than `--staleness-days` (default 90). Same heuristic applies to `gitlab.com/<owner>/<repo>/-/raw/<branch>/<path>`. Other hosts skip the check.
+
+**Neighbors**:
+- **4 + 5 (SPA / JS-rendered)**: still archetype 4. The renderer is the SPA; the harvest target is the spec, not the rendered DOM. The five viewer signatures above route around the SPA layer entirely.
+- **4 + 6 (Non-English partial)**: the spec is language-neutral (paths, parameter names, schema keys never translate). The narrative pages need the non-English handling from archetype 6, but the spec parse is unchanged.
+
+**See**: `case-study-hetzner-openapi.md` for the end-to-end walkthrough — discovery cascade, mirror fallback, spec + narrative merge, optional probing, drift report, handoff packet.
 
 ---
 

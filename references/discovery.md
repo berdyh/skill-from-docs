@@ -66,13 +66,31 @@ Cheapest and most complete first:
 - Sitemap at `<host>/sitemap.xml`.
 - Often exposes a JSON API — look for XHR requests in browser dev tools if manually inspecting.
 
-### Swagger UI hosted endpoint
-
-- The UI page itself is worthless to fetch; the `swagger.json` / `openapi.json` it points at is what matters. Look at page source for the spec URL.
-
 ### Notion-backed docs
 
 - Hard to scrape from raw fetch (client-rendered). Go straight to headless browser, or check if the project also publishes a traditional docs site.
+
+## OpenAPI renderers
+
+When the docs page is a JS-based viewer that renders an OpenAPI spec, the rendered HTML is worthless to fetch — what matters is the spec URL the viewer points at. Five renderers cover ~95% of cases in the wild. Each has a one-line view-source signature and a canonical attribute that names the spec URL:
+
+| Renderer | View-source signature | Common spec-URL attribute |
+|---|---|---|
+| Swagger UI | `<script>` with `SwaggerUIBundle({` or `swagger-ui-init` | `url:` in bundle config |
+| ReDoc | `<redoc>` tag or `<script src="redoc.standalone.js">` | `spec-url` on `<redoc>` |
+| Stoplight Elements | `<elements-api>` tag | `apiDescriptionUrl` |
+| Scalar | `<script id="api-reference">` | `data-url` |
+| RapiDoc | `<rapi-doc>` tag | `spec-url` |
+
+Regex priority matters. **Scalar's `data-url` is checked before any generic `spec-url` lookup** — Scalar's tag uses a different attribute, and a permissive `spec-url` regex over view-source would otherwise miss it. **RapiDoc and ReDoc both use `spec-url`**, so try them after the unambiguous matches (Stoplight's `apiDescriptionUrl`, Scalar's `data-url`, Swagger UI's `url:` inside a bundle call). Without that ordering, a permissive regex picks the wrong renderer's URL on pages that embed more than one viewer or that have inert sample markup elsewhere on the page.
+
+The cascade `openapi-harvest fetch` runs:
+1. Direct fetch of the SOURCE URL.
+2. Common spec paths (`/openapi.json`, `/openapi.yaml`, `/swagger.json`, `/v3/api-docs`, `/api-docs`, `/api/v1/openapi.json`, `/spec.json`).
+3. Renderer-config regex over view-source for the entry URL, in the priority order above.
+4. Community mirror lookup (manual; the tool surfaces the failure mode and the user supplies the mirror URL).
+
+Once a spec URL is identified, parse the spec — never the rendered viewer.
 
 ## Signals that mean "fall back to headless browser"
 

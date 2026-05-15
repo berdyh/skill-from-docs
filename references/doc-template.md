@@ -75,6 +75,8 @@ The full surface. Structure depends on the tool:
 - **SDK**: group by module/class. Each method: signature, params, return type, raises, one example.
 - **CLI**: group by subcommand. Each: purpose, flags, positional args, exit codes, example invocation.
 
+**Archetype 4 (OpenAPI-only) layout.** For archetype-4 harvests, group endpoints by OpenAPI tag under H3 sub-sections — e.g. `### Tag: Locations`, `### Tag: Datacenters`. Each endpoint sits under an H4 (`#### GET /v1/locations`) or as a list item beneath its tag's H3, and follows the same `method + path, auth, params, request, response, status codes, example` shape as any other REST API entry. The H3-per-tag organization is what `openapi-harvest consolidate` emits automatically when the workspace's `handoff.json` carries `archetype_primary: 4`. The canonical H2s above the H3s (`## API reference`, `## Authentication`, etc.) are unchanged — only the H3 grouping is archetype-specific.
+
 ### `## Minimal working example`
 
 One end-to-end script in the target language that demonstrates install + auth + one real operation. Must be runnable as-is given credentials. If multiple languages were requested, one per language.
