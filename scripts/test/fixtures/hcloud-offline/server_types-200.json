@@ -1,0 +1,29 @@
+{
+  "scope": "case-study",
+  "request": {
+    "method": "GET",
+    "url": "https://api.hetzner.cloud/v1/server_types",
+    "headers": {"Authorization": "<redacted>"},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "X-RateLimit-Limit": "3600"
+    },
+    "body": {
+      "server_types": [
+        {"id": 1, "name": "cx11", "cores": 1, "memory": 2.0},
+        {"id": 2, "name": "cx21", "cores": 2, "memory": 4.0}
+      ]
+    },
+    "timing_ms": 71
+  },
+  "manifest": {
+    "tool_version": "0.1.0",
+    "captured_at": "2026-05-01T10:02:00Z",
+    "spec_url_at_capture": "https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json",
+    "spec_sha256_at_capture": "offline-fixture"
+  }
+}

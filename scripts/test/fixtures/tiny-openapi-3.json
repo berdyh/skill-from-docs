@@ -1,0 +1,75 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Tiny API",
+    "version": "1.0.0",
+    "description": "A minimal OpenAPI 3.0 spec for testing."
+  },
+  "paths": {
+    "/locations": {
+      "get": {
+        "operationId": "listLocations",
+        "summary": "List locations",
+        "tags": ["Locations"],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["locations"],
+                  "properties": {
+                    "locations": {
+                      "type": "array",
+                      "items": {"$ref": "#/components/schemas/Location"}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/locations/{id}": {
+      "get": {
+        "operationId": "getLocation",
+        "summary": "Get a location",
+        "tags": ["Locations"],
+        "parameters": [
+          {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {"$ref": "#/components/schemas/Location"}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Location": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id": {"type": "integer"},
+          "name": {"type": "string"},
+          "city": {"type": "string"}
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  }
+}

@@ -1,0 +1,166 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Hetzner Cloud (offline test fixture)",
+    "version": "1.0.0",
+    "description": "Synthetic Hetzner-shaped OpenAPI spec for offline case-study walkthrough."
+  },
+  "servers": [{"url": "https://api.hetzner.cloud"}],
+  "security": [{"bearerAuth": []}],
+  "paths": {
+    "/v1/locations": {
+      "get": {
+        "operationId": "listLocations",
+        "summary": "List locations",
+        "tags": ["Locations"],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["locations"],
+                  "properties": {
+                    "locations": {
+                      "type": "array",
+                      "items": {"$ref": "#/components/schemas/Location"}
+                    },
+                    "meta": {"$ref": "#/components/schemas/Meta"}
+                  }
+                }
+              }
+            }
+          },
+          "401": {"$ref": "#/components/responses/Unauthorized"}
+        }
+      }
+    },
+    "/v1/datacenters": {
+      "get": {
+        "operationId": "listDatacenters",
+        "summary": "List datacenters",
+        "tags": ["Datacenters"],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["datacenters"],
+                  "properties": {
+                    "datacenters": {
+                      "type": "array",
+                      "items": {"$ref": "#/components/schemas/Datacenter"}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/server_types": {
+      "get": {
+        "operationId": "listServerTypes",
+        "summary": "List server types",
+        "tags": ["ServerTypes"],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["server_types"],
+                  "properties": {
+                    "server_types": {
+                      "type": "array",
+                      "items": {"$ref": "#/components/schemas/ServerType"}
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {"type": "http", "scheme": "bearer"}
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Unauthorized",
+        "content": {
+          "application/json": {
+            "schema": {"$ref": "#/components/schemas/Error"}
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Location": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id": {"type": "integer"},
+          "name": {"type": "string"},
+          "city": {"type": "string"},
+          "country": {"type": "string"}
+        }
+      },
+      "Datacenter": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id": {"type": "integer"},
+          "name": {"type": "string"},
+          "location": {"$ref": "#/components/schemas/Location"}
+        }
+      },
+      "ServerType": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id": {"type": "integer"},
+          "name": {"type": "string"},
+          "cores": {"type": "integer"},
+          "memory": {"type": "number"}
+        }
+      },
+      "Meta": {
+        "type": "object",
+        "properties": {
+          "pagination": {
+            "type": "object",
+            "properties": {
+              "page": {"type": "integer"},
+              "per_page": {"type": "integer"},
+              "next_page": {"type": "integer", "nullable": true}
+            }
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+              "code": {"type": "string"},
+              "message": {"type": "string"},
+              "details": {"type": "object"}
+            }
+          }
+        }
+      }
+    }
+  }
+}
