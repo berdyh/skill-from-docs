@@ -1,0 +1,20 @@
+{
+  "spec_url": "https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json",
+  "spec_sha256": "offline-fixture",
+  "fetched_at": "2026-05-01T12:00:00Z",
+  "format": "openapi-3.0",
+  "operations": {
+    "/v1/locations:get": {
+      "original_pointer": "/paths/~1v1~1locations/get",
+      "tags": ["Locations"]
+    },
+    "/v1/datacenters:get": {
+      "original_pointer": "/paths/~1v1~1datacenters/get",
+      "tags": ["Datacenters"]
+    },
+    "/v1/server_types:get": {
+      "original_pointer": "/paths/~1v1~1server_types/get",
+      "tags": ["ServerTypes"]
+    }
+  }
+}

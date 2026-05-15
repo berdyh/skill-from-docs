@@ -1,0 +1,25 @@
+[project]
+name = "skill-from-docs-tools"
+version = "0.1.0"
+description = "OpenAPI harvest tool for the skill-from-docs Claude Code skill"
+requires-python = ">=3.10"
+dependencies = [
+  "httpx>=0.27,<1.0",
+  "prance[osv]>=23.6",
+  "pyyaml>=6.0,<7.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=7.0",
+]
+
+[project.scripts]
+openapi-harvest = "skill_from_docs.openapi_harvest:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

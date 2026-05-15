@@ -1,0 +1,396 @@
+"""openapi-harvest fetch — discover, fetch, and parse an OpenAPI spec."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from typing import Any
+from urllib.parse import urljoin, urlparse
+
+from . import __version__
+from ._http import (
+    AllowlistViolation,
+    DEFAULT_USER_AGENT,
+    HostAllowlist,
+    build_client,
+    request_with_retry,
+)
+from ._manifest import file_entry, now_iso, record_run, sha256_bytes
+from ._slug import default_workspace
+
+
+COMMON_SPEC_PATHS = (
+    "/openapi.json",
+    "/openapi.yaml",
+    "/swagger.json",
+    "/v3/api-docs",
+    "/api-docs",
+    "/api/v1/openapi.json",
+    "/spec.json",
+)
+
+# Renderer regex patterns, order matters (specific first).
+RENDERER_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("scalar", re.compile(r"data-url=[\"']([^\"']+)[\"']", re.IGNORECASE)),
+    (
+        "stoplight",
+        re.compile(
+            r"apiDescriptionUrl\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE
+        ),
+    ),
+    (
+        "redoc",
+        re.compile(r"<redoc[^>]*spec-url=[\"']([^\"']+)[\"']", re.IGNORECASE),
+    ),
+    (
+        "rapidoc",
+        re.compile(r"<rapi-doc[^>]*spec-url=[\"']([^\"']+)[\"']", re.IGNORECASE),
+    ),
+    (
+        "swagger-ui",
+        re.compile(
+            r"(?:SwaggerUIBundle|swagger-ui-init|SwaggerUI)[^{]*\{[^}]*?url\s*:\s*[\"']([^\"']+)[\"']",
+            re.IGNORECASE | re.DOTALL,
+        ),
+    ),
+]
+
+GITHUB_RAW_RE = re.compile(
+    r"^https://raw\.githubusercontent\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/(?P<branch>[^/]+)/(?P<path>.+)$"
+)
+
+
+class FetchError(Exception):
+    """Internal fetch error mapped to an exit code."""
+
+    def __init__(self, message: str, exit_code: int = 1):
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+def add_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "fetch",
+        help="discover + parse an OpenAPI spec",
+        description="Fetch an OpenAPI spec from a URL, local path, or stdin (@-).",
+    )
+    p.add_argument("source")
+    p.add_argument("-o", "--output-spec")
+    p.add_argument("--output-source-map")
+    p.add_argument("--no-resolve", action="store_true")
+    p.add_argument("--user-agent")
+    p.add_argument("--timeout", type=float, default=30.0)
+    p.add_argument("--staleness-days", type=int, default=90)
+    p.add_argument("--count-endpoints", action="store_true")
+    p.add_argument("--allow-host", action="append", default=[])
+    p.add_argument("--workspace")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.set_defaults(func=run)
+
+
+def _is_url(s: str) -> bool:
+    return s.startswith(("http://", "https://"))
+
+
+def _parse_spec_bytes(data: bytes) -> dict[str, Any]:
+    """Parse JSON or YAML bytes into a dict."""
+    try:
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        pass
+    try:
+        import yaml  # type: ignore
+
+        loaded = yaml.safe_load(data.decode("utf-8"))
+        if isinstance(loaded, dict):
+            return loaded
+    except Exception as e:
+        raise FetchError(f"failed to parse spec as JSON or YAML: {e}", exit_code=3)
+    raise FetchError("spec is not a JSON object", exit_code=3)
+
+
+def _resolve_refs(spec: dict[str, Any]) -> dict[str, Any]:
+    """Use prance to resolve $refs. On failure, return the original spec."""
+    try:
+        from prance import ResolvingParser  # type: ignore
+    except ImportError:
+        return spec
+    try:
+        parser = ResolvingParser(spec_string=json.dumps(spec), backend="openapi-spec-validator")
+        if parser.specification is not None:
+            return parser.specification  # type: ignore[return-value]
+    except Exception:
+        # If prance can't resolve (circular refs, validator failure), keep original.
+        return spec
+    return spec
+
+
+def _build_source_map(spec: dict[str, Any], *, spec_url: str | None, sha256: str) -> dict[str, Any]:
+    operations: dict[str, Any] = {}
+    paths = spec.get("paths") or {}
+    if isinstance(paths, dict):
+        for path, methods in paths.items():
+            if not isinstance(methods, dict):
+                continue
+            for method, op in methods.items():
+                if method.lower() not in (
+                    "get", "post", "put", "delete", "patch", "head", "options", "trace"
+                ):
+                    continue
+                if not isinstance(op, dict):
+                    continue
+                key = f"{path}:{method.lower()}"
+                pointer_path = path.replace("~", "~0").replace("/", "~1")
+                operations[key] = {
+                    "original_pointer": f"/paths/~1{pointer_path[1:]}/{method.lower()}"
+                    if path.startswith("/")
+                    else f"/paths/{pointer_path}/{method.lower()}",
+                    "tags": op.get("tags", []),
+                }
+    return {
+        "spec_url": spec_url,
+        "spec_sha256": sha256,
+        "fetched_at": now_iso(),
+        "format": _detect_format(spec),
+        "operations": operations,
+    }
+
+
+def _detect_format(spec: dict[str, Any]) -> str:
+    if "openapi" in spec:
+        v = str(spec["openapi"])
+        return f"openapi-{v.rsplit('.', 1)[0]}" if "." in v else f"openapi-{v}"
+    if "swagger" in spec:
+        return f"swagger-{spec['swagger']}"
+    return "unknown"
+
+
+def _count_endpoints(spec: dict[str, Any]) -> int:
+    n = 0
+    for _path, methods in (spec.get("paths") or {}).items():
+        if not isinstance(methods, dict):
+            continue
+        for m in methods:
+            if m.lower() in (
+                "get", "post", "put", "delete", "patch", "head", "options", "trace"
+            ):
+                n += 1
+    return n
+
+
+def _try_renderers(html: str, base_url: str) -> str | None:
+    """Return the first renderer-discovered spec URL, or None."""
+    for _name, pat in RENDERER_PATTERNS:
+        m = pat.search(html)
+        if m:
+            candidate = m.group(1)
+            if not candidate.startswith(("http://", "https://")):
+                candidate = urljoin(base_url, candidate)
+            return candidate
+    return None
+
+
+def _discover(client, base_url: str, allowlist: HostAllowlist) -> tuple[bytes, str]:
+    """Discovery cascade. Returns (spec_bytes, final_url) or raises FetchError."""
+    # 1. Direct fetch.
+    try:
+        resp = request_with_retry(client, "GET", base_url, allowlist=allowlist, max_retries=0)
+        if resp.status_code == 200:
+            ct = resp.headers.get("Content-Type", "").lower()
+            body = resp.content
+            if any(t in ct for t in ("json", "yaml", "yml")) or _looks_like_spec(body):
+                return body, base_url
+            # treat as HTML — try renderers
+            html = body.decode("utf-8", errors="replace")
+            renderer_url = _try_renderers(html, base_url)
+            if renderer_url:
+                try:
+                    allowlist.check(renderer_url)
+                except AllowlistViolation as exc:
+                    raise FetchError(str(exc), exit_code=1)
+                r2 = request_with_retry(
+                    client, "GET", renderer_url, allowlist=allowlist, max_retries=0
+                )
+                if r2.status_code == 200:
+                    return r2.content, renderer_url
+    except AllowlistViolation as exc:
+        raise FetchError(str(exc), exit_code=1)
+    except Exception as e:
+        # Continue to common-path probing for connection errors.
+        last_err = e  # noqa: F841
+
+    # 2. Common spec paths against the origin.
+    parsed = urlparse(base_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    for path in COMMON_SPEC_PATHS:
+        candidate = origin + path
+        try:
+            allowlist.check(candidate)
+        except AllowlistViolation:
+            continue
+        try:
+            resp = request_with_retry(
+                client, "GET", candidate, allowlist=allowlist, max_retries=0
+            )
+        except Exception:
+            continue
+        if resp.status_code == 200 and _looks_like_spec(resp.content):
+            return resp.content, candidate
+
+    raise FetchError(
+        f"could not discover an OpenAPI spec from {base_url}", exit_code=1
+    )
+
+
+def _looks_like_spec(body: bytes) -> bool:
+    head = body[:512].lstrip().lower()
+    if head.startswith(b"{"):
+        return b"openapi" in body[:2048].lower() or b"swagger" in body[:2048].lower()
+    if head.startswith(b"openapi") or head.startswith(b"swagger:"):
+        return True
+    return False
+
+
+def _check_staleness(url: str, days: int, client, *, log) -> None:
+    if days <= 0:
+        return
+    m = GITHUB_RAW_RE.match(url)
+    if not m:
+        log("staleness check unavailable for non-GitHub raw URLs")
+        return
+    owner = m.group("owner")
+    repo = m.group("repo")
+    branch = m.group("branch")
+    path = m.group("path")
+    api_url = (
+        f"https://api.github.com/repos/{owner}/{repo}/commits"
+        f"?path={path}&sha={branch}&per_page=1"
+    )
+    try:
+        resp = client.get(api_url)
+    except Exception as e:
+        log(f"staleness check failed: {e}")
+        return
+    if resp.status_code != 200:
+        log(f"staleness check: GitHub commits API returned {resp.status_code}")
+        return
+    try:
+        commits = resp.json()
+    except Exception:
+        log("staleness check: GitHub response was not JSON")
+        return
+    if not commits:
+        log("staleness check: no commits returned for path")
+        return
+    date_str = (
+        commits[0].get("commit", {}).get("committer", {}).get("date")
+    )
+    if not date_str:
+        return
+    from datetime import datetime, timezone
+
+    try:
+        commit_dt = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return
+    age_days = (datetime.now(timezone.utc) - commit_dt).days
+    if age_days > days:
+        log(f"WARNING: mirror is {age_days} days old (threshold: {days} days)")
+
+
+def run(args, *, log=None, transport=None) -> int:
+    """Entry point for the subcommand. `log` is a printer used for stderr
+    output; tests can capture it. `transport` is an httpx.MockTransport for
+    tests.
+    """
+    if log is None:
+        def log(msg: str) -> None:
+            if not args.quiet:
+                print(msg, file=sys.stderr)
+
+    workspace = args.workspace or default_workspace(args.source)
+    os.makedirs(workspace, exist_ok=True)
+    os.makedirs(os.path.join(workspace, "raw"), exist_ok=True)
+    allowlist = HostAllowlist(args.allow_host)
+
+    # 1. Read source bytes.
+    started = now_iso()
+    spec_url: str | None = None
+    if args.source == "@-":
+        body = sys.stdin.buffer.read()
+    elif _is_url(args.source):
+        if allowlist:
+            try:
+                allowlist.check(args.source)
+            except AllowlistViolation as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 1
+        with build_client(
+            timeout=args.timeout,
+            user_agent=args.user_agent or DEFAULT_USER_AGENT,
+            transport=transport,
+        ) as client:
+            try:
+                body, spec_url = _discover(client, args.source, allowlist)
+            except FetchError as fe:
+                print(f"ERROR: {fe}", file=sys.stderr)
+                return fe.exit_code
+            except Exception as e:
+                print(f"ERROR: network error: {e}", file=sys.stderr)
+                return 2
+            _check_staleness(spec_url, args.staleness_days, client, log=log)
+    else:
+        if not os.path.exists(args.source):
+            print(f"ERROR: file not found: {args.source}", file=sys.stderr)
+            return 1
+        with open(args.source, "rb") as f:
+            body = f.read()
+        spec_url = None
+
+    # 2. Parse.
+    try:
+        spec = _parse_spec_bytes(body)
+    except FetchError as fe:
+        print(f"ERROR: {fe}", file=sys.stderr)
+        return fe.exit_code
+
+    # 3. Resolve $refs (optional).
+    if not args.no_resolve:
+        spec = _resolve_refs(spec)
+
+    sha = sha256_bytes(body)
+    source_map = _build_source_map(spec, spec_url=spec_url, sha256=sha)
+
+    # 4. --count-endpoints short-circuit.
+    if args.count_endpoints:
+        print(_count_endpoints(spec))
+        return 0
+
+    # 5. Write outputs.
+    out_spec = args.output_spec or os.path.join(workspace, "raw", "spec.json")
+    out_map = args.output_source_map or os.path.join(workspace, "raw", "source-map.json")
+    os.makedirs(os.path.dirname(out_spec) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(out_map) or ".", exist_ok=True)
+    with open(out_spec, "w", encoding="utf-8") as f:
+        json.dump(spec, f, indent=2)
+        f.write("\n")
+    with open(out_map, "w", encoding="utf-8") as f:
+        json.dump(source_map, f, indent=2)
+        f.write("\n")
+
+    finished = now_iso()
+    record_run(
+        workspace,
+        subcommand="fetch",
+        args={"source": args.source, "no_resolve": args.no_resolve},
+        started_at=started,
+        finished_at=finished,
+        outputs=[file_entry(workspace, out_spec), file_entry(workspace, out_map)],
+    )
+
+    log(f"wrote {out_spec}")
+    log(f"wrote {out_map}")
+    return 0

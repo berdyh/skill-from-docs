@@ -1,0 +1,28 @@
+{
+  "scope": "case-study",
+  "request": {
+    "method": "GET",
+    "url": "https://api.example.com/locations",
+    "headers": {"Authorization": "<redacted>"},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "X-RateLimit-Limit": "3600"
+    },
+    "body": {
+      "locations": [
+        {"id": 1, "name": "fsn1", "city": "Falkenstein"}
+      ]
+    },
+    "timing_ms": 42
+  },
+  "manifest": {
+    "tool_version": "0.1.0",
+    "captured_at": "2026-05-01T12:00:00Z",
+    "spec_url_at_capture": "https://example.com/openapi.json",
+    "spec_sha256_at_capture": "ab12cd34"
+  }
+}

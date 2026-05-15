@@ -1,0 +1,27 @@
+{
+  "scope": "drift-validation",
+  "request": {
+    "method": "GET",
+    "url": "https://api.example.com/locations",
+    "headers": {"Authorization": "<redacted>"},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Link": "<https://api.example.com/locations?page=2>; rel=\"next\"",
+      "X-RateLimit-Remaining": "3599"
+    },
+    "body": {
+      "locations": [{"id": 1, "name": "fsn1"}]
+    },
+    "timing_ms": 51
+  },
+  "manifest": {
+    "tool_version": "0.1.0",
+    "captured_at": "2026-05-01T12:00:00Z",
+    "spec_url_at_capture": null,
+    "spec_sha256_at_capture": null
+  }
+}

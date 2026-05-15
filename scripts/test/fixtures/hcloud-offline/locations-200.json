@@ -1,0 +1,33 @@
+{
+  "scope": "case-study",
+  "request": {
+    "method": "GET",
+    "url": "https://api.hetzner.cloud/v1/locations",
+    "headers": {"Authorization": "<redacted>", "User-Agent": "skill-from-docs/0.1.0"},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Link": "<https://api.hetzner.cloud/v1/locations?page=2>; rel=\"next\"",
+      "X-RateLimit-Limit": "3600",
+      "X-RateLimit-Remaining": "3599",
+      "X-Request-ID": "req_abc123"
+    },
+    "body": {
+      "locations": [
+        {"id": 1, "name": "fsn1", "city": "Falkenstein", "country": "DE"},
+        {"id": 2, "name": "nbg1", "city": "Nuremberg", "country": "DE"}
+      ],
+      "meta": {"pagination": {"page": 1, "per_page": 25, "next_page": null}}
+    },
+    "timing_ms": 87
+  },
+  "manifest": {
+    "tool_version": "0.1.0",
+    "captured_at": "2026-05-01T10:00:00Z",
+    "spec_url_at_capture": "https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json",
+    "spec_sha256_at_capture": "offline-fixture"
+  }
+}
