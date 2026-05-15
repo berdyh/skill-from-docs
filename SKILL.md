@@ -1,6 +1,6 @@
 ---
 name: skill-from-docs
-description: Exhaustively harvest a tool or library's documentation into a consolidated markdown bundle (including image-text extraction) and hand it off to `skill-creator:skill-creator`, which then produces the actual integration skill. Use whenever the user provides a docs URL, a GitHub repo, a library name, or an OpenAPI spec and wants a reusable integration skill — phrases like "make a skill from these docs", "turn this API's docs into a skill", "I want a skill for integrating <tool>", "read the docs for <library> and build a skill", or pasting a single docs subpage and asking for full coverage. Also triggers when the docs are partial, multi-page, JS-rendered, image-heavy, or in a non-English language and require crawling, headless-browser rendering, vision, or web-search supplementation to be complete before a skill can be written. This skill is discovery-only: it never produces a SKILL.md itself; that decision belongs to skill-creator.
+description: Exhaustively harvest a tool or library's documentation into a consolidated markdown bundle (including image-text extraction and, for OpenAPI-only APIs, optional live-probing to capture real response shapes, auth patterns, and spec-vs-reality drift) and hand it off to `skill-creator:skill-creator`, which then produces the actual integration skill. Use whenever the user provides a docs URL, a GitHub repo, a library name, or an OpenAPI spec and wants a reusable integration skill — phrases like "make a skill from these docs", "turn this API's docs into a skill", "I want a skill for integrating <tool>", "read the docs for <library> and build a skill", "capture real responses from this API", "validate my OpenAPI spec against the live API", "figure out the auth pattern for this REST API", "my docs are SPA-rendered Swagger UI / ReDoc / Stoplight / Scalar / RapiDoc", or pasting a single docs subpage and asking for full coverage. Also triggers when the docs are partial, multi-page, JS-rendered, image-heavy, OpenAPI-spec-only, or in a non-English language and require crawling, headless-browser rendering, vision, live API probing with a token, or web-search supplementation to be complete before a skill can be written. This skill is discovery-only: it never produces a SKILL.md itself; that decision belongs to skill-creator.
 ---
 
 # skill-from-docs
@@ -46,6 +46,7 @@ Check each row; if a required tool is missing, stop and report — don't improvi
 | Vision-capable Read on saved images | Phase 1 Step 2.5 — image-text extraction | Proceed but skip Step 2.5; flag any image-heavy archetypes (2/3/6) in the handoff packet so skill-creator knows the diagrams were not transcribed. |
 | `sphobjinv` (optional) | Parsing ReadTheDocs `objects.inv` in Phase 1 | Skip that discovery probe. Sitemap coverage is usually sufficient. |
 | Target tool's own CLI | Phase 1 Step 1 item 7 — iterating `<tool> --help` | Skip. Fall back to reading the argparse/clap tree from the tool's source in its repo. |
+| Python ≥3.10 with `openapi-harvest` installed | Phase 1 archetype-4 probing | Proceed but skip probing; fall back to spec-only harvest with `<!-- TODO -->` markers. Install: `pip install -e ~/.claude/skills/skill-from-docs/scripts`. |
 
 The two hard-fail rows are non-negotiable. The skill-creator hard-fail is the single most important policy in this skill: any local fallback that produces a SKILL.md re-encodes structural decisions that conflict with skill-creator's progressive-disclosure design, and a 200-URL harvest with no destination is wasteful — both are prevented by failing fast here.
 
@@ -83,12 +84,15 @@ Workspace layout at the end of Phase 1:
 ~/.claude/skill-from-docs/<tool-slug>/
 ├── docs.md                  # consolidated harvest with provenance + inlined image transcriptions
 ├── handoff.json             # pre-filled answers for skill-creator's interview (Step 5)
+├── manifest.json            # archetype-4: run records, allowed_hosts, spec/probe hashes (written by openapi-harvest)
 ├── images/                  # per-image transcribed sidecars
 │   ├── <slug>-fig01.md
 │   └── ...
 ├── images-manifest.json     # image → source URL → docs.md anchor map
-├── raw/                     # raw fetched pages (kept for refresh + audit)
+├── raw/                     # raw fetched pages (kept for refresh + audit); archetype-4 also holds spec.json + source-map.json
 │   └── <slug>.md
+├── narrative/               # archetype-4: sibling prose pages consolidate merges under canonical H2s
+├── probes/                  # archetype-4: captured live response fixtures (redacted, scope-labeled)
 └── url-queue.json           # discovered URLs (used by "Refresh" cache option)
 ```
 
@@ -133,6 +137,8 @@ The default priority order below is tuned for an unknown docs site. If Step 0 cl
 8. If the site is on ReadTheDocs: try `<host>/_/downloads/en/stable/htmlzip/` and `<host>/_/downloads/en/stable/pdf/` — these bundle the entire docs corpus in one fetch.
 
 For the detailed per-platform patterns (Docusaurus, Mintlify, ReadTheDocs, MkDocs, GitBook, Swagger UI, Notion docs) see `references/discovery.md`.
+
+For archetype 4 (OpenAPI-only), the discovery cascade is implemented in `openapi-harvest fetch`. The cascade tries direct fetch → common spec paths (`/openapi.json`, `/openapi.yaml`, `/swagger.json`, `/v3/api-docs`, `/api-docs`, `/api/v1/openapi.json`, `/spec.json`) → renderer-config extraction from HTML view-source (Swagger UI, ReDoc, Stoplight Elements, Scalar, RapiDoc — see `references/discovery.md` for the patterns). See `references/case-study-hetzner-openapi.md` for a worked example.
 
 **Handling the partial-URL case.** If the user gave `site.com/ru/integration-registration`:
 - Fetch the page itself *and* the section root (`site.com/ru/`) *and* the docs root (`site.com/`).
@@ -208,7 +214,7 @@ Merge `raw/*.md` into one `docs.md` at `~/.claude/skill-from-docs/<tool-slug>/do
 Before moving to Phase 2, verify `docs.md` covers every item below. For each missing item, use `WebSearch` *before* giving up.
 
 - [ ] Installation — every supported method (pip / npm / cargo / brew / docker / from source)
-- [ ] Authentication and configuration — tokens, env vars, config files, OAuth flow
+- [ ] Authentication and configuration — tokens, env vars, config files, OAuth flow. If archetype 4 AND the auth section is missing or partial AND the user has supplied a token, run `openapi-harvest auth --allow-host <host> --token $TOKEN <known-good-endpoint>`. The captured response counts as a *scoped probe-source* per the probing-as-evidence model in `references/probing-tools.md` — provenance comment carries a `scope` label, never doc-page provenance. `--allow-host` is REQUIRED; without it the tool exits 1 (prevents poisoned-spec credential exfiltration).
 - [ ] Core concepts and data model
 - [ ] Full API surface (REST paths, SDK methods, or CLI commands — whichever applies)
 - [ ] At least one minimal end-to-end working example in the target language
@@ -233,7 +239,7 @@ Fields:
 - `user_declared_scope` — verbatim from Phase 0 question 4 (e.g. "minimal create-payment-intent flow", "full OAuth + webhooks", "production-ready Node SDK setup").
 - `user_declared_languages` — from Phase 0 question 3 (array, e.g. `["python"]` or `["language-agnostic"]`).
 - `archetype_primary`, `archetype_secondary` — source-shape archetype IDs from Step 0 (1–6).
-- `content_shape_signals` — **neutral observations only**. Examples of acceptable signals: `top_level_h2_count`, `repeated_factor_like_sections: 15` (when the docs have 15 parallel-shaped chapters), `repeated_endpoint_like_sections`, `repeated_module_like_sections`, `has_openapi_spec`, `multi_language_docs`, `code_block_languages: ["python", "typescript"]`. **Do not** decide "this is N independent variants" or "this should be split per-resource"; that's skill-creator's call. Surface the signal; let the interview interpret.
+- `content_shape_signals` — **neutral observations only**. Examples of acceptable signals: `top_level_h2_count`, `repeated_factor_like_sections: 15` (when the docs have 15 parallel-shaped chapters), `repeated_endpoint_like_sections`, `repeated_module_like_sections`, `has_openapi_spec`, `multi_language_docs`, `code_block_languages: ["python", "typescript"]`. **Do not** decide "this is N independent variants" or "this should be split per-resource"; that's skill-creator's call. Surface the signal; let the interview interpret. Archetype-4 harvests SHOULD populate five OpenAPI-specific signals: `has_openapi_spec` (bool), `spec_url` (string), `spec_format` (one of `openapi-3.0`, `openapi-3.1`, `swagger-2.0`), `endpoint_count` (int), `tag_count` (int). All five are optional v1 extensions; absent keys mean "not yet checked" and readers MUST NOT infer false. Other archetypes typically omit them. `provenance_index` carries `sources` (spec-derived URLs with optional JSON Pointers) and `probes` (captured live responses with method, URL, status, scope, fixture path) in separate arrays so downstream verifiers can apply different trust levels.
 - `coverage_checklist` — Step 4 checklist with each item marked `covered`, `partial`, or `missing` plus the source URL(s).
 - `gap_list` — explicit unresolved gaps from Step 4, even after WebSearch. Empty array if none.
 - `provenance_index` — map of `docs.md` H2 section → list of source URLs. Used by skill-creator for its own anti-hallucination check.
@@ -278,3 +284,5 @@ If skill-creator's interview always starts cold (no workspace-path channel exist
 - **Writing harvest artifacts to a relative path.** Always write to `~/.claude/skill-from-docs/<tool-slug>/`. Relative paths pollute whichever project the user happens to be in and orphan the cache.
 - **Producing a SKILL.md as a fallback.** There is no fallback. If skill-creator is missing, Phase 0.5 aborts. Local fallback templates re-encode structural decisions that conflict with skill-creator and are how this skill ended up over-stepping in the first place.
 - **Scraping before discovery.** Slower, incomplete, and wastes tokens on the same sidebar HTML repeatedly.
+- **Treating a captured probe response as if it were a doc page.** Probe provenance comments use `<!-- probe: METHOD URL status: N retrieved: DATE scope: LABEL fixture: PATH -->`; doc provenance uses `<!-- source: URL retrieved: DATE raw_file: PATH -->` (with optional `spec-pointer: JSONPOINTER` for archetype 4). Mixing them breaks skill-creator's verifier.
+- **Running probes without `--allow-host`.** A poisoned spec can specify an attacker-controlled endpoint URL. `openapi-harvest` enforces an allowlist on every outbound call; bypassing it is a security policy violation.

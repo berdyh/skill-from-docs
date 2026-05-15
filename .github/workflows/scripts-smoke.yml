@@ -1,0 +1,28 @@
+name: scripts-smoke
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/scripts-smoke.yml'
+  push:
+    branches: [main]
+    paths: ['scripts/**']
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with: { python-version: '${{ matrix.python }}' }
+      - run: pip install -e ./scripts
+      - run: pip install pytest pytest-cov
+      - run: pytest scripts/test/ -v --cov=skill_from_docs --cov-report=term-missing
+      - name: Detect hardcoded endpoint count in case study
+        run: |
+          if grep -E "# → [0-9]+" references/case-study-hetzner-openapi.md; then
+            echo "::error::Case study hardcodes a specific endpoint count, which will rot. Use a fuzzy hint like '~85 endpoints' instead."
+            exit 1
+          fi

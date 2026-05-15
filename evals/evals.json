@@ -1,0 +1,26 @@
+{
+  "skill_name": "skill-from-docs",
+  "evals": [
+    {
+      "id": 1,
+      "name": "openapi-archetype-4-hetzner",
+      "prompt": "I want a skill for integrating Hetzner Cloud into my Python service. Docs: https://docs.hetzner.com/cloud/. Read-only scope.",
+      "expected_output": "Workspace at ~/.claude/skill-from-docs/api.hetzner.cloud/ with valid docs.md (canonical H2s; per-tag H3s under ## API reference), handoff.json carrying archetype_primary=4 and all five OpenAPI content_shape_signals populated, source-map.json, and at least the Locations endpoint probed (with a real Hetzner token) or seeded from hcloud-offline fixtures (without one).",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "well-structured-archetype-1-stripe",
+      "prompt": "Make a skill from the Stripe API docs: https://docs.stripe.com/api. Node target, create-payment-intent scope.",
+      "expected_output": "Workspace with docs.md covering payment-intents endpoints; archetype_primary=1; handoff.json has_openapi_spec=true (Stripe publishes OpenAPI) but full archetype-4 signal set not required for non-probing harvests.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "multi-source-archetype-3-fusesoc",
+      "prompt": "Make a skill for FuseSoC. Docs: https://fusesoc.readthedocs.io. Python library mode.",
+      "expected_output": "Workspace with docs.md merging ReadTheDocs + GitHub /examples + CLI --help captures; archetype_primary=3; no OpenAPI signals required.",
+      "files": []
+    }
+  ]
+}
