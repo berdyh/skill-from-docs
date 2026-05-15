@@ -2,7 +2,7 @@
 
 Reference inventory for the `openapi-harvest` console script and its six subcommands. Read this when you're harvesting an archetype-4 (OpenAPI-only) target and need to decide which subcommand to reach for, what its output looks like in `docs.md`, and what the security defaults actually defend against.
 
-The tool installs once (`pip install -e ~/.claude/skills/skill-from-docs/scripts`) and is invoked from any directory as `openapi-harvest <subcommand> ...`. All subcommands share a single config, redaction policy, host allowlist, run manifest, error contract, User-Agent, Python ≥3.10 check, and `--workspace PATH` flag.
+The tool installs once (`pip install -e ~/.claude/skills/skill-from-docs/scripts`) and is invoked from any directory as `openapi-harvest <subcommand> [WORKSPACE] [options]`. Each subcommand accepts an optional positional `WORKSPACE` path (defaults to `~/.claude/skill-from-docs/<inferred-slug>/`). All subcommands share a single config, redaction policy, host allowlist, run manifest, error contract, User-Agent, and Python ≥3.10 check.
 
 For the worked walkthrough that exercises every subcommand against a real API, see `case-study-hetzner-openapi.md`.
 
