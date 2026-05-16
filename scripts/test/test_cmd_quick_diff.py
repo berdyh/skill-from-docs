@@ -196,3 +196,22 @@ def test_spec_sha256_mismatch(fixtures_dir: Path, tmp_path: Path, capsys):
     cmd_quick_diff.run(_args(str(fixture_path), s))
     out = capsys.readouterr().out
     assert "spec_revision" in out
+
+
+def test_quick_diff_output_has_drift_validation_provenance(
+    fixtures_dir: Path, tmp_path: Path, capsys
+):
+    """H10: quick-diff output must carry a `<!-- probe: ... scope: drift-validation ... -->`
+    comment naming the fixture path."""
+    fixture_path = fixtures_dir / "locations-200.json"
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "x", "version": "1"},
+        "paths": {"/locations": {"get": {"responses": {"200": {"description": "ok"}}}}},
+    }
+    s = _write(tmp_path / "spec.json", spec)
+    cmd_quick_diff.run(_args(str(fixture_path), s))
+    out = capsys.readouterr().out
+    assert "<!-- probe:" in out
+    assert "scope: drift-validation" in out
+    assert "fixture:" in out

@@ -155,3 +155,102 @@ def test_handoff_emission(tmp_path: Path, fixtures_dir: Path):
     assert handoff["archetype_primary"] == 4
     assert handoff["content_shape_signals"]["has_openapi_spec"] is True
     assert "provenance_index" in handoff
+
+
+def test_consolidate_narrative_emits_provenance(tmp_path: Path, fixtures_dir: Path):
+    """H6: narrative sections must carry a `<!-- source: ... raw_file: narrative/... -->`
+    provenance comment so `validate` accepts them."""
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "narrative").mkdir()
+    shutil.copy(fixtures_dir / "tiny-openapi-3.json", tmp_path / "raw" / "spec.json")
+    (tmp_path / "narrative" / "authentication.md").write_text("Use a Bearer token.")
+    (tmp_path / "narrative" / "errors.md").write_text("HTTP status codes.")
+    (tmp_path / "narrative" / "gotchas.md").write_text("Watch out for ratelimits.")
+    rc = cmd_consolidate.run(_args(str(tmp_path)))
+    assert rc == 0
+    docs = (tmp_path / "docs.md").read_text()
+    # Authentication section already had provenance — keep that working.
+    assert "Use a Bearer token." in docs
+    # Errors + Gotchas now must have provenance comments
+    assert "## Errors" in docs
+    assert "raw_file: narrative/errors.md" in docs
+    assert "raw_file: narrative/gotchas.md" in docs
+
+
+def test_handoff_coverage_checklist_populated(tmp_path: Path, fixtures_dir: Path):
+    """H9: handoff.coverage_checklist must list the 8 canonical sections
+    with `name` + `status` (covered | partial | missing)."""
+    (tmp_path / "raw").mkdir()
+    shutil.copy(fixtures_dir / "tiny-openapi-3.json", tmp_path / "raw" / "spec.json")
+    cmd_consolidate.run(_args(str(tmp_path)))
+    handoff = json.loads((tmp_path / "handoff.json").read_text())
+    cc = handoff["coverage_checklist"]
+    assert isinstance(cc, list)
+    names = {item["name"] for item in cc}
+    expected = {
+        "Installation",
+        "Authentication",
+        "Core concepts",
+        "API reference",
+        "Minimal working example",
+        "Errors",
+        "Rate limits",
+        "Gotchas",
+    }
+    assert expected.issubset(names), f"missing items: {expected - names}"
+    for item in cc:
+        assert item["status"] in ("covered", "partial", "missing")
+
+
+def test_handoff_suggested_test_cases_count(tmp_path: Path, fixtures_dir: Path):
+    """H9: handoff.suggested_test_cases must have 3-5 derived suggestions."""
+    (tmp_path / "raw").mkdir()
+    shutil.copy(fixtures_dir / "tiny-openapi-3.json", tmp_path / "raw" / "spec.json")
+    cmd_consolidate.run(_args(str(tmp_path)))
+    handoff = json.loads((tmp_path / "handoff.json").read_text())
+    stc = handoff["suggested_test_cases"]
+    assert isinstance(stc, list)
+    assert 3 <= len(stc) <= 5
+    for entry in stc:
+        assert entry.get("status") == "suggestion"
+
+
+def test_sanitize_tag_name_with_heading_injection(tmp_path: Path):
+    """H8: a tag name like `Foo\\n# INJECTED` must be sanitized so no orphan
+    H1 leaks into docs.md output."""
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "x", "version": "1"},
+        "paths": {
+            "/y": {"get": {"tags": ["Foo\n# INJECTED HEADING\n"], "responses": {"200": {"description": "ok"}}}}
+        },
+    }
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw" / "spec.json").write_text(json.dumps(spec))
+    cmd_consolidate.run(_args(str(tmp_path)))
+    docs = (tmp_path / "docs.md").read_text()
+    # No line in docs.md should be a literal `# INJECTED HEADING`
+    for line in docs.splitlines():
+        assert line.strip() != "# INJECTED HEADING"
+
+
+def test_sanitize_path_with_html_comment_injection(tmp_path: Path):
+    """H8: a path containing `<!--` must be sanitized so it can't open a
+    fake provenance comment."""
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "x", "version": "1"},
+        "paths": {
+            "/foo/<!--inject-->": {
+                "get": {"tags": ["T"], "responses": {"200": {"description": "ok"}}}
+            }
+        },
+    }
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw" / "spec.json").write_text(json.dumps(spec))
+    cmd_consolidate.run(_args(str(tmp_path)))
+    docs = (tmp_path / "docs.md").read_text()
+    # The endpoint heading must not contain a literal `<!--`
+    headings = [ln for ln in docs.splitlines() if ln.startswith("#### `")]
+    for h in headings:
+        assert "<!--" not in h

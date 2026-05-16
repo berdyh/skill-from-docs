@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import httpx
@@ -135,3 +136,57 @@ def test_missing_allow_host_exits_1(tmp_path: Path):
     args = _args(workspace=str(tmp_path), allow_host=[])
     rc = cmd_auth.run(args)
     assert rc == 1
+
+
+def test_auth_emits_fixture_and_provenance_comment(tmp_path: Path, capsys):
+    """H5: auth must write a probes/auth-<host>-<status>.json fixture and
+    the markdown must carry a `scope: auth-discovery` provenance comment so
+    `validate` can index it as a source."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        auth = req.headers.get("Authorization", "")
+        if auth == "Bearer real-secret-token":
+            return httpx.Response(200, json={"ok": True}, headers={"X-RateLimit-Limit": "10"})
+        return httpx.Response(
+            401,
+            json={"error": "unauthorized"},
+            headers={"WWW-Authenticate": "Bearer realm=api"},
+        )
+
+    args = _args(workspace=str(tmp_path))
+    rc = cmd_auth.run(args, transport=_make_transport(handler))
+    assert rc == 0
+
+    # Fixture written under probes/
+    probes_dir = tmp_path / "probes"
+    fixtures = list(probes_dir.glob("auth-*.json"))
+    assert len(fixtures) == 1, f"expected 1 auth fixture, got {fixtures}"
+    fixture = json.loads(fixtures[0].read_text())
+    assert fixture["scope"] == "auth-discovery"
+    assert fixture["request"]["url"].startswith("https://api.example.com")
+
+    # Markdown carries the provenance comment
+    out = capsys.readouterr().out
+    assert "<!-- probe:" in out
+    assert "scope: auth-discovery" in out
+    assert f"fixture: probes/{fixtures[0].name}" in out
+
+
+def test_auth_url_redacted_in_markdown(tmp_path: Path, capsys):
+    """B1: a credential-bearing endpoint URL must be redacted in the captured
+    markdown."""
+
+    def handler(req):
+        return httpx.Response(401, json={})
+
+    args = _args(
+        endpoint="https://api.example.com/v1/x?api_key=ABC123&token=DEF",
+        workspace=str(tmp_path),
+    )
+    cmd_auth.run(args, transport=_make_transport(handler))
+    out = capsys.readouterr().out
+    assert "ABC123" not in out
+    assert "DEF" not in out
+    assert "<redacted>" in out
+
+

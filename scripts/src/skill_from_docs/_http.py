@@ -78,6 +78,11 @@ def build_client(
         "timeout": timeout,
         "follow_redirects": follow_redirects,
         "http2": False,
+        # Ignore HTTP_PROXY / HTTPS_PROXY / NO_PROXY env vars so token-bearing
+        # requests never get routed through an attacker-controlled proxy. The
+        # allowlist defends against poisoned target hosts; trust_env=False
+        # closes the environment-poisoning side channel. (B4)
+        "trust_env": False,
     }
     if transport is not None:
         kwargs["transport"] = transport

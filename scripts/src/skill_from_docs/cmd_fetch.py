@@ -112,8 +112,91 @@ def _parse_spec_bytes(data: bytes) -> dict[str, Any]:
     raise FetchError("spec is not a JSON object", exit_code=3)
 
 
+def _collect_external_refs(node: Any, refs: list[str]) -> None:
+    """Walk a spec graph collecting every `$ref` string value. Internal refs
+    (`#/...`) are skipped — only external refs that prance would dereference
+    by URL/file are returned.
+    """
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k == "$ref" and isinstance(v, str):
+                if not v.startswith("#"):
+                    refs.append(v)
+            else:
+                _collect_external_refs(v, refs)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_external_refs(item, refs)
+
+
+def _validate_external_refs(
+    spec: dict[str, Any],
+    *,
+    allowlist: HostAllowlist,
+    source_host: str | None,
+) -> None:
+    """B3: reject `$ref` values that would cause prance to fetch a non-allowed
+    URL or a local file. Raises FetchError (exit 3) on the first violation.
+
+    - Internal refs (`#/...`) are always safe — never collected.
+    - `file://` and any non-http(s) scheme are rejected unconditionally.
+    - http/https refs must target a host in `allowlist` OR the same host as
+      the source spec.
+    """
+    refs: list[str] = []
+    _collect_external_refs(spec, refs)
+    for ref in refs:
+        # Strip in-document anchor for host parsing.
+        ref_url = ref.split("#", 1)[0]
+        if not ref_url:
+            # Pure fragment after stripping (shouldn't happen since '#/...' is
+            # filtered out, but be safe).
+            continue
+        parsed = urlparse(ref_url)
+        scheme = (parsed.scheme or "").lower()
+        if not scheme:
+            # Relative path ref to a sibling file — resolves against source.
+            # If source is remote, this becomes a same-host http(s) fetch and
+            # is allowed when the source host is allowed. If source is local
+            # (no spec_url), prance reads a sibling file — block it.
+            if source_host is None:
+                raise FetchError(
+                    f"external $ref to sibling file is not allowed when source is local: {ref!r}",
+                    exit_code=3,
+                )
+            continue
+        if scheme in ("file",):
+            raise FetchError(
+                f"external $ref uses file:// scheme (not allowed): {ref!r}",
+                exit_code=3,
+            )
+        if scheme not in ("http", "https"):
+            raise FetchError(
+                f"external $ref uses non-http(s) scheme {scheme!r}: {ref!r}",
+                exit_code=3,
+            )
+        host = (parsed.hostname or "").lower()
+        if not host:
+            raise FetchError(
+                f"external $ref has no host: {ref!r}", exit_code=3
+            )
+        allowed_hosts = set()
+        if source_host:
+            allowed_hosts.add(source_host.lower())
+        # allowlist exposes its hosts via __contains__
+        if host not in allowed_hosts and host not in allowlist:
+            raise FetchError(
+                f"external $ref host {host!r} is not in --allow-host: {ref!r}",
+                exit_code=3,
+            )
+
+
 def _resolve_refs(spec: dict[str, Any]) -> dict[str, Any]:
-    """Use prance to resolve $refs. On failure, return the original spec."""
+    """Use prance to resolve $refs. On failure, return the original spec.
+
+    NOTE: the caller MUST run `_validate_external_refs` first to ensure prance
+    is not given a poisoned spec with attacker-controlled `$ref` URLs (B3).
+    """
     try:
         from prance import ResolvingParser  # type: ignore
     except ImportError:
@@ -126,6 +209,11 @@ def _resolve_refs(spec: dict[str, Any]) -> dict[str, Any]:
         # If prance can't resolve (circular refs, validator failure), keep original.
         return spec
     return spec
+
+
+def _jp_escape(s: str) -> str:
+    """RFC 6901 JSON Pointer escape: `~` -> `~0`, `/` -> `~1`. (H7)"""
+    return s.replace("~", "~0").replace("/", "~1")
 
 
 def _build_source_map(spec: dict[str, Any], *, spec_url: str | None, sha256: str) -> dict[str, Any]:
@@ -143,11 +231,11 @@ def _build_source_map(spec: dict[str, Any], *, spec_url: str | None, sha256: str
                 if not isinstance(op, dict):
                     continue
                 key = f"{path}:{method.lower()}"
-                pointer_path = path.replace("~", "~0").replace("/", "~1")
+                # H7: build the pointer as `/paths/` + RFC-6901-encoded raw
+                # path. For `/v1/locations` this yields `/paths/~1v1~1locations/get`
+                # (single `~1` for each `/`), not `/paths/~11v1~1locations/get`.
                 operations[key] = {
-                    "original_pointer": f"/paths/~1{pointer_path[1:]}/{method.lower()}"
-                    if path.startswith("/")
-                    else f"/paths/{pointer_path}/{method.lower()}",
+                    "original_pointer": f"/paths/{_jp_escape(path)}/{method.lower()}",
                     "tags": op.get("tags", []),
                 }
     return {
@@ -265,9 +353,14 @@ def _check_staleness(url: str, days: int, client, *, log) -> None:
     repo = m.group("repo")
     branch = m.group("branch")
     path = m.group("path")
+    # B2: the staleness probe always targets `api.github.com`. We never honor
+    # a user-supplied override here — narrowing the attack surface.
     api_url = (
         f"https://api.github.com/repos/{owner}/{repo}/commits"
         f"?path={path}&sha={branch}&per_page=1"
+    )
+    assert urlparse(api_url).hostname == "api.github.com", (
+        "staleness check must only target api.github.com"
     )
     try:
         resp = client.get(api_url)
@@ -316,18 +409,28 @@ def run(args, *, log=None, transport=None) -> int:
     os.makedirs(os.path.join(workspace, "raw"), exist_ok=True)
     allowlist = HostAllowlist(args.allow_host)
 
+    # B2: when source is a remote URL, --allow-host is REQUIRED and must match
+    # the source host. Local paths and stdin (@-) are not network calls and
+    # skip the allowlist check.
+    if _is_url(args.source):
+        if not allowlist:
+            print(
+                "ERROR: --allow-host is required when fetching from a URL.",
+                file=sys.stderr,
+            )
+            return 1
+
     # 1. Read source bytes.
     started = now_iso()
     spec_url: str | None = None
     if args.source == "@-":
         body = sys.stdin.buffer.read()
     elif _is_url(args.source):
-        if allowlist:
-            try:
-                allowlist.check(args.source)
-            except AllowlistViolation as exc:
-                print(f"ERROR: {exc}", file=sys.stderr)
-                return 1
+        try:
+            allowlist.check(args.source)
+        except AllowlistViolation as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
         with build_client(
             timeout=args.timeout,
             user_agent=args.user_agent or DEFAULT_USER_AGENT,
@@ -358,7 +461,18 @@ def run(args, *, log=None, transport=None) -> int:
         return fe.exit_code
 
     # 3. Resolve $refs (optional).
+    # B3: validate every external $ref BEFORE handing the spec to prance — a
+    # poisoned `$ref: https://attacker.com/x` or `$ref: file:///etc/passwd`
+    # would otherwise be fetched server-side.
     if not args.no_resolve:
+        source_host = urlparse(spec_url).hostname if spec_url else None
+        try:
+            _validate_external_refs(
+                spec, allowlist=allowlist, source_host=source_host
+            )
+        except FetchError as fe:
+            print(f"ERROR: {fe}", file=sys.stderr)
+            return fe.exit_code
         spec = _resolve_refs(spec)
 
     sha = sha256_bytes(body)

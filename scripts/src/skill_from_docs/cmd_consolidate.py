@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from typing import Any
@@ -12,7 +13,7 @@ from typing import Any
 from . import __version__
 from ._manifest import file_entry, now_iso, record_run, sha256_file
 from ._provenance import emit_probe, emit_source
-from ._sanitize import sanitize_spec_descriptions, sanitize_text
+from ._sanitize import sanitize_spec_descriptions, sanitize_text, sanitize_text_for_markdown
 from ._schema import ProbeFixture
 
 
@@ -141,14 +142,24 @@ def _endpoint_block(
     raw_file: str,
     probes_for_endpoint: list[tuple[ProbeFixture, str]],
 ) -> list[str]:
-    lines: list[str] = [f"#### `{method} {path}`", ""]
+    # H8: sanitize path before embedding in a heading so `<!--` / leading `#`
+    # / `\n` in attacker-controlled path strings can't break out.
+    safe_path = sanitize_text_for_markdown(path, source_pointer=f"paths/{path}")
+    safe_method = sanitize_text_for_markdown(
+        method, source_pointer=f"paths/{path}/method"
+    )
+    lines: list[str] = [f"#### `{safe_method} {safe_path}`", ""]
     summary = op.get("summary") or ""
     description = op.get("description") or ""
     if summary:
-        lines.append(f"**{summary}**")
+        # Inline use → flatten newlines.
+        lines.append(
+            f"**{sanitize_text_for_markdown(summary, source_pointer=f'paths/{path}/summary')}**"
+        )
         lines.append("")
     if description:
-        lines.append(description)
+        # Block use — sanitize_text already escapes injection markers.
+        lines.append(sanitize_text(description, source_pointer=f"paths/{path}/description").text)
         lines.append("")
     params = op.get("parameters") or []
     if params:
@@ -210,6 +221,33 @@ def _section_or_default(narratives: dict[str, str], key: str, default: str) -> s
     return narratives.get(key, default)
 
 
+def _emit_narrative_section(
+    lines: list[str],
+    narratives: dict[str, str],
+    key: str,
+    filename: str,
+    retrieved: str,
+) -> None:
+    """H6: write a section body sourced from a narrative file, emitting a
+    `<!-- source: narrative file: ... -->` provenance comment so `validate`
+    accepts the section. Falls back to `_Not documented upstream._` when no
+    narrative exists for the section.
+    """
+    body = narratives.get(key)
+    if body:
+        lines.append(body)
+        lines.append("")
+        lines.append(
+            emit_source(
+                "(narrative)",
+                retrieved=retrieved,
+                raw_file=f"narrative/{filename}",
+            )
+        )
+    else:
+        lines.append("_Not documented upstream._")
+
+
 def _build_docs_md(
     spec: dict[str, Any] | None,
     source_map: dict[str, Any] | None,
@@ -243,7 +281,7 @@ def _build_docs_md(
     # Installation
     lines.append("## Installation")
     lines.append("")
-    lines.append(_section_or_default(narratives, "installation", "_Not documented upstream._"))
+    _emit_narrative_section(lines, narratives, "installation", "installation.md", retrieved)
     lines.append("")
 
     # Authentication
@@ -284,7 +322,7 @@ def _build_docs_md(
     # Core concepts
     lines.append("## Core concepts")
     lines.append("")
-    lines.append(_section_or_default(narratives, "core-concepts", "_Not documented upstream._"))
+    _emit_narrative_section(lines, narratives, "core-concepts", "core-concepts.md", retrieved)
     lines.append("")
 
     # API reference
@@ -316,7 +354,17 @@ def _build_docs_md(
             lines.append("_No endpoints match the filter._")
             lines.append("")
         for tag in sorted(by_tag.keys()):
-            lines.append(f"### Tag: {tag}")
+            # H8: sanitize tag name before emitting as a heading AND as part
+            # of the spec pointer in the provenance comment. A `\n` in the tag
+            # name would otherwise split the comment across lines.
+            safe_tag = sanitize_text_for_markdown(
+                tag, source_pointer=f"tags/{tag}"
+            )
+            # For pointer use: keep alphanumerics + dash/underscore; replace
+            # anything else with `_`. This keeps the pointer renderable in
+            # a single HTML comment.
+            pointer_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", safe_tag)[:80]
+            lines.append(f"### Tag: {safe_tag}")
             lines.append("")
             # H3 tag-level provenance points back to the spec root
             lines.append(
@@ -324,7 +372,7 @@ def _build_docs_md(
                     spec_url or "(local spec)",
                     retrieved=retrieved,
                     raw_file=spec_raw_rel,
-                    spec_pointer=f"/tags/{tag}",
+                    spec_pointer=f"/tags/{pointer_tag}",
                 )
             )
             lines.append("")
@@ -391,19 +439,19 @@ def _build_docs_md(
     # Errors
     lines.append("## Errors")
     lines.append("")
-    lines.append(_section_or_default(narratives, "errors", "_Not documented upstream._"))
+    _emit_narrative_section(lines, narratives, "errors", "errors.md", retrieved)
     lines.append("")
 
     # Rate limits
     lines.append("## Rate limits, quotas, versioning")
     lines.append("")
-    lines.append(_section_or_default(narratives, "rate-limits", "_Not documented upstream._"))
+    _emit_narrative_section(lines, narratives, "rate-limits", "rate-limits.md", retrieved)
     lines.append("")
 
     # Gotchas
     lines.append("## Gotchas")
     lines.append("")
-    lines.append(_section_or_default(narratives, "gotchas", "_Not documented upstream._"))
+    _emit_narrative_section(lines, narratives, "gotchas", "gotchas.md", retrieved)
     lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
@@ -482,12 +530,22 @@ def _build_handoff(
                             }
                         )
 
+    # H9: populate coverage_checklist from sections actually present in docs.md.
+    coverage_checklist = _derive_coverage_checklist(docs_md_text, spec_url)
+
+    # H9: derive 3-5 suggested test cases from spec tags + endpoint summaries.
+    suggested_test_cases = _derive_test_cases(spec, title)
+
+    # H9: pull user_declared_scope from manifest if a prior probe run recorded
+    # a --scope. Otherwise leave empty (harvest agent fills it in).
+    declared_scope, declared_languages = _read_user_declarations(workspace, spec)
+
     handoff = {
         "version": 1,
         "proposed_name": proposed_name,
         "tool_summary": info.get("description", "")[:1024],
-        "user_declared_scope": "",
-        "user_declared_languages": [],
+        "user_declared_scope": declared_scope,
+        "user_declared_languages": declared_languages,
         "archetype_primary": 4 if spec else None,
         "content_shape_signals": {
             "has_openapi_spec": bool(spec),
@@ -496,11 +554,11 @@ def _build_handoff(
             "endpoint_count": endpoint_count,
             "tag_count": tag_count,
         },
-        "coverage_checklist": [],
+        "coverage_checklist": coverage_checklist,
         "gap_list": [],
         "provenance_index": provenance_index,
         "image_inventory": [],
-        "suggested_test_cases": [],
+        "suggested_test_cases": suggested_test_cases,
         "harvest_metadata": {
             "retrieved_date": retrieved[:10],
             "tool_version": __version__,
@@ -513,6 +571,125 @@ def _build_handoff(
         if "<!-- TODO" in line:
             handoff["gap_list"].append({"line": line_num, "text": line.strip()})
     return handoff
+
+
+def _derive_coverage_checklist(
+    docs_md_text: str, spec_url: str | None
+) -> list[dict[str, Any]]:
+    """H9: walk docs.md and decide coverage status for each of the 8 canonical
+    sections. A section is `covered` if it has a non-empty body (not just
+    `_Not documented upstream._`), `partial` if it has a `<!-- TODO -->`
+    marker, and `missing` otherwise.
+    """
+    items_spec = [
+        ("Installation", "## Installation"),
+        ("Authentication", "## Authentication"),
+        ("Core concepts", "## Core concepts"),
+        ("API reference", "## API reference"),
+        ("Minimal working example", "## Minimal working example"),
+        ("Errors", "## Errors"),
+        ("Rate limits", "## Rate limits"),
+        ("Gotchas", "## Gotchas"),
+    ]
+    lines = docs_md_text.splitlines()
+    out: list[dict[str, Any]] = []
+    for name, heading in items_spec:
+        status = "missing"
+        # Find the heading; capture the body lines until the next H2.
+        idx = next((i for i, ln in enumerate(lines) if ln.startswith(heading)), None)
+        if idx is not None:
+            body = []
+            j = idx + 1
+            while j < len(lines) and not lines[j].startswith("## "):
+                body.append(lines[j])
+                j += 1
+            body_text = "\n".join(body).strip()
+            if not body_text or body_text == "_Not documented upstream._":
+                status = "missing"
+            elif "<!-- TODO" in body_text:
+                status = "partial"
+            else:
+                status = "covered"
+        sources = [spec_url] if spec_url else []
+        out.append({"name": name, "status": status, "sources": sources})
+    return out
+
+
+def _derive_test_cases(
+    spec: dict[str, Any] | None, title: str
+) -> list[dict[str, Any]]:
+    """H9: derive 3-5 trigger-phrase test cases from the spec. We surface the
+    first three endpoint summaries as natural-language phrases plus two
+    catch-all phrases (`use {title}`, `integrate with {title}`).
+    """
+    cases: list[dict[str, Any]] = []
+    if spec:
+        paths = spec.get("paths") or {}
+        seen = 0
+        for path, methods in paths.items():
+            if seen >= 3:
+                break
+            if not isinstance(methods, dict):
+                continue
+            for method, op in methods.items():
+                if not isinstance(op, dict):
+                    continue
+                summary = op.get("summary") or f"{method.upper()} {path}"
+                cases.append(
+                    {
+                        "trigger_phrase": f"{summary} via {title}",
+                        "endpoint": f"{method.upper()} {path}",
+                        "status": "suggestion",
+                    }
+                )
+                seen += 1
+                break
+    # Always pad with two catch-all phrases so the list is in the 3-5 range.
+    cases.append(
+        {
+            "trigger_phrase": f"use {title}",
+            "endpoint": None,
+            "status": "suggestion",
+        }
+    )
+    cases.append(
+        {
+            "trigger_phrase": f"integrate with {title}",
+            "endpoint": None,
+            "status": "suggestion",
+        }
+    )
+    # Cap at 5
+    return cases[:5]
+
+
+def _read_user_declarations(
+    workspace: str, spec: dict[str, Any] | None
+) -> tuple[str, list[str]]:
+    """H9: peek at manifest.json for a `--scope` arg from a previous run; peek
+    at `info.x-language` for spec-declared SDK languages. Both default to
+    empty (harvest agent fills them in)."""
+    declared_scope = ""
+    declared_languages: list[str] = []
+    try:
+        from ._manifest import load_manifest
+
+        data = load_manifest(workspace)
+        for run in data.get("runs", []):
+            args = run.get("args") or {}
+            scope = args.get("scope")
+            if isinstance(scope, str) and scope and scope != "ad-hoc":
+                declared_scope = scope
+                break
+    except Exception:
+        pass
+    if spec is not None:
+        x_lang = (spec.get("info") or {}).get("x-language")
+        if isinstance(x_lang, list):
+            declared_languages = [str(x) for x in x_lang]
+        elif isinstance(x_lang, str):
+            declared_languages = [x_lang]
+    return declared_scope, declared_languages
 
 
 def _count_raw_files(workspace: str) -> int:

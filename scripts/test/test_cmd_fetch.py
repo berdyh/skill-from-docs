@@ -165,3 +165,182 @@ def test_host_allowlist_violation(tmp_path: Path):
     )
     rc = cmd_fetch.run(args, transport=transport)
     assert rc == 1
+
+
+def test_fetch_url_missing_allow_host_exits_1(tmp_path: Path, capsys):
+    """B2: fetching a remote URL with no --allow-host must exit 1."""
+    transport = _transport({})
+    args = _make_args(
+        source="https://example.com/spec.json",
+        workspace=str(tmp_path),
+        allow_host=[],
+    )
+    rc = cmd_fetch.run(args, transport=transport)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--allow-host" in err
+
+
+def test_fetch_url_allow_host_mismatch_exits_1(tmp_path: Path):
+    """B2: --allow-host that doesn't include the source host must exit 1."""
+    transport = _transport({})
+    args = _make_args(
+        source="https://example.com/spec.json",
+        workspace=str(tmp_path),
+        allow_host=["api.example.com"],
+    )
+    rc = cmd_fetch.run(args, transport=transport)
+    assert rc == 1
+
+
+def test_fetch_local_path_skips_allow_host(tmp_path: Path, fixtures_dir: Path):
+    """B2: local file paths skip allow-host check — they're not network calls."""
+    args = _make_args(
+        source=str(fixtures_dir / "tiny-openapi-3.json"),
+        workspace=str(tmp_path),
+        allow_host=[],  # not required for local
+    )
+    rc = cmd_fetch.run(args)
+    assert rc == 0
+
+
+def test_staleness_only_allows_api_github_com():
+    """B2: the staleness check function constructs a URL that always targets
+    api.github.com — never user-controllable."""
+    import httpx as _httpx
+
+    captured_urls: list[str] = []
+
+    def handler(req: _httpx.Request) -> _httpx.Response:
+        captured_urls.append(str(req.url))
+        return _httpx.Response(
+            200,
+            json=[{"commit": {"committer": {"date": "2026-04-01T00:00:00Z"}}}],
+        )
+
+    transport = _httpx.MockTransport(handler)
+    with _httpx.Client(transport=transport, trust_env=False) as client:
+        cmd_fetch._check_staleness(
+            "https://raw.githubusercontent.com/owner/repo/main/openapi.json",
+            days=1,
+            client=client,
+            log=lambda m: None,
+        )
+    assert captured_urls
+    for url in captured_urls:
+        host = re.match(r"https://([^/]+)/", url).group(1)
+        assert host == "api.github.com"
+
+
+def test_external_ref_https_outside_allowlist_rejected(tmp_path: Path):
+    """B3: external $ref to a host outside the allowlist exits 3."""
+    poisoned = {
+        "openapi": "3.0.3",
+        "info": {"title": "x", "version": "1"},
+        "paths": {
+            "/y": {"get": {"$ref": "https://attacker.com/x.json"}}
+        },
+    }
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(poisoned))
+    args = _make_args(
+        source=str(spec_path),
+        workspace=str(tmp_path / "ws"),
+        allow_host=["api.example.com"],
+        no_resolve=False,
+    )
+    rc = cmd_fetch.run(args)
+    assert rc == 3
+
+
+def test_external_ref_https_in_allowlist_accepted(tmp_path: Path):
+    """B3: external $ref to a host in the allowlist is accepted (prance may
+    or may not actually fetch — that's not our concern here)."""
+    ok = {
+        "openapi": "3.0.3",
+        "info": {"title": "x", "version": "1"},
+        "paths": {
+            "/y": {"get": {"$ref": "https://api.example.com/sub.json"}}
+        },
+    }
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(ok))
+    args = _make_args(
+        source=str(spec_path),
+        workspace=str(tmp_path / "ws"),
+        allow_host=["api.example.com"],
+        no_resolve=False,
+    )
+    # Validation passes; prance may fail to resolve which is fine —
+    # `_resolve_refs` returns the original spec in that case.
+    rc = cmd_fetch.run(args)
+    assert rc == 0
+
+
+def test_external_ref_file_scheme_rejected(tmp_path: Path):
+    """B3: external $ref with file:// scheme always exits 3."""
+    poisoned = {
+        "openapi": "3.0.3",
+        "info": {"title": "x", "version": "1"},
+        "paths": {
+            "/y": {"get": {"$ref": "file:///etc/passwd"}}
+        },
+    }
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(poisoned))
+    args = _make_args(
+        source=str(spec_path),
+        workspace=str(tmp_path / "ws"),
+        allow_host=["api.example.com"],
+        no_resolve=False,
+    )
+    rc = cmd_fetch.run(args)
+    assert rc == 3
+
+
+def test_internal_ref_always_accepted(tmp_path: Path):
+    """B3: internal `#/...` $refs are always safe — never collected as external."""
+    ok = {
+        "openapi": "3.0.3",
+        "info": {"title": "x", "version": "1"},
+        "paths": {
+            "/y": {"get": {"responses": {"200": {
+                "content": {"application/json": {
+                    "schema": {"$ref": "#/components/schemas/Y"}
+                }}
+            }}}}
+        },
+        "components": {"schemas": {"Y": {"type": "object"}}},
+    }
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(ok))
+    args = _make_args(
+        source=str(spec_path),
+        workspace=str(tmp_path / "ws"),
+        allow_host=[],
+        no_resolve=False,
+    )
+    rc = cmd_fetch.run(args)
+    assert rc == 0
+
+
+def test_source_map_json_pointers_correct(tmp_path: Path):
+    """H7: source-map pointers must be RFC-6901-encoded once, not twice.
+    For `/v1/locations` the expected pointer is `/paths/~1v1~1locations/get`."""
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "x", "version": "1"},
+        "paths": {
+            "/v1/locations": {"get": {"responses": {"200": {"description": "ok"}}}},
+            "/v1/server_types/{id}": {
+                "get": {"responses": {"200": {"description": "ok"}}}
+            },
+        },
+    }
+    sm = cmd_fetch._build_source_map(spec, spec_url=None, sha256="x")
+    assert sm["operations"]["/v1/locations:get"]["original_pointer"] == (
+        "/paths/~1v1~1locations/get"
+    )
+    assert sm["operations"]["/v1/server_types/{id}:get"]["original_pointer"] == (
+        "/paths/~1v1~1server_types~1{id}/get"
+    )

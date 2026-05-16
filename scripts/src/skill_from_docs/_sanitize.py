@@ -42,6 +42,24 @@ class SanitizeResult:
     detections: list[str]
 
 
+def sanitize_text_for_markdown(text: str, *, source_pointer: str | None = None) -> str:
+    """H8: apply the same escape rules regardless of source field name. Used
+    by `consolidate` when emitting heading content (tag names, paths,
+    operation IDs) sourced from raw spec strings.
+
+    For inline use inside a heading or table cell, newlines and carriage
+    returns are flattened to spaces so attacker-controlled text cannot break
+    out of the heading line into a sibling block.
+    """
+    if not isinstance(text, str):
+        return text
+    cleaned = sanitize_text(text, source_pointer=source_pointer).text
+    # Flatten line breaks so embedded text can't escape a single-line context
+    # (heading, table cell).
+    cleaned = cleaned.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    return cleaned
+
+
 def sanitize_text(text: str, *, source_pointer: str | None = None) -> SanitizeResult:
     """Apply the full prompt-injection guard to a string.
 

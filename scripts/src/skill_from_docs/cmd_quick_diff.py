@@ -10,7 +10,9 @@ import sys
 from typing import Any
 from urllib.parse import urlparse
 
-from ._manifest import sha256_file
+from ._manifest import now_iso, sha256_file
+from ._provenance import emit_probe
+from ._redaction import redact_url
 from ._schema import ProbeFixture
 
 
@@ -216,9 +218,24 @@ def run(args) -> int:
 
     # Render report.
     lines = ["# quick-diff report", ""]
+    # H10: drift-validation provenance comment so downstream tools can index
+    # this output. Use the fixture's spec_url_at_capture when present.
+    fixture_rel = os.path.basename(args.fixture)
+    provenance_url = fixture.manifest.spec_url_at_capture or fixture.request.url
+    lines.append(
+        emit_probe(
+            fixture.request.method,
+            redact_url(provenance_url),
+            status=fixture.response.status,
+            retrieved=fixture.manifest.captured_at or now_iso(),
+            scope="drift-validation",
+            fixture=fixture_rel,
+        )
+    )
+    lines.append("")
     lines.append(f"- fixture: {args.fixture}")
     lines.append(f"- spec: {args.spec}")
-    lines.append(f"- endpoint: {fixture.request.method} {fixture.request.url}")
+    lines.append(f"- endpoint: {fixture.request.method} {redact_url(fixture.request.url)}")
     lines.append("")
     any_drift = False
     for cat, items in drift_categories.items():

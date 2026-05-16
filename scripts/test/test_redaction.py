@@ -69,3 +69,62 @@ def test_set_cookie_and_location_redaction():
     out = redact_headers(headers)
     assert out["Set-Cookie"] == REDACTED
     assert out["Location"] == REDACTED
+
+
+def test_http_client_ignores_env_proxies(monkeypatch):
+    """B4: trust_env=False prevents HTTP_PROXY/HTTPS_PROXY hijacking of
+    token-bearing requests through an attacker-controlled proxy."""
+    monkeypatch.setenv("HTTP_PROXY", "http://attacker.example:9999")
+    monkeypatch.setenv("HTTPS_PROXY", "http://attacker.example:9999")
+    monkeypatch.setenv("NO_PROXY", "")
+
+    from skill_from_docs._http import build_client
+
+    with build_client() as client:
+        # httpx merges env proxies into client config when trust_env is True.
+        # With trust_env=False the client never reads the env, so:
+        assert client.trust_env is False
+        # No proxy mounts should be installed from env.
+        for mount in getattr(client, "_mounts", {}):
+            # If any mount is configured, it should not be the attacker host.
+            # (Default httpx.Client has no env-derived mounts when trust_env=False.)
+            assert "attacker.example" not in repr(mount)
+
+
+def test_url_query_redaction_in_manifest_and_auth_markdown(tmp_path):
+    """B1: URL with sensitive query params must be redacted in manifest entries
+    and in `auth` markdown output."""
+    from skill_from_docs._manifest import record_run, load_manifest
+
+    raw_url = "https://api.example.com/x?api_key=secret&token=abc&page=2"
+    record_run(
+        str(tmp_path),
+        subcommand="probe",
+        args={"url": raw_url, "method": "GET", "scope": "ad-hoc"},
+        started_at="2026-01-01T00:00:00Z",
+        finished_at="2026-01-01T00:00:01Z",
+    )
+    data = load_manifest(str(tmp_path))
+    persisted = data["runs"][0]["args"]["url"]
+    assert "api_key=<redacted>" in persisted
+    assert "token=<redacted>" in persisted
+    assert "page=2" in persisted
+    assert "secret" not in persisted
+    assert "abc" not in persisted
+
+    # Verify auth markdown emission via _format_markdown
+    from skill_from_docs.cmd_auth import _format_markdown
+
+    md = _format_markdown(
+        {
+            "endpoint": raw_url,
+            "captured_at": "2026-01-01T00:00:00Z",
+            "unauthenticated": {"status": 401, "www_authenticate": None, "body": {}},
+            "bad_token": {"status": 401, "body": {}},
+            "attempts": [],
+            "winner": None,
+            "rate_limit_headers": {},
+        }
+    )
+    assert "secret" not in md
+    assert "api_key=<redacted>" in md or "<redacted>" in md

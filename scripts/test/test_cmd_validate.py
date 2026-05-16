@@ -103,6 +103,23 @@ def test_json_output_schema(tmp_path: Path, fixtures_dir: Path, capsys):
     assert "summary" in payload
 
 
+def test_validate_accepts_narrative_provenance(tmp_path: Path, fixtures_dir: Path):
+    """H6: a workspace with narrative-sourced sections (and matching provenance
+    comments) validates clean."""
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "narrative").mkdir()
+    shutil.copy(fixtures_dir / "tiny-openapi-3.json", tmp_path / "raw" / "spec.json")
+    (tmp_path / "narrative" / "installation.md").write_text("pip install x")
+    (tmp_path / "narrative" / "core-concepts.md").write_text("X has Y.")
+    (tmp_path / "narrative" / "errors.md").write_text("HTTP codes.")
+    (tmp_path / "narrative" / "rate-limits.md").write_text("100/hr.")
+    (tmp_path / "narrative" / "gotchas.md").write_text("Beware.")
+    (tmp_path / "narrative" / "example.md").write_text("```\ncurl https://x\n```")
+    cmd_consolidate.run(_consolidate_args(str(tmp_path)))
+    rc = cmd_validate.run(_validate_args(str(tmp_path)))
+    assert rc == 0
+
+
 def test_strict_promotes_warnings(tmp_path: Path, fixtures_dir: Path):
     ws = _seed_workspace(tmp_path, fixtures_dir)
     # tiny-openapi-3.json has no spec_format/tag_count in handoff signals.

@@ -9,9 +9,24 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import __version__
+from ._redaction import redact_url
 
 
 MANIFEST_FILENAME = "manifest.json"
+
+
+def _redact_recursive(value: Any) -> Any:
+    """Walk a JSON-like value and apply redact_url to any string that looks
+    like an http(s) URL with sensitive query params. Used so manifest entries
+    never persist raw credential-bearing URLs to disk. (B1)
+    """
+    if isinstance(value, dict):
+        return {k: _redact_recursive(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_recursive(v) for v in value]
+    if isinstance(value, str) and value.startswith(("http://", "https://")):
+        return redact_url(value)
+    return value
 
 
 def sha256_file(path: str) -> str:
@@ -68,11 +83,11 @@ def record_run(
     data["runs"].append(
         {
             "subcommand": subcommand,
-            "args": args,
+            "args": _redact_recursive(args),
             "started_at": started_at,
             "finished_at": finished_at,
-            "inputs": inputs or [],
-            "outputs": outputs or [],
+            "inputs": _redact_recursive(inputs or []),
+            "outputs": _redact_recursive(outputs or []),
         }
     )
     write_manifest(workspace, data)

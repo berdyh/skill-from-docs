@@ -16,7 +16,7 @@ from ._http import (
     build_client,
     request_with_retry,
 )
-from ._manifest import now_iso, record_run
+from ._manifest import file_entry, now_iso, record_run
 from ._redaction import redact_body, redact_headers, redact_url
 from ._slug import default_workspace
 
@@ -91,9 +91,26 @@ def _try(
 
 
 def _format_markdown(report: dict[str, Any]) -> str:
+    # B1: always URL-redact the endpoint shown to the user. Sensitive query
+    # params (api_key, token, etc.) must never survive into captured markdown.
+    endpoint_display = redact_url(report["endpoint"])
     lines: list[str] = ["# Authentication probe report", ""]
-    lines.append(f"- endpoint: `{report['endpoint']}`")
+    lines.append(f"- endpoint: `{endpoint_display}`")
     lines.append(f"- captured_at: {report['captured_at']}")
+    # H5: probe provenance comment so `validate` can index this as a source.
+    fixture_rel = report.get("fixture_relpath")
+    if fixture_rel:
+        host = urlparse(report["endpoint"]).hostname or "unknown"  # noqa: F841
+        winner_status = (
+            report["winner"]["status"]
+            if report.get("winner") and "status" in report["winner"]
+            else report["unauthenticated"]["status"]
+        )
+        lines.append(
+            f"<!-- probe: GET {endpoint_display} status: {winner_status} "
+            f"retrieved: {report['captured_at']} scope: auth-discovery "
+            f"fixture: {fixture_rel} -->"
+        )
     lines.append("")
 
     if report.get("winner"):
@@ -239,6 +256,49 @@ def run(args, *, transport=None) -> int:
         k: v for k, v in success_response_headers.items() if k.lower() in _RATE_LIMIT_HEADERS
     }
 
+    # H5: write a probe fixture for auth discovery so `validate` can index it.
+    # Use the unauth baseline as the captured response — it's the most useful
+    # signal (WWW-Authenticate header + 401 body). All fields URL-redacted.
+    probes_dir = os.path.join(workspace, "probes")
+    os.makedirs(probes_dir, exist_ok=True)
+    parsed_endpoint = urlparse(args.endpoint)
+    host_slug = (parsed_endpoint.hostname or "unknown").replace(".", "-")
+    fixture_filename = f"auth-{host_slug}-{baseline['status']}.json"
+    fixture_path = os.path.join(probes_dir, fixture_filename)
+    fixture_payload = {
+        "scope": "auth-discovery",
+        "request": {
+            "method": "GET",
+            "url": redact_url(args.endpoint),
+            "headers": {},
+            "body": None,
+        },
+        "response": {
+            "status": baseline["status"],
+            "headers": redact_headers(
+                {
+                    "WWW-Authenticate": baseline.get("www_authenticate") or "",
+                    **{k: v for k, v in rate_headers.items()},
+                }
+            ),
+            "body": baseline.get("body"),
+            "timing_ms": None,
+        },
+        "manifest": {
+            "tool_version": __import__("skill_from_docs").__version__,
+            "captured_at": started,
+            "spec_url_at_capture": None,
+            "spec_sha256_at_capture": None,
+            "winner_pattern": (winner or {}).get("name"),
+            "bad_token_status": bad_token["status"],
+            "attempts": attempts,
+        },
+    }
+    with open(fixture_path, "w", encoding="utf-8") as f:
+        json.dump(fixture_payload, f, indent=2)
+        f.write("\n")
+    fixture_rel = os.path.relpath(fixture_path, workspace)
+
     report = {
         "endpoint": args.endpoint,
         "captured_at": started,
@@ -247,6 +307,7 @@ def run(args, *, transport=None) -> int:
         "attempts": attempts,
         "winner": winner,
         "rate_limit_headers": rate_headers,
+        "fixture_relpath": fixture_rel,
     }
 
     markdown = _format_markdown(report)
@@ -264,6 +325,7 @@ def run(args, *, transport=None) -> int:
         args={"endpoint": args.endpoint, "patterns_tried": len(attempts)},
         started_at=started,
         finished_at=finished,
+        outputs=[file_entry(workspace, fixture_rel)],
     )
 
     if winner is None:
