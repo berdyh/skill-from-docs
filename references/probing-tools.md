@@ -27,7 +27,18 @@ For community-mirror sources, append `mirror: unofficial`. The `spec-pointer` va
 
 **How it shows up in `handoff.json`.** Populates `content_shape_signals.has_openapi_spec`, `spec_url`, `spec_format`, `endpoint_count`, `tag_count`. Also records the spec sha256 in `manifest.json` so `quick-diff` and `validate` can detect probe-vs-spec revision drift later.
 
-**Security defaults.** `--allow-host HOST` (repeatable) restricts where `fetch` will follow the cascade. Without it the subcommand exits 1. Mirror staleness check (when source URL is a GitHub or GitLab raw URL) calls the public commits API and warns on stderr if the file's last commit is older than `--staleness-days` (default 90). Header-based staleness detection is *not* used (HTTP `Last-Modified` on raw mirror URLs is noisy).
+**Security defaults.** `--allow-host HOST` (repeatable) restricts where `fetch` will follow the cascade. Without it the subcommand exits 1. The mirror staleness check derives its API target from the source URL — no hardcoded hosts — so the same `--staleness-days N` flag (default 90) works portably across four built-in mirror hosts:
+
+| Source URL pattern | Staleness API target | Style |
+|---|---|---|
+| `raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}` | `api.github.com/repos/{o}/{r}/commits` | `github` |
+| `gitlab.com/{owner}/{repo}/-/raw/{branch}/{path}` | `gitlab.com/api/v4/projects/{owner%2Frepo}/repository/commits` | `gitlab` |
+| `codeberg.org/{owner}/{repo}/raw/branch/{branch}/{path}` | `codeberg.org/api/v1/repos/{o}/{r}/commits` | `gitea` |
+| `bitbucket.org/{workspace}/{repo}/raw/{branch}/{path}` | `api.bitbucket.org/2.0/repositories/{w}/{r}/commits` | `bitbucket` |
+
+For self-hosted instances (Gitea, GitLab self-managed, Bitbucket Server, GitHub Enterprise), pass both `--staleness-api-host HOST` and `--staleness-api-style {github,gitlab,gitea,bitbucket}` to enable the check explicitly. Either flag alone exits 1 (half a configuration is more confusing than none). Unknown hosts with no explicit flags get a one-line stderr note naming the flags that would enable the check — the harvest continues, just without the staleness warning.
+
+The derived API host is added to a **function-local** allowlist for the single staleness call only; global `--allow-host` does not widen this scope, so the attack surface stays narrow regardless of which mirror host the spec came from. Header-based staleness detection is *not* used (HTTP `Last-Modified` on raw mirror URLs is CDN-cache noise, not commit date).
 
 ---
 

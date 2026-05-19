@@ -106,6 +106,8 @@ WARN: mirror staleness: hcloud.json last committed 2026-01-08 (118 days ago).
 
 For Hetzner, the mirror is usually fresh enough to ignore the warning; surface it to the user if it fires.
 
+The same staleness check works portably for GitLab (`gitlab.com/<o>/<r>/-/raw/...`), Gitea/codeberg (`codeberg.org/<o>/<r>/raw/branch/...`), and Bitbucket (`bitbucket.org/<w>/<r>/raw/...`) mirrors with no extra flags. Self-hosted instances opt in with `--staleness-api-host HOST` + `--staleness-api-style {github,gitlab,gitea,bitbucket}`. The recognizer lives in `scripts/src/skill_from_docs/cmd_fetch.py`.
+
 ---
 
 ## Phase 1, Step 2 — Parse spec, enumerate narrative siblings

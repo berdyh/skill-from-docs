@@ -23,6 +23,8 @@ def _make_args(**overrides):
         user_agent=None,
         timeout=5.0,
         staleness_days=0,
+        staleness_api_host=None,
+        staleness_api_style=None,
         count_endpoints=False,
         allow_host=["api.example.com"],
         workspace=None,

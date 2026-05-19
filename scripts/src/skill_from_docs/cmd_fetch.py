@@ -61,6 +61,33 @@ RENDERER_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 GITHUB_RAW_RE = re.compile(
     r"^https://raw\.githubusercontent\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/(?P<branch>[^/]+)/(?P<path>.+)$"
 )
+GITLAB_RAW_RE = re.compile(
+    r"^https://gitlab\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/-/raw/(?P<branch>[^/]+)/(?P<path>.+)$"
+)
+GITEA_RAW_RE = re.compile(
+    # Gitea/Forgejo (codeberg) raw URL: /{owner}/{repo}/raw/branch/{branch}/{path}
+    # Also matches /raw/commit/{sha}/{path} when contributors pin to a SHA.
+    r"^https://(?P<host>codeberg\.org)/(?P<owner>[^/]+)/(?P<repo>[^/]+)/raw/(?:branch|commit)/(?P<branch>[^/]+)/(?P<path>.+)$"
+)
+BITBUCKET_RAW_RE = re.compile(
+    r"^https://bitbucket\.org/(?P<workspace>[^/]+)/(?P<repo>[^/]+)/raw/(?P<branch>[^/]+)/(?P<path>.+)$"
+)
+
+# Supported `--staleness-api-style` values. Each style maps to a known
+# commits-API shape and date-field path inside `_extract_commit_date`.
+_KNOWN_STYLES = ("github", "gitlab", "gitea", "bitbucket")
+
+
+class StalenessTarget:
+    """One staleness-check API target. Derived from a spec URL or supplied
+    explicitly via --staleness-api-host + --staleness-api-style."""
+
+    __slots__ = ("api_host", "api_url", "style")
+
+    def __init__(self, api_host: str, api_url: str, style: str):
+        self.api_host = api_host
+        self.api_url = api_url
+        self.style = style
 
 
 class FetchError(Exception):
@@ -84,6 +111,18 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--user-agent")
     p.add_argument("--timeout", type=float, default=30.0)
     p.add_argument("--staleness-days", type=int, default=90)
+    p.add_argument(
+        "--staleness-api-host",
+        help="Self-hosted git instance host (e.g. git.example.com). "
+        "Must be paired with --staleness-api-style.",
+    )
+    p.add_argument(
+        "--staleness-api-style",
+        choices=_KNOWN_STYLES,
+        help="API shape for --staleness-api-host. "
+        "github = REST /repos/.../commits; gitlab = /api/v4/projects/.../commits; "
+        "gitea = /api/v1/repos/.../commits; bitbucket = /2.0/repositories/.../commits.",
+    )
     p.add_argument("--count-endpoints", action="store_true")
     p.add_argument("--allow-host", action="append", default=[])
     p.add_argument("--workspace")
@@ -342,56 +381,223 @@ def _looks_like_spec(body: bytes) -> bool:
     return False
 
 
-def _check_staleness(url: str, days: int, client, *, log) -> None:
-    if days <= 0:
-        return
-    m = GITHUB_RAW_RE.match(url)
-    if not m:
-        log("staleness check unavailable for non-GitHub raw URLs")
-        return
-    owner = m.group("owner")
-    repo = m.group("repo")
-    branch = m.group("branch")
-    path = m.group("path")
-    # B2: the staleness probe always targets `api.github.com`. We never honor
-    # a user-supplied override here — narrowing the attack surface.
-    api_url = (
-        f"https://api.github.com/repos/{owner}/{repo}/commits"
-        f"?path={path}&sha={branch}&per_page=1"
-    )
-    assert urlparse(api_url).hostname == "api.github.com", (
-        "staleness check must only target api.github.com"
-    )
+def _derive_staleness_target(source_url: str) -> StalenessTarget | None:
+    """Recognize the four built-in mirror-host patterns and build a
+    StalenessTarget for each. Returns None for unknown hosts; callers fall
+    back to explicit --staleness-api-host + --staleness-api-style flags or
+    skip the check with an actionable stderr note.
+    """
+    m = GITHUB_RAW_RE.match(source_url)
+    if m:
+        return StalenessTarget(
+            api_host="api.github.com",
+            api_url=(
+                f"https://api.github.com/repos/{m.group('owner')}/{m.group('repo')}"
+                f"/commits?path={m.group('path')}&sha={m.group('branch')}&per_page=1"
+            ),
+            style="github",
+        )
+    m = GITLAB_RAW_RE.match(source_url)
+    if m:
+        # GitLab requires URL-encoding the project's owner/repo as `owner%2Frepo`.
+        project = f"{m.group('owner')}%2F{m.group('repo')}"
+        return StalenessTarget(
+            api_host="gitlab.com",
+            api_url=(
+                f"https://gitlab.com/api/v4/projects/{project}/repository/commits"
+                f"?path={m.group('path')}&ref_name={m.group('branch')}&per_page=1"
+            ),
+            style="gitlab",
+        )
+    m = GITEA_RAW_RE.match(source_url)
+    if m:
+        host = m.group("host")
+        return StalenessTarget(
+            api_host=host,
+            api_url=(
+                f"https://{host}/api/v1/repos/{m.group('owner')}/{m.group('repo')}"
+                f"/commits?path={m.group('path')}&sha={m.group('branch')}&limit=1"
+            ),
+            style="gitea",
+        )
+    m = BITBUCKET_RAW_RE.match(source_url)
+    if m:
+        return StalenessTarget(
+            api_host="api.bitbucket.org",
+            api_url=(
+                f"https://api.bitbucket.org/2.0/repositories/{m.group('workspace')}"
+                f"/{m.group('repo')}/commits?include={m.group('branch')}"
+                f"&path={m.group('path')}&pagelen=1"
+            ),
+            style="bitbucket",
+        )
+    return None
+
+
+def _build_explicit_target(source_url: str, host: str, style: str) -> StalenessTarget | None:
+    """When auto-derivation returns None and the user passed
+    --staleness-api-host + --staleness-api-style, build the target for a
+    self-hosted instance. Requires the source URL to follow a recognizable
+    `/owner/repo/raw/...` shape so we can extract the path components.
+
+    The recognizer tries three common self-hosted layouts:
+    - Gitea-style: /{owner}/{repo}/raw/branch/{branch}/{path}
+    - Gitea-style (commit-pinned): /{owner}/{repo}/raw/commit/{sha}/{path}
+    - Simple: /{owner}/{repo}/raw/{branch}/{path}  (Bitbucket Server / Stash)
+    """
+    parsed = urlparse(source_url)
+    parts = [p for p in parsed.path.split("/") if p]
+    if len(parts) < 4 or parts[2] != "raw":
+        return None
+    owner, repo = parts[0], parts[1]
+    if len(parts) >= 6 and parts[3] in ("branch", "commit"):
+        branch = parts[4]
+        path = "/".join(parts[5:])
+    else:
+        branch = parts[3]
+        path = "/".join(parts[4:])
+    if style == "github":
+        # GitHub Enterprise; assumes /api/v3 prefix.
+        api_url = (
+            f"https://{host}/api/v3/repos/{owner}/{repo}/commits"
+            f"?path={path}&sha={branch}&per_page=1"
+        )
+    elif style == "gitlab":
+        project = f"{owner}%2F{repo}"
+        api_url = (
+            f"https://{host}/api/v4/projects/{project}/repository/commits"
+            f"?path={path}&ref_name={branch}&per_page=1"
+        )
+    elif style == "gitea":
+        api_url = (
+            f"https://{host}/api/v1/repos/{owner}/{repo}/commits"
+            f"?path={path}&sha={branch}&limit=1"
+        )
+    elif style == "bitbucket":
+        api_url = (
+            f"https://{host}/2.0/repositories/{owner}/{repo}/commits"
+            f"?include={branch}&path={path}&pagelen=1"
+        )
+    else:  # pragma: no cover — argparse choices guard this
+        return None
+    return StalenessTarget(api_host=host, api_url=api_url, style=style)
+
+
+def _extract_commit_date(payload: Any, style: str) -> str | None:
+    """Walk the style-specific JSON path to the ISO 8601 commit date."""
     try:
-        resp = client.get(api_url)
-    except Exception as e:
-        log(f"staleness check failed: {e}")
-        return
-    if resp.status_code != 200:
-        log(f"staleness check: GitHub commits API returned {resp.status_code}")
-        return
-    try:
-        commits = resp.json()
-    except Exception:
-        log("staleness check: GitHub response was not JSON")
-        return
-    if not commits:
-        log("staleness check: no commits returned for path")
-        return
-    date_str = (
-        commits[0].get("commit", {}).get("committer", {}).get("date")
-    )
-    if not date_str:
-        return
+        if style == "bitbucket":
+            values = payload.get("values") if isinstance(payload, dict) else None
+            if not values:
+                return None
+            return values[0].get("date")
+        # github / gitlab / gitea all return a top-level list of commits.
+        if not isinstance(payload, list) or not payload:
+            return None
+        first = payload[0]
+        if style == "gitlab":
+            return first.get("committed_date")
+        # github + gitea both nest under commit.committer.date
+        return (first.get("commit") or {}).get("committer", {}).get("date")
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
+def _parse_iso_date(date_str: str):
+    """Tolerant ISO 8601 parser. Returns a timezone-aware datetime or None."""
     from datetime import datetime, timezone
 
+    if not date_str:
+        return None
+    # Common shapes: "2026-05-14T10:30:00Z", "2026-05-14T10:30:00+00:00",
+    # "2026-05-14T10:30:00.000Z", "2026-05-14T10:30:00.000+00:00".
+    normalized = date_str.replace("Z", "+00:00")
     try:
-        commit_dt = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(normalized)
     except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _check_staleness(
+    source_url: str,
+    days: int,
+    client,
+    *,
+    log,
+    explicit_host: str | None = None,
+    explicit_style: str | None = None,
+) -> None:
+    """Portable staleness check. Auto-derives the API target from the source
+    URL's host; falls back to explicit flags for self-hosted instances; skips
+    with an actionable note when neither resolves.
+
+    Replaces the original GitHub-only logic. The derived `api_host` becomes a
+    function-local allowlist for the single staleness call — global
+    `--allow-host` is NOT honored here, preserving the narrowed attack surface
+    the codex review imposed.
+    """
+    if days <= 0:
         return
+
+    target = _derive_staleness_target(source_url)
+    if target is None and explicit_host and explicit_style:
+        target = _build_explicit_target(source_url, explicit_host, explicit_style)
+    if target is None:
+        host = urlparse(source_url).hostname or "(unknown)"
+        log(
+            f"NOTE: staleness check unavailable for host '{host}'. "
+            "Pass --staleness-api-host HOST --staleness-api-style "
+            "{github|gitlab|gitea|bitbucket} to enable the check against a "
+            "self-hosted instance."
+        )
+        return
+
+    # Function-local allowlist: only the derived/explicit api_host is allowed
+    # for this one outbound call. Global --allow-host does not widen this scope.
+    local_allowlist = HostAllowlist([target.api_host])
+    try:
+        local_allowlist.check(target.api_url)
+    except AllowlistViolation as exc:
+        log(f"staleness check: internal allowlist mismatch ({exc})")
+        return
+
+    try:
+        resp = client.get(target.api_url)
+    except Exception as e:
+        log(f"staleness check failed ({target.style}): {e}")
+        return
+    if resp.status_code != 200:
+        log(
+            f"staleness check: {target.style} commits API returned "
+            f"{resp.status_code}"
+        )
+        return
+    try:
+        payload = resp.json()
+    except Exception:
+        log(f"staleness check: {target.style} response was not JSON")
+        return
+
+    date_str = _extract_commit_date(payload, target.style)
+    if not date_str:
+        log(f"staleness check: no commit date found in {target.style} response")
+        return
+    commit_dt = _parse_iso_date(date_str)
+    if commit_dt is None:
+        log(f"staleness check: could not parse commit date {date_str!r}")
+        return
+
+    from datetime import datetime, timezone
+
     age_days = (datetime.now(timezone.utc) - commit_dt).days
     if age_days > days:
-        log(f"WARNING: mirror is {age_days} days old (threshold: {days} days)")
+        log(
+            f"WARNING: mirror is {age_days} days old "
+            f"(threshold: {days} days, source: {target.style})"
+        )
 
 
 def run(args, *, log=None, transport=None) -> int:
@@ -403,6 +609,16 @@ def run(args, *, log=None, transport=None) -> int:
         def log(msg: str) -> None:
             if not args.quiet:
                 print(msg, file=sys.stderr)
+
+    # --staleness-api-host and --staleness-api-style must be paired or both
+    # absent. Half a configuration is more confusing than none.
+    if bool(args.staleness_api_host) != bool(args.staleness_api_style):
+        print(
+            "ERROR: --staleness-api-host and --staleness-api-style must be "
+            "passed together (or both omitted).",
+            file=sys.stderr,
+        )
+        return 1
 
     workspace = args.workspace or default_workspace(args.source)
     os.makedirs(workspace, exist_ok=True)
@@ -444,7 +660,14 @@ def run(args, *, log=None, transport=None) -> int:
             except Exception as e:
                 print(f"ERROR: network error: {e}", file=sys.stderr)
                 return 2
-            _check_staleness(spec_url, args.staleness_days, client, log=log)
+            _check_staleness(
+                spec_url,
+                args.staleness_days,
+                client,
+                log=log,
+                explicit_host=args.staleness_api_host,
+                explicit_style=args.staleness_api_style,
+            )
     else:
         if not os.path.exists(args.source):
             print(f"ERROR: file not found: {args.source}", file=sys.stderr)
