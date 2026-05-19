@@ -36,7 +36,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--short-circuit", dest="short_circuit", action="store_true", default=True)
     p.add_argument("--no-short-circuit", dest="short_circuit", action="store_false")
     p.add_argument("--include-query-auth", action="store_true", default=False)
-    p.add_argument("--basic-creds")
+    p.add_argument("--basic-creds", help="USER:PASS on the command line (logs to shell history).")
+    p.add_argument(
+        "--basic-creds-env",
+        help="Name of env var containing USER:PASS (preferred over --basic-creds).",
+    )
+    p.add_argument(
+        "--spec",
+        help="Optional OpenAPI spec path. When provided, the cascade is filtered to "
+        "the spec's declared securitySchemes (header-based preferred automatically).",
+    )
     p.add_argument("--bad-token-pattern", default=FIXED_BAD_TOKEN)
     p.add_argument("--allow-host", action="append", default=[])
     p.add_argument(
@@ -62,6 +71,190 @@ HEADER_PATTERNS = [
 def _basic_header(creds: str) -> dict[str, str]:
     encoded = base64.b64encode(creds.encode("utf-8")).decode("ascii")
     return {"Authorization": f"Basic {encoded}"}
+
+
+def _resolve_basic_creds(args) -> tuple[str | None, int]:
+    """Resolve Basic credentials from --basic-creds OR --basic-creds-env.
+
+    Returns (creds_or_None, exit_code). exit_code is 0 on success (creds may be
+    None if Basic was not requested), or 1 on user error. Env-var path is
+    preferred because CLI creds leak via shell history / ps output / process
+    listings; --basic-creds prints a stderr warning so contributors notice.
+    """
+    if args.basic_creds and args.basic_creds_env:
+        print(
+            "ERROR: --basic-creds and --basic-creds-env are mutually exclusive.",
+            file=sys.stderr,
+        )
+        return (None, 1)
+    if args.basic_creds_env:
+        creds = os.environ.get(args.basic_creds_env)
+        if not creds:
+            print(
+                f"ERROR: env var {args.basic_creds_env!r} is not set or is empty.",
+                file=sys.stderr,
+            )
+            return (None, 1)
+        return (creds, 0)
+    if args.basic_creds:
+        print(
+            "WARNING: --basic-creds passes credentials on the command line, which "
+            "leaks via shell history and process listings. Use --basic-creds-env "
+            "VARNAME instead for production use.",
+            file=sys.stderr,
+        )
+        return (args.basic_creds, 0)
+    return (None, 0)
+
+
+def _classify_winner(name: str | None) -> tuple[str | None, list[str]]:
+    """Classify the winning pattern. Returns (auth_method, security_warnings).
+
+    Downstream skill-creator reads these from handoff.json.content_shape_signals
+    to decide what the generated integration skill must warn users about.
+    """
+    if name is None:
+        return (None, [])
+    if name.startswith("query "):
+        return (
+            "query_string",
+            [
+                "Query-string credentials leak into logs, proxies, CDN caches, "
+                "browser history, and server access logs. The generated integration "
+                "skill MUST warn users about this risk and recommend migrating to a "
+                "header-based pattern if the API supports it."
+            ],
+        )
+    if name == "Basic auth":
+        return (
+            "basic",
+            [
+                "Basic auth credentials. The generated integration skill MUST load "
+                "USER:PASS from environment variables (never hardcode in source or "
+                "docs). Recommend a credential helper for local development."
+            ],
+        )
+    if name == "Bearer header":
+        return ("bearer", [])
+    if name in ("Token header", "raw Authorization"):
+        return ("auth_token_header", [])
+    return ("api_key_header", [])
+
+
+def _load_spec_schemes(spec_path: str) -> dict[str, Any]:
+    """Load components.securitySchemes from a local OpenAPI spec file.
+
+    Tries JSON first; falls back to YAML if pyyaml is available. Returns an
+    empty dict if the spec can't be parsed or doesn't declare schemes.
+    """
+    try:
+        with open(spec_path, "rb") as f:
+            text = f.read()
+    except OSError:
+        return {}
+    try:
+        spec = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            import yaml  # type: ignore
+
+            spec = yaml.safe_load(text)
+        except Exception:
+            return {}
+    if not isinstance(spec, dict):
+        return {}
+    components = spec.get("components") or {}
+    schemes = components.get("securitySchemes") or {}
+    return schemes if isinstance(schemes, dict) else {}
+
+
+def _filter_cascade_by_spec(
+    cascade: list[tuple[str, dict[str, str], str]],
+    schemes: dict[str, Any],
+    include_query_auth: bool,
+) -> tuple[list[tuple[str, dict[str, str], str]], list[str]]:
+    """Filter the auth cascade to patterns the spec actually declares.
+
+    Implements the prefer-header-automatically rule: if the spec declares any
+    header-based scheme, query-string patterns are dropped from the cascade even
+    when --include-query-auth was set. The user gets a warning so the override
+    is legible. Returns (filtered_cascade, warnings).
+    """
+    warnings: list[str] = []
+    if not schemes:
+        return cascade, warnings  # No declared schemes: keep brute-force.
+
+    has_bearer = False
+    has_basic = False
+    declared_api_key_headers: set[str] = set()
+    declared_api_key_query: set[str] = set()
+    for scheme in schemes.values():
+        if not isinstance(scheme, dict):
+            continue
+        stype = scheme.get("type")
+        if stype == "http":
+            scheme_kind = (scheme.get("scheme") or "").lower()
+            if scheme_kind == "bearer":
+                has_bearer = True
+            elif scheme_kind == "basic":
+                has_basic = True
+        elif stype == "apiKey":
+            in_ = scheme.get("in")
+            name_ = scheme.get("name")
+            if not name_:
+                continue
+            if in_ == "header":
+                declared_api_key_headers.add(name_)
+            elif in_ == "query":
+                declared_api_key_query.add(name_)
+
+    has_any_header_pattern = has_bearer or has_basic or bool(declared_api_key_headers)
+
+    if has_any_header_pattern and include_query_auth:
+        warnings.append(
+            "Spec declares header-based authentication; query-string patterns excluded "
+            "from probe cascade despite --include-query-auth (prefer-header-automatically "
+            "policy). Pass --no-prefer-header-automatically if you really need both."
+        )
+
+    filtered: list[tuple[str, dict[str, str], str]] = []
+    for entry in cascade:
+        pattern_name = entry[0]
+        keep = False
+        if pattern_name == "Bearer header" and has_bearer:
+            keep = True
+        elif pattern_name == "Token header" and has_bearer:
+            # Many APIs accept "Token <X>" as a Bearer alias; keep for tolerance.
+            keep = True
+        elif pattern_name == "raw Authorization" and (has_bearer or has_basic):
+            keep = True
+        elif pattern_name == "Basic auth" and has_basic:
+            keep = True
+        elif pattern_name == "X-API-Key" and "X-API-Key" in declared_api_key_headers:
+            keep = True
+        elif pattern_name == "X-Auth-Token" and "X-Auth-Token" in declared_api_key_headers:
+            keep = True
+        elif pattern_name == "Api-Key" and "Api-Key" in declared_api_key_headers:
+            keep = True
+        elif pattern_name == "Token (custom header)" and "Token" in declared_api_key_headers:
+            keep = True
+        elif pattern_name.startswith("query "):
+            qkey = pattern_name.replace("query ?", "").rstrip("=")
+            # Only keep query patterns if spec declares them AND no header alternative.
+            if qkey in declared_api_key_query and not has_any_header_pattern:
+                keep = True
+        if keep:
+            filtered.append(entry)
+
+    if not filtered:
+        # Spec declares only schemes we don't probe (e.g., oauth2). Fall through.
+        warnings.append(
+            "Spec declares only schemes openapi-harvest doesn't probe (e.g., oauth2, "
+            "openIdConnect). Falling back to the full brute-force cascade."
+        )
+        return cascade, warnings
+
+    return filtered, warnings
 
 
 def _query_url(url: str, key: str, value: str) -> str:
@@ -143,6 +336,18 @@ def _format_markdown(report: dict[str, Any]) -> str:
         lines.append("## Rate-limit headers (from success response)")
         for k, v in report["rate_limit_headers"].items():
             lines.append(f"- `{k}: {v}`")
+        lines.append("")
+
+    # Security guidance — propagates the auth-method policy to docs.md and
+    # ultimately to handoff.json. skill-creator reads this to decide what
+    # warnings to emit in the generated integration skill.
+    auth_method = report.get("auth_method")
+    warnings = report.get("security_warnings") or []
+    if warnings:
+        lines.append(f"## Security guidance (auth_method: `{auth_method}`)")
+        for w in warnings:
+            lines.append(f"- {w}")
+        lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
 
@@ -174,6 +379,10 @@ def run(args, *, transport=None) -> int:
     except AllowlistViolation as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+
+    resolved_basic_creds, basic_exit = _resolve_basic_creds(args)
+    if basic_exit != 0:
+        return basic_exit
 
     workspace = args.workspace or default_workspace(args.endpoint)
     os.makedirs(workspace, exist_ok=True)
@@ -224,11 +433,24 @@ def run(args, *, transport=None) -> int:
         cascade: list[tuple[str, dict[str, str], str]] = []
         for name, fn in HEADER_PATTERNS:
             cascade.append((name, fn(args.token), args.endpoint))
-        if args.basic_creds:
-            cascade.append(("Basic auth", _basic_header(args.basic_creds), args.endpoint))
+        basic_creds = resolved_basic_creds  # from _resolve_basic_creds above
+        if basic_creds:
+            cascade.append(("Basic auth", _basic_header(basic_creds), args.endpoint))
         if args.include_query_auth:
             for k in ("api_key", "token", "access_token", "key"):
                 cascade.append((f"query ?{k}=", {}, _query_url(args.endpoint, k, args.token)))
+
+        # Spec-aware filtering. Prefer-header-automatically rule lives here:
+        # if the spec declares a header-based scheme, query patterns drop out
+        # of the cascade even when --include-query-auth was set.
+        spec_filter_warnings: list[str] = []
+        if args.spec:
+            schemes = _load_spec_schemes(args.spec)
+            cascade, spec_filter_warnings = _filter_cascade_by_spec(
+                cascade, schemes, args.include_query_auth
+            )
+            for warn_line in spec_filter_warnings:
+                print(f"NOTE: {warn_line}", file=sys.stderr)
 
         for name, headers, url in cascade:
             try:
@@ -255,6 +477,15 @@ def run(args, *, transport=None) -> int:
     rate_headers = {
         k: v for k, v in success_response_headers.items() if k.lower() in _RATE_LIMIT_HEADERS
     }
+
+    # Classify the winning pattern so the markdown report + fixture manifest +
+    # downstream handoff.json all carry the same signal. skill-creator reads
+    # this from handoff.content_shape_signals.auth_method to decide what
+    # warnings the generated integration skill must surface.
+    winner_name = (winner or {}).get("name")
+    auth_method, security_warnings = _classify_winner(winner_name)
+    if spec_filter_warnings:
+        security_warnings = security_warnings + spec_filter_warnings
 
     # H5: write a probe fixture for auth discovery so `validate` can index it.
     # Use the unauth baseline as the captured response — it's the most useful
@@ -290,6 +521,8 @@ def run(args, *, transport=None) -> int:
             "spec_url_at_capture": None,
             "spec_sha256_at_capture": None,
             "winner_pattern": (winner or {}).get("name"),
+            "auth_method": auth_method,
+            "security_warnings": security_warnings,
             "bad_token_status": bad_token["status"],
             "attempts": attempts,
         },
@@ -308,6 +541,8 @@ def run(args, *, transport=None) -> int:
         "winner": winner,
         "rate_limit_headers": rate_headers,
         "fixture_relpath": fixture_rel,
+        "auth_method": auth_method,
+        "security_warnings": security_warnings,
     }
 
     markdown = _format_markdown(report)

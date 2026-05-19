@@ -254,3 +254,64 @@ def test_sanitize_path_with_html_comment_injection(tmp_path: Path):
     headings = [ln for ln in docs.splitlines() if ln.startswith("#### `")]
     for h in headings:
         assert "<!--" not in h
+
+
+def test_handoff_propagates_auth_method_from_auth_discovery_probe(tmp_path: Path):
+    """Auth-discovery probes carry auth_method + security_warnings in their
+    manifest. consolidate must lift them into handoff.content_shape_signals
+    so skill-creator can decide what warnings the generated skill emits."""
+    (tmp_path / "raw").mkdir()
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "Test", "version": "1.0.0"},
+        "paths": {"/x": {"get": {"summary": "x"}}},
+        "components": {"securitySchemes": {"bearer": {"type": "http", "scheme": "bearer"}}},
+    }
+    (tmp_path / "raw" / "spec.json").write_text(json.dumps(spec))
+
+    # Synthetic auth-discovery probe fixture.
+    probes_dir = tmp_path / "probes"
+    probes_dir.mkdir()
+    fixture = {
+        "scope": "auth-discovery",
+        "request": {"method": "GET", "url": "https://api.example.com/x", "headers": {}, "body": None},
+        "response": {"status": 401, "headers": {}, "body": None, "timing_ms": None},
+        "manifest": {
+            "tool_version": "0.1.0",
+            "captured_at": "2026-05-16T00:00:00Z",
+            "spec_url_at_capture": None,
+            "spec_sha256_at_capture": None,
+            "auth_method": "query_string",
+            "security_warnings": [
+                "Query-string credentials leak into logs, proxies, CDN caches.",
+            ],
+            "winner_pattern": "query ?api_key=",
+            "bad_token_status": 401,
+            "attempts": [],
+        },
+    }
+    (probes_dir / "auth-api-example-com-401.json").write_text(json.dumps(fixture))
+
+    cmd_consolidate.run(_args(str(tmp_path), merge_probes=True))
+    handoff = json.loads((tmp_path / "handoff.json").read_text())
+    signals = handoff["content_shape_signals"]
+    assert signals.get("auth_method") == "query_string"
+    warnings = signals.get("security_warnings") or []
+    assert any("logs" in w for w in warnings)
+
+
+def test_handoff_omits_auth_method_when_no_auth_probe(tmp_path: Path):
+    """Workspaces without auth-discovery probes get no auth_method key.
+    Absent = not yet checked; readers must not infer false."""
+    (tmp_path / "raw").mkdir()
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "Test", "version": "1.0.0"},
+        "paths": {"/x": {"get": {"summary": "x"}}},
+    }
+    (tmp_path / "raw" / "spec.json").write_text(json.dumps(spec))
+    cmd_consolidate.run(_args(str(tmp_path)))
+    handoff = json.loads((tmp_path / "handoff.json").read_text())
+    signals = handoff["content_shape_signals"]
+    assert "auth_method" not in signals
+    assert "security_warnings" not in signals

@@ -457,6 +457,27 @@ def _build_docs_md(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _collect_auth_method_signals(
+    probes: list[tuple[ProbeFixture, str]],
+) -> tuple[str | None, list[str]]:
+    """Find the auth-discovery probe (if any) and lift its auth_method +
+    security_warnings out of the fixture manifest so they can flow into
+    handoff.content_shape_signals. Returns (auth_method, warnings).
+
+    skill-creator reads auth_method (`bearer` | `auth_token_header` |
+    `api_key_header` | `basic` | `query_string`) to decide what the generated
+    integration skill must warn users about and how it loads credentials.
+    """
+    for fixture, _name in probes:
+        if fixture.scope != "auth-discovery":
+            continue
+        method = fixture.manifest.auth_method
+        if method is None:
+            continue
+        return method, list(fixture.manifest.security_warnings)
+    return None, []
+
+
 def _build_handoff(
     workspace: str,
     spec: dict[str, Any] | None,
@@ -540,6 +561,22 @@ def _build_handoff(
     # a --scope. Otherwise leave empty (harvest agent fills it in).
     declared_scope, declared_languages = _read_user_declarations(workspace, spec)
 
+    # Lift auth_method + security_warnings from any auth-discovery probe so
+    # skill-creator can read them from handoff.content_shape_signals and
+    # decide what the generated integration skill must warn users about.
+    auth_method, auth_security_warnings = _collect_auth_method_signals(probes)
+
+    content_shape_signals: dict[str, Any] = {
+        "has_openapi_spec": bool(spec),
+        "spec_url": spec_url,
+        "spec_format": spec_format,
+        "endpoint_count": endpoint_count,
+        "tag_count": tag_count,
+    }
+    if auth_method is not None:
+        content_shape_signals["auth_method"] = auth_method
+        content_shape_signals["security_warnings"] = auth_security_warnings
+
     handoff = {
         "version": 1,
         "proposed_name": proposed_name,
@@ -547,13 +584,7 @@ def _build_handoff(
         "user_declared_scope": declared_scope,
         "user_declared_languages": declared_languages,
         "archetype_primary": 4 if spec else None,
-        "content_shape_signals": {
-            "has_openapi_spec": bool(spec),
-            "spec_url": spec_url,
-            "spec_format": spec_format,
-            "endpoint_count": endpoint_count,
-            "tag_count": tag_count,
-        },
+        "content_shape_signals": content_shape_signals,
         "coverage_checklist": coverage_checklist,
         "gap_list": [],
         "provenance_index": provenance_index,

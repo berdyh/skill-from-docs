@@ -28,6 +28,9 @@ class ProbeManifest:
     captured_at: str
     spec_url_at_capture: str | None = None
     spec_sha256_at_capture: str | None = None
+    # auth-discovery probes carry these. Other scopes leave them None.
+    auth_method: str | None = None
+    security_warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -57,6 +60,8 @@ class ProbeFixture:
                 "captured_at": self.manifest.captured_at,
                 "spec_url_at_capture": self.manifest.spec_url_at_capture,
                 "spec_sha256_at_capture": self.manifest.spec_sha256_at_capture,
+                "auth_method": self.manifest.auth_method,
+                "security_warnings": list(self.manifest.security_warnings),
             },
         }
 
@@ -84,6 +89,8 @@ class ProbeFixture:
                 captured_at=man.get("captured_at", ""),
                 spec_url_at_capture=man.get("spec_url_at_capture"),
                 spec_sha256_at_capture=man.get("spec_sha256_at_capture"),
+                auth_method=man.get("auth_method"),
+                security_warnings=list(man.get("security_warnings") or []),
             ),
         )
 

@@ -49,9 +49,18 @@ For community-mirror sources, append `mirror: unofficial`. The `spec-pointer` va
 
 The captured 401 envelope (from the fixed bad-token call) also feeds `## Errors`.
 
-**How it shows up in `handoff.json`.** Populates the `coverage_checklist.Authentication` entry. The captured fixture lands in `provenance_index` under the relevant H2 with `type: probe` and `scope: auth-discovery`.
+**How it shows up in `handoff.json`.** Populates the `coverage_checklist.Authentication` entry. The captured fixture lands in `provenance_index` under the relevant H2 with `type: probe` and `scope: auth-discovery`. The winning pattern is classified into one of five `auth_method` values — `bearer`, `auth_token_header`, `api_key_header`, `basic`, `query_string` — and surfaced as `content_shape_signals.auth_method`. Any policy warnings (e.g., "query-string credentials leak into logs") flow into `content_shape_signals.security_warnings`. **skill-creator reads these signals to decide what the generated integration skill must warn users about and how it should load credentials.**
 
-**Security defaults.** `--allow-host HOST` is required; endpoint host must match. Cascade is header-only by default. Query-string auth patterns (`?api_key=`, `?token=`, etc.) require `--include-query-auth` because the URL reaches logs, proxies, caches, and fixture files. `Authorization: Basic` requires `--basic-creds USER:PASS` to opt in. The 401-capture probe uses the literal string `aaaaaaaa-bad-token-bbbbbbbb` rather than deriving from the real token, so the real token cannot leak via the bad-token call. Redirects are blocked by default. Default redaction (auth headers, sensitive body keys, `Set-Cookie`, `Location`, sensitive URL query keys) applies to the saved fixture.
+**Auth-method policy.** Four rules govern what the cascade tries and how the result flows downstream:
+
+| Auth method | Cascade behavior | Generated-skill guidance |
+|---|---|---|
+| **Bearer / API-key header** | Enabled by default, preferred. Bearer is first in the cascade. Short-circuit on first 200. | No special guidance — this is the safe default. |
+| **Query-string auth** | Opt-in via `--include-query-auth`. When the spec is provided (`--spec`) and declares any header-based scheme, query patterns are dropped automatically with a stderr note ("prefer-header-automatically"). | If query auth wins, the markdown report emits a `## Security guidance` block and `handoff.json` carries a warning that the generated skill MUST surface to users (logs / proxies / CDN caches / browser history leakage). |
+| **Basic auth** | Opt-in via `--basic-creds USER:PASS` (stderr warning recommends switching) or, preferred, `--basic-creds-env VARNAME` (reads `USER:PASS` from the named env var — no shell-history exposure). | If Basic wins, the markdown report and `handoff.json` direct skill-creator to load credentials from environment variables in the generated integration skill, never hardcoded. |
+| **Both supported by docs** | Pass `--spec PATH` and the cascade is filtered to declared `securitySchemes` only, with header-based always preferred over query-string. | The fixture manifest records which schemes the spec declared so skill-creator can pick the safer one. |
+
+**Security defaults.** `--allow-host HOST` is required; endpoint host must match. Cascade is header-only by default. Query-string auth patterns (`?api_key=`, `?token=`, etc.) require `--include-query-auth` because the URL reaches logs, proxies, caches, and fixture files. `Authorization: Basic` requires `--basic-creds USER:PASS` (CLI; warns) or `--basic-creds-env VARNAME` (env var; preferred) to opt in. The 401-capture probe uses the literal string `aaaaaaaa-bad-token-bbbbbbbb` rather than deriving from the real token, so the real token cannot leak via the bad-token call. Redirects are blocked by default. Default redaction (auth headers, sensitive body keys, `Set-Cookie`, `Location`, sensitive URL query keys) applies to the saved fixture and to the markdown output (URL query strings carrying `api_key=`/`token=`/etc. are redacted before display).
 
 ---
 
