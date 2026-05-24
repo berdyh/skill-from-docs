@@ -1,0 +1,30 @@
+{
+  "scope": "case-study",
+  "request": {
+    "method": "GET",
+    "url": "https://api.hetzner.cloud/v1/datacenters",
+    "headers": {"Authorization": "<redacted>"},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "headers": {
+      "Content-Type": "application/json",
+      "Link": "<https://api.hetzner.cloud/v1/datacenters?page=2>; rel=\"next\"",
+      "X-RateLimit-Limit": "3600"
+    },
+    "body": {
+      "datacenters": [
+        {"id": 1, "name": "fsn1-dc14", "location": {"id": 1, "name": "fsn1", "city": "Falkenstein"}},
+        {"id": 2, "name": "nbg1-dc3", "location": {"id": 2, "name": "nbg1", "city": "Nuremberg"}}
+      ]
+    },
+    "timing_ms": 64
+  },
+  "manifest": {
+    "tool_version": "0.1.0",
+    "captured_at": "2026-05-01T10:01:00Z",
+    "spec_url_at_capture": "https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json",
+    "spec_sha256_at_capture": "offline-fixture"
+  }
+}

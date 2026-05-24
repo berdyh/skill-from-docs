@@ -1,0 +1,11 @@
+[
+  {
+    "sha": "deadbeef",
+    "commit": {
+      "committer": {
+        "date": "2020-01-15T12:00:00Z"
+      },
+      "message": "old commit"
+    }
+  }
+]

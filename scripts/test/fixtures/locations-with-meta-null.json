@@ -1,0 +1,24 @@
+{
+  "scope": "drift-validation",
+  "request": {
+    "method": "GET",
+    "url": "https://api.example.com/locations",
+    "headers": {},
+    "body": null
+  },
+  "response": {
+    "status": 200,
+    "headers": {"Content-Type": "application/json"},
+    "body": {
+      "locations": [],
+      "meta": {"pagination": null}
+    },
+    "timing_ms": 30
+  },
+  "manifest": {
+    "tool_version": "0.1.0",
+    "captured_at": "2026-05-01T12:00:00Z",
+    "spec_url_at_capture": null,
+    "spec_sha256_at_capture": null
+  }
+}

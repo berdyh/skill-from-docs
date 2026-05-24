@@ -1,0 +1,11 @@
+[
+  {
+    "sha": "abc1234",
+    "commit": {
+      "committer": {
+        "date": "2026-04-15T12:00:00Z"
+      },
+      "message": "recent commit"
+    }
+  }
+]

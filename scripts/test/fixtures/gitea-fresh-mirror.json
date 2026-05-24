@@ -1,0 +1,18 @@
+[
+  {
+    "sha": "abc1234",
+    "commit": {
+      "author": {
+        "name": "Test",
+        "email": "test@example.com",
+        "date": "2026-04-15T12:00:00Z"
+      },
+      "committer": {
+        "name": "Test",
+        "email": "test@example.com",
+        "date": "2026-04-15T12:00:00Z"
+      },
+      "message": "recent commit"
+    }
+  }
+]

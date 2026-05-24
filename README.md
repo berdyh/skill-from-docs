@@ -67,13 +67,20 @@ skill-from-docs/
 ├── SKILL.md                                  # main workflow: classify → harvest → handoff
 ├── README.md
 ├── LICENSE
-└── references/
-    ├── archetypes.md                         # six docs archetypes + per-archetype strategy
-    ├── discovery.md                          # per-platform patterns (ReadTheDocs, Mintlify, ...)
-    ├── doc-template.md                       # structure for the consolidated docs.md
-    ├── case-study-fusesoc.md                 # deep walkthrough: multi-source scattered
-    ├── case-study-resend-spa.md              # vignette: SPA / JS-rendered
-    └── case-study-yandex-nonenglish.md       # vignette: non-English partial
+├── references/
+│   ├── archetypes.md                         # six docs archetypes + per-archetype strategy
+│   ├── discovery.md                          # per-platform patterns (ReadTheDocs, Mintlify, ...)
+│   ├── doc-template.md                       # structure for the consolidated docs.md
+│   ├── probing-tools.md                      # openapi-harvest subcommand reference + security model
+│   ├── case-study-fusesoc.md                 # deep walkthrough: multi-source scattered
+│   ├── case-study-resend-spa.md              # vignette: SPA / JS-rendered
+│   ├── case-study-yandex-nonenglish.md       # vignette: non-English partial
+│   └── case-study-hetzner-openapi.md         # vignette: OpenAPI-only (archetype 4) with optional live probing
+└── scripts/                                  # optional CLI dev kit for archetype-4 harvesting
+    ├── README.md
+    ├── pyproject.toml
+    ├── src/skill_from_docs/                  # openapi-harvest CLI (6 subcommands)
+    └── test/                                 # ~71 pytest tests + fixtures
 ```
 
 The case studies are tiered. FuseSoC is a deep end-to-end walkthrough — read it once in full to understand how all four phases fit together. Resend and Yandex are shorter, focused on the one hard decision specific to their archetype. Read the case that matches what you classified in Phase 1 Step 0.
@@ -90,6 +97,12 @@ The skill handles any of these routinely:
 6. **Non-English partial** — regional APIs where the entry URL is a deep subpage
 
 Full recognition signals and strategies in `references/archetypes.md`.
+
+### Optional CLI dev kit for archetype 4
+
+For OpenAPI-only APIs, `skill-from-docs` ships an optional CLI tool, `openapi-harvest`, in `scripts/`. It exposes six subcommands — `fetch`, `auth`, `probe`, `quick-diff`, `consolidate`, `validate` — covering spec discovery (across Swagger UI, ReDoc, Stoplight, Scalar, RapiDoc renderers), auth-pattern detection, scoped live probing with default-redaction and host-allowlist, spec-vs-reality drift reporting, workspace consolidation (emits both `docs.md` and `handoff.json`), and a "you're done when…" completion checkpoint.
+
+Install with `pip install -e ./scripts`. See [scripts/README.md](scripts/README.md) for the full error contract, security model, and smoke-test sequence, and [references/case-study-hetzner-openapi.md](references/case-study-hetzner-openapi.md) for a worked walkthrough against Hetzner Cloud (works offline using bundled fixtures, no third-party signup required).
 
 ## Limits
 
