@@ -18,10 +18,10 @@ openapi-harvest fetch \
   https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json \
   --allow-host raw.githubusercontent.com \
   --count-endpoints
-# → approximately 85
+# → prints the current endpoint count
 ```
 
-That's the proof-of-life. The cascade resolved the spec, `prance` flattened `$ref`s, and the operation count fell out. From here the case study walks the full harvest. The exact count is intentionally fuzzy here; CI regenerates it on every PR so a stale number doesn't quietly haunt the docs.
+That's the proof-of-life. The cascade resolved the spec, `prance` flattened `$ref`s, and the operation count fell out. From here the case study walks the full harvest. The exact count intentionally is not written here; it shifts as the upstream mirror updates, and CI rejects hardcoded endpoint counts so stale numbers do not quietly haunt the docs.
 
 ---
 
@@ -30,7 +30,7 @@ That's the proof-of-life. The cascade resolved the spec, `prance` flattened `$re
 A handful of properties line up that make this case educational beyond Hetzner itself:
 
 - **SPA-rendered docs.** `docs.hetzner.com/cloud/api/` is a Swagger UI shell. A naive `WebFetch` returns React boilerplate, not endpoints. The spec lives elsewhere.
-- **Auto-generated spec from internal sources.** ~85 operations across ~25 tags. Field-level documentation is uneven; some descriptions are literally `"string"` placeholders.
+- **Auto-generated spec from internal sources.** The mirror carries a broad multi-tag API surface. Field-level documentation is uneven; some descriptions are literally `"string"` placeholders.
 - **Community mirror, not first-party.** The maintained OpenAPI spec is `https://github.com/MaximilianKoestler/hcloud-openapi` — a third-party project that scrapes Hetzner's internal API definitions and republishes them. The skill must mark this as `mirror: unofficial` in provenance.
 - **Plain bearer auth.** `Authorization: Bearer <token>`. Token issued from the Hetzner Cloud Console under Security. A free account is enough; no payment method required for read-only operations.
 - **Non-trivial error envelope.** Hetzner returns `{"error": {"code": "...", "message": "...", "details": {...}}}` for 4xx — distinct enough from generic OpenAPI error schemas that you want a captured 401 in the docs.
@@ -407,7 +407,7 @@ This rewrites `docs.md` with each captured probe added as a sibling provenance c
 }
 ```
 
-Five OpenAPI signals are populated: `has_openapi_spec`, `spec_url`, `spec_format`, `endpoint_count`, `tag_count`. The two counts are written by `consolidate` from the parsed spec; the case study writes them as fuzzy hints (`approximately 85`) because the actual numbers shift as the upstream mirror updates. `provenance_index` carries `sources` (spec) and `probes` (reality) on separate keys so the downstream verifier can apply different trust levels.
+Five OpenAPI signals are populated: `has_openapi_spec`, `spec_url`, `spec_format`, `endpoint_count`, `tag_count`. The two counts are written by `consolidate` from the parsed spec; the case study avoids hardcoding them because the actual numbers shift as the upstream mirror updates. `provenance_index` carries `sources` (spec) and `probes` (reality) on separate keys so the downstream verifier can apply different trust levels.
 
 Stop here. The harvest is complete. What `skill-creator` does with this packet — what the resulting integration skill's name is, how its body is structured, which test cases land in the trigger description — is not this skill's call.
 

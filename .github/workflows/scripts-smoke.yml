@@ -23,6 +23,6 @@ jobs:
       - name: Detect hardcoded endpoint count in case study
         run: |
           if grep -E "# → [0-9]+" references/case-study-hetzner-openapi.md; then
-            echo "::error::Case study hardcodes a specific endpoint count, which will rot. Use a fuzzy hint like '~85 endpoints' instead."
+            echo "::error::Case study hardcodes a specific endpoint count, which will rot. Say that the command prints the current endpoint count instead."
             exit 1
           fi
