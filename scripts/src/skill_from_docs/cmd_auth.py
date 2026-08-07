@@ -15,6 +15,7 @@ from ._http import (
     HostAllowlist,
     build_client,
     request_with_retry,
+    require_allowlist,
 )
 from ._manifest import file_entry, now_iso, record_run
 from ._redaction import redact_body, redact_headers, redact_url
@@ -369,15 +370,8 @@ _RATE_LIMIT_HEADERS = (
 
 
 def run(args, *, transport=None) -> int:
-    # Test the constructed allowlist, not the raw arg list: argparse append
-    # turns `--allow-host ""` (an unset shell var) into [""], which is truthy
-    # but builds an empty allowlist, and an empty allowlist permits every host.
-    allowlist = HostAllowlist(args.allow_host)
-    if not allowlist:
-        print(
-            "ERROR: --allow-host HOST is required for auth (and must be non-empty).",
-            file=sys.stderr,
-        )
+    allowlist = require_allowlist(args.allow_host, subcommand="auth")
+    if allowlist is None:
         return 1
 
     try:

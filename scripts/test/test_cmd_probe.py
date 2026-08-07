@@ -316,3 +316,68 @@ def test_empty_allow_host_string_is_rejected(tmp_path: Path, capsys):
     args = _args(workspace=str(tmp_path), allow_host=[""])
     assert cmd_probe.run(args, transport=_mock(lambda r: httpx.Response(200))) == 1
     assert "--allow-host" in capsys.readouterr().err
+
+
+def test_base64_padded_form_value_still_redacted(tmp_path: Path):
+    """`=` inside a value (base64 padding) is the common shape for a client
+    secret; an over-strict form heuristic would drop it back to raw text."""
+
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(
+        workspace=str(tmp_path),
+        method="POST",
+        data="client_secret=c2VjcmV0dmFsdWU=&grant_type=client_credentials",
+        scope="auth-discovery",
+    )
+    assert cmd_probe.run(args, transport=_mock(h)) == 0
+    raw = next((tmp_path / "probes").iterdir()).read_text()
+    assert "c2VjcmV0dmFsdWU" not in raw
+    assert json.loads(raw)["request"]["body"]["client_secret"] == "<redacted>"
+
+
+def test_repeated_form_keys_are_preserved(tmp_path: Path):
+    """`scope=read&scope=write` must not collapse to the last value — the
+    fixture claims to record the request that was actually sent."""
+
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(
+        workspace=str(tmp_path), method="POST", data="scope=read&scope=write&grant_type=x"
+    )
+    assert cmd_probe.run(args, transport=_mock(h)) == 0
+    body = json.loads(next((tmp_path / "probes").iterdir()).read_text())["request"]["body"]
+    assert body["scope"] == ["read", "write"]
+
+
+def test_follow_redirects_enforces_allowlist_per_hop(tmp_path: Path):
+    """--follow-redirects must not become an allowlist bypass: httpx following
+    a 30x itself would vet only the original URL."""
+    seen: list[str] = []
+
+    def h(req):
+        seen.append(str(req.url))
+        if req.url.host == "api.example.com":
+            return httpx.Response(302, headers={"Location": "https://evil.example.net/leak"})
+        return httpx.Response(200, json={"leaked": True})
+
+    args = _args(workspace=str(tmp_path), follow_redirects=True)
+    rc = cmd_probe.run(args, transport=_mock(h))
+    assert rc == 1
+    # The off-allowlist hop was never requested.
+    assert all("evil.example.net" not in u for u in seen)
+    assert not list((tmp_path / "probes").iterdir())
+
+
+def test_follow_redirects_allowed_when_target_is_on_allowlist(tmp_path: Path):
+    def h(req):
+        if req.url.path == "/v1/locations":
+            return httpx.Response(302, headers={"Location": "https://api.example.com/v2/locations"})
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(workspace=str(tmp_path), follow_redirects=True)
+    assert cmd_probe.run(args, transport=_mock(h)) == 0
+    data = json.loads(next((tmp_path / "probes").iterdir()).read_text())
+    assert data["response"]["status"] == 200

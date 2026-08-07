@@ -16,6 +16,7 @@ from ._http import (
     HostAllowlist,
     build_client,
     request_with_retry,
+    require_allowlist,
 )
 from ._manifest import file_entry, now_iso, record_run, sha256_bytes
 from ._slug import default_workspace
@@ -228,24 +229,10 @@ def _collect_external_ref_violations(
     return violations
 
 
-def _validate_external_refs(
-    spec: dict[str, Any],
-    *,
-    allowlist: HostAllowlist,
-    source_host: str | None,
-) -> None:
-    """Raise FetchError (exit 3) on the first external-$ref violation."""
-    violations = _collect_external_ref_violations(
-        spec, allowlist=allowlist, source_host=source_host
-    )
-    if violations:
-        raise FetchError(violations[0], exit_code=3)
-
-
 def _resolve_refs(spec: dict[str, Any]) -> dict[str, Any]:
     """Use prance to resolve $refs. On failure, return the original spec.
 
-    NOTE: the caller MUST run `_validate_external_refs` first to ensure prance
+    NOTE: the caller MUST run `_collect_external_ref_violations` first to ensure prance
     is not given a poisoned spec with attacker-controlled `$ref` URLs (B3).
     """
     try:
@@ -642,9 +629,8 @@ def run(args, *, log=None, transport=None) -> int:
     # skip the allowlist check.
     if _is_url(args.source):
         if not allowlist:
-            print(
-                "ERROR: --allow-host is required when fetching from a URL.",
-                file=sys.stderr,
+            require_allowlist(
+                args.allow_host, subcommand="fetch", context="when the source is a URL"
             )
             return 1
 

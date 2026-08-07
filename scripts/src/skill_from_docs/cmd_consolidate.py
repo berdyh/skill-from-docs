@@ -14,7 +14,7 @@ from . import __version__
 from ._manifest import file_entry, now_iso, record_run
 from ._provenance import emit_probe, emit_source
 from ._sanitize import sanitize_spec_descriptions, sanitize_text, sanitize_text_for_markdown
-from ._schema import ProbeFixture, lint_handoff
+from ._schema import HANDOFF_VERSION, ProbeFixture, lint_handoff
 
 
 CANONICAL_H2 = [
@@ -578,7 +578,7 @@ def _build_handoff(
         content_shape_signals["security_warnings"] = auth_security_warnings
 
     handoff = {
-        "version": 1,
+        "version": HANDOFF_VERSION,
         "proposed_name": proposed_name,
         "tool_summary": info.get("description", "")[:1024],
         "user_declared_scope": declared_scope,

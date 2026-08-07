@@ -5,11 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from typing import Any
 
 from ._manifest import now_iso, verify_hashes
-from ._http import HostAllowlist
+from ._http import require_allowlist
 from ._provenance import find_all_provenance
 from ._schema import lint_handoff
 
@@ -68,19 +67,15 @@ def _section_has_provenance(text: str, line_idx: int, lines: list[str]) -> bool:
 
 
 def run(args) -> int:
-    # An empty HostAllowlist allows everything, so --network without a usable
-    # --allow-host would silently be the unrestricted GET this gate exists to
-    # prevent. Test the constructed allowlist, not the raw arg list: argparse
-    # append turns `--allow-host ""` (an unset shell var) into [""], which is
-    # truthy but constructs an empty, permit-everything allowlist.
-    network_allowlist = HostAllowlist(getattr(args, "allow_host", None) or [])
-    if getattr(args, "network", False) and not network_allowlist:
-        print(
-            "ERROR: --network requires --allow-host HOST (repeatable, non-empty). "
-            "The URL is read from handoff.json, which this command did not produce.",
-            file=sys.stderr,
+    # The spec_url is read out of a local handoff.json, which this command did
+    # not produce, so --network is gated like every other outbound call.
+    network_allowlist = None
+    if getattr(args, "network", False):
+        network_allowlist = require_allowlist(
+            getattr(args, "allow_host", None), subcommand="validate", context="--network"
         )
-        return 1
+        if network_allowlist is None:
+            return 1
 
     workspace = args.workspace or os.getcwd()
     checks: list[dict[str, Any]] = []

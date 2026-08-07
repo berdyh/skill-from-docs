@@ -9,13 +9,14 @@ import re
 import sys
 import time
 from typing import Any
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, urljoin, urlparse
 
 from . import __version__
 from ._http import (
     AllowlistViolation,
     HostAllowlist,
     build_client,
+    require_allowlist,
 )
 from ._manifest import now_iso, record_run, sha256_file
 from ._redaction import (
@@ -98,10 +99,10 @@ def _looks_form_encoded(text: str) -> bool:
     if "=" not in text or "\n" in text:
         return False
     for segment in text.split("&"):
-        if segment.count("=") != 1:
-            return False
-        key, _, _value = segment.partition("=")
-        if not key or not re.fullmatch(r"[A-Za-z0-9_.\[\]-]+", key):
+        # partition, not count("=") — a base64-padded value (`secret=abc==`) is
+        # the common shape for exactly the credentials this needs to reach.
+        key, sep, _value = segment.partition("=")
+        if not sep or not key or not re.fullmatch(r"[A-Za-z0-9_.\[\]-]+", key):
             return False
     return True
 
@@ -127,7 +128,17 @@ def _decode_request_body(body_bytes: bytes | None) -> Any:
     except (ValueError, TypeError):
         pass
     if _looks_form_encoded(text):
-        return dict(parse_qsl(text, keep_blank_values=True))
+        pairs = parse_qsl(text, keep_blank_values=True)
+        out: dict[str, Any] = {}
+        for key, value in pairs:
+            # `scope=read&scope=write` is ordinary; collapsing to the last value
+            # would misrepresent the request the fixture claims to record.
+            if key in out:
+                existing = out[key]
+                out[key] = existing + [value] if isinstance(existing, list) else [existing, value]
+            else:
+                out[key] = value
+        return out
     return text
 
 
@@ -148,17 +159,41 @@ def _retry_with_policy(
     allowlist: HostAllowlist,
     max_retries: int,
     sleeper=time.sleep,
+    follow_redirects: bool = False,
+    max_redirects: int = 5,
 ):
     """Probe-specific retry: honors Retry-After on 429, backoff on 5xx,
     returns the last response on max retries exceeded.
+
+    Redirects are followed here rather than by httpx so that every hop is
+    allowlist-checked. Handing `follow_redirects=True` to the client would let
+    it chase a 30x to an arbitrary host with only the *original* URL vetted.
     """
     if allowlist is not None:
         allowlist.check(url)
 
     attempts = 0
+    redirects = 0
     last_resp = None
     while True:
         last_resp = client.request(method, url, headers=headers, content=content)
+        if (
+            follow_redirects
+            and last_resp.status_code in (301, 302, 303, 307, 308)
+            and redirects < max_redirects
+        ):
+            location = last_resp.headers.get("Location")
+            if location:
+                url = urljoin(url, location)
+                # Raises AllowlistViolation before the next request goes out.
+                if allowlist is not None:
+                    allowlist.check(url)
+                if last_resp.status_code == 303 or (
+                    last_resp.status_code in (301, 302) and method == "POST"
+                ):
+                    method, content = "GET", None
+                redirects += 1
+                continue
         if last_resp.status_code == 429 and attempts < max_retries:
             ra = last_resp.headers.get("Retry-After")
             try:
@@ -189,15 +224,8 @@ def _load_spec_meta(workspace: str) -> tuple[str | None, str | None]:
 
 
 def run(args, *, transport=None, sleeper=time.sleep) -> int:
-    # Test the constructed allowlist, not the raw arg list: argparse append
-    # turns `--allow-host ""` (an unset shell var) into [""], which is truthy
-    # but builds an empty allowlist, and an empty allowlist permits every host.
-    allowlist = HostAllowlist(args.allow_host)
-    if not allowlist:
-        print(
-            "ERROR: --allow-host HOST is required for probe (and must be non-empty).",
-            file=sys.stderr,
-        )
+    allowlist = require_allowlist(args.allow_host, subcommand="probe")
+    if allowlist is None:
         return 1
 
     try:
@@ -259,9 +287,11 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
 
     started = now_iso()
     t0 = time.perf_counter()
+    # Always False: _retry_with_policy follows redirects itself so it can
+    # allowlist-check each hop before the request goes out.
     with build_client(
         timeout=args.timeout,
-        follow_redirects=args.follow_redirects,
+        follow_redirects=False,
         transport=transport,
     ) as client:
         try:
@@ -274,6 +304,7 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
                 allowlist=allowlist,
                 max_retries=args.max_retries,
                 sleeper=sleeper,
+                follow_redirects=args.follow_redirects,
             )
         except AllowlistViolation as exc:
             print(f"ERROR: {exc}", file=sys.stderr)

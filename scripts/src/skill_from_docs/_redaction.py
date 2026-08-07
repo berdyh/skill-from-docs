@@ -23,6 +23,8 @@ SENSITIVE_HEADER_RE = re.compile(
 # Default body keys to redact recursively in JSON bodies.
 DEFAULT_BODY_KEYS = (
     "token",
+    "client_secret",
+    "client_assertion",
     "api_key",
     "apiKey",
     "secret",
