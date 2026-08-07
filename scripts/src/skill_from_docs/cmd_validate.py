@@ -9,6 +9,7 @@ import sys
 from typing import Any
 
 from ._manifest import now_iso, verify_hashes
+from ._http import HostAllowlist
 from ._provenance import find_all_provenance
 from ._schema import lint_handoff
 
@@ -67,13 +68,16 @@ def _section_has_provenance(text: str, line_idx: int, lines: list[str]) -> bool:
 
 
 def run(args) -> int:
-    # An empty HostAllowlist allows everything, so --network without
+    # An empty HostAllowlist allows everything, so --network without a usable
     # --allow-host would silently be the unrestricted GET this gate exists to
-    # prevent. Same policy as `auth` and `probe`.
-    if getattr(args, "network", False) and not getattr(args, "allow_host", None):
+    # prevent. Test the constructed allowlist, not the raw arg list: argparse
+    # append turns `--allow-host ""` (an unset shell var) into [""], which is
+    # truthy but constructs an empty, permit-everything allowlist.
+    network_allowlist = HostAllowlist(getattr(args, "allow_host", None) or [])
+    if getattr(args, "network", False) and not network_allowlist:
         print(
-            "ERROR: --network requires --allow-host HOST (repeatable). The URL is read "
-            "from handoff.json, which this command did not produce.",
+            "ERROR: --network requires --allow-host HOST (repeatable, non-empty). "
+            "The URL is read from handoff.json, which this command did not produce.",
             file=sys.stderr,
         )
         return 1
@@ -280,12 +284,12 @@ def run(args) -> int:
     # Optional network check
     if args.network and handoff_ok:
         try:
-            from ._http import AllowlistViolation, HostAllowlist, build_client
+            from ._http import AllowlistViolation, build_client
 
             # spec_url is read out of a local handoff.json, which is data this
             # command did not produce. Gate it like every other outbound call
             # rather than GETting whatever the file happens to name.
-            allowlist = HostAllowlist(args.allow_host)
+            allowlist = network_allowlist
             spec_url = (handoff.get("content_shape_signals") or {}).get("spec_url")
             urls_to_check = [spec_url] if spec_url else []
             with build_client(timeout=10.0) as client:

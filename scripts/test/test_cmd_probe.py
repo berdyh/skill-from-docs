@@ -89,7 +89,10 @@ def test_json_request_body_keys_are_redacted(tmp_path: Path):
     assert body["region"] == "eu"
 
 
-def test_non_json_request_body_is_kept_as_text(tmp_path: Path):
+def test_form_encoded_request_body_is_structured(tmp_path: Path):
+    """Form bodies are parsed into a dict so key-based redaction can reach
+    them; non-sensitive keys round-trip unchanged."""
+
     def h(req):
         return httpx.Response(200, json={"ok": True})
 
@@ -101,7 +104,10 @@ def test_non_json_request_body_is_kept_as_text(tmp_path: Path):
     rc = cmd_probe.run(args, transport=_mock(h))
     assert rc == 0
     fixture_path = next((tmp_path / "probes").iterdir())
-    assert json.loads(fixture_path.read_text())["request"]["body"] == "name=widget&count=3"
+    assert json.loads(fixture_path.read_text())["request"]["body"] == {
+        "name": "widget",
+        "count": "3",
+    }
 
 
 def test_dry_run_redacts_json_request_body(tmp_path: Path, capsys):
@@ -270,3 +276,43 @@ def test_proxy_authorization_is_redacted(tmp_path: Path):
     assert cmd_probe.run(args, transport=_mock(h)) == 0
     raw = next((tmp_path / "probes").iterdir()).read_text()
     assert "c2VjcmV0" not in raw
+
+
+def test_form_encoded_request_body_keys_are_redacted(tmp_path: Path):
+    """An OAuth2 token request is the most credential-dense body this tool
+    captures, and it is form-encoded, not JSON."""
+
+    def h(req):
+        return httpx.Response(200, json={"access_token": "x"})
+
+    args = _args(
+        workspace=str(tmp_path),
+        method="POST",
+        data="grant_type=password&client_secret=SUPERSECRET&password=hunter2&scope=read",
+        scope="auth-discovery",
+    )
+    assert cmd_probe.run(args, transport=_mock(h)) == 0
+    raw = next((tmp_path / "probes").iterdir()).read_text()
+    assert "hunter2" not in raw
+    body = json.loads(raw)["request"]["body"]
+    assert body["password"] == "<redacted>"
+    assert body["scope"] == "read"
+
+
+def test_free_text_body_is_not_mistaken_for_a_form(tmp_path: Path):
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    for payload in ("just some free text", "<xml>a=b</xml>", "a=1\nb=2"):
+        ws = tmp_path / payload[:4].replace("<", "_").replace("/", "_")
+        args = _args(workspace=str(ws), method="POST", data=payload)
+        assert cmd_probe.run(args, transport=_mock(h)) == 0
+        assert json.loads(next((ws / "probes").iterdir()).read_text())["request"]["body"] == payload
+
+
+def test_empty_allow_host_string_is_rejected(tmp_path: Path, capsys):
+    """`--allow-host ""` from an unset shell var is a truthy arg list but an
+    empty, permit-everything allowlist."""
+    args = _args(workspace=str(tmp_path), allow_host=[""])
+    assert cmd_probe.run(args, transport=_mock(lambda r: httpx.Response(200))) == 1
+    assert "--allow-host" in capsys.readouterr().err

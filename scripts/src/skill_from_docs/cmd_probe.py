@@ -9,7 +9,7 @@ import re
 import sys
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from . import __version__
 from ._http import (
@@ -88,13 +88,36 @@ def _read_body(spec: str | None) -> bytes | None:
     return spec.encode("utf-8")
 
 
-def _decode_request_body(body_bytes: bytes | None) -> Any:
-    """Decode a request body for the fixture, parsing JSON where possible.
+def _looks_form_encoded(text: str) -> bool:
+    """Heuristic for application/x-www-form-urlencoded without a Content-Type.
 
-    Parsing matters for more than tidiness: `redact_body` only applies
+    Deliberately strict: every `&`-separated segment must be a single `k=v`
+    pair with a non-empty key that looks like an identifier. A JSON body, an
+    XML body, or free text will not match.
+    """
+    if "=" not in text or "\n" in text:
+        return False
+    for segment in text.split("&"):
+        if segment.count("=") != 1:
+            return False
+        key, _, _value = segment.partition("=")
+        if not key or not re.fullmatch(r"[A-Za-z0-9_.\[\]-]+", key):
+            return False
+    return True
+
+
+def _decode_request_body(body_bytes: bytes | None) -> Any:
+    """Decode a request body for the fixture, structuring it where possible.
+
+    Structure matters for more than tidiness: `redact_body` only applies
     key-based redaction while walking dicts, so a body left as a string keeps
-    `{"password": "..."}` verbatim in the saved fixture. The response path gets
+    `password=hunter2` verbatim in the saved fixture. The response path gets
     this for free via `resp.json()`; the request path has to ask.
+
+    Form-encoded bodies matter as much as JSON here — an OAuth2 token request
+    (`grant_type=password&client_secret=...`) is the most credential-dense body
+    this tool will ever capture, and capturing it is exactly what
+    `--scope auth-discovery` is for.
     """
     if not body_bytes:
         return None
@@ -102,7 +125,10 @@ def _decode_request_body(body_bytes: bytes | None) -> Any:
     try:
         return json.loads(text)
     except (ValueError, TypeError):
-        return text
+        pass
+    if _looks_form_encoded(text):
+        return dict(parse_qsl(text, keep_blank_values=True))
+    return text
 
 
 def _fixture_slug(url: str, method: str) -> str:
@@ -163,10 +189,17 @@ def _load_spec_meta(workspace: str) -> tuple[str | None, str | None]:
 
 
 def run(args, *, transport=None, sleeper=time.sleep) -> int:
-    if not args.allow_host:
-        print("ERROR: --allow-host is required for probe.", file=sys.stderr)
-        return 1
+    # Test the constructed allowlist, not the raw arg list: argparse append
+    # turns `--allow-host ""` (an unset shell var) into [""], which is truthy
+    # but builds an empty allowlist, and an empty allowlist permits every host.
     allowlist = HostAllowlist(args.allow_host)
+    if not allowlist:
+        print(
+            "ERROR: --allow-host HOST is required for probe (and must be non-empty).",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         allowlist.check(args.url)
     except AllowlistViolation as exc:

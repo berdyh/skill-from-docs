@@ -369,11 +369,17 @@ _RATE_LIMIT_HEADERS = (
 
 
 def run(args, *, transport=None) -> int:
-    if not args.allow_host:
-        print("ERROR: --allow-host is required for auth.", file=sys.stderr)
+    # Test the constructed allowlist, not the raw arg list: argparse append
+    # turns `--allow-host ""` (an unset shell var) into [""], which is truthy
+    # but builds an empty allowlist, and an empty allowlist permits every host.
+    allowlist = HostAllowlist(args.allow_host)
+    if not allowlist:
+        print(
+            "ERROR: --allow-host HOST is required for auth (and must be non-empty).",
+            file=sys.stderr,
+        )
         return 1
 
-    allowlist = HostAllowlist(args.allow_host)
     try:
         allowlist.check(args.endpoint)
     except AllowlistViolation as exc:
