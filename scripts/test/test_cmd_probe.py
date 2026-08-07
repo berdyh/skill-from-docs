@@ -241,3 +241,32 @@ def test_missing_allow_host_exits_1(tmp_path: Path):
     args = _args(workspace=str(tmp_path), allow_host=[])
     rc = cmd_probe.run(args)
     assert rc == 1
+
+
+def test_follow_redirects_flag_pair(tmp_path: Path):
+    """--no-follow-redirects used to be the only flag and was a no-op
+    (store_false with default=False). Redirects stay off by default; the
+    enabling counterpart now exists."""
+    import argparse
+
+    from skill_from_docs import openapi_harvest
+
+    parser = openapi_harvest.build_parser()
+    base = ["probe", "https://api.example.com/x", "--scope", "ad-hoc", "--allow-host", "api.example.com"]
+    assert parser.parse_args(base).follow_redirects is False
+    assert parser.parse_args(base + ["--no-follow-redirects"]).follow_redirects is False
+    assert parser.parse_args(base + ["--follow-redirects"]).follow_redirects is True
+    assert isinstance(parser, argparse.ArgumentParser)
+
+
+def test_proxy_authorization_is_redacted(tmp_path: Path):
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(
+        workspace=str(tmp_path),
+        header=["Proxy-Authorization: Basic c2VjcmV0"],
+    )
+    assert cmd_probe.run(args, transport=_mock(h)) == 0
+    raw = next((tmp_path / "probes").iterdir()).read_text()
+    assert "c2VjcmV0" not in raw

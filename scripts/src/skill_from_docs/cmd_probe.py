@@ -48,11 +48,21 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--redact-body-pattern", action="append", default=[])
     p.add_argument("--allow-host", action="append", default=[])
     p.add_argument("--max-retries", type=int, default=3)
+    # Redirects are blocked by default: a 30x to an attacker host is the
+    # canonical token-leak path. --no-follow-redirects is kept as an accepted
+    # no-op so existing invocations and docs keep working.
+    p.add_argument(
+        "--follow-redirects",
+        dest="follow_redirects",
+        action="store_true",
+        default=False,
+        help="follow 30x responses (default: off; the Location header is captured, not followed)",
+    )
     p.add_argument(
         "--no-follow-redirects",
         dest="follow_redirects",
         action="store_false",
-        default=False,
+        help=argparse.SUPPRESS,
     )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--timeout", type=float, default=30.0)

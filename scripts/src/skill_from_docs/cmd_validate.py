@@ -21,6 +21,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("workspace", nargs="?")
     p.add_argument("--strict", action="store_true")
     p.add_argument("--network", action="store_true")
+    p.add_argument(
+        "--allow-host",
+        action="append",
+        default=[],
+        help="host allowed for --network re-fetches (repeatable; required with --network)",
+    )
     p.add_argument("--json", dest="json_out", action="store_true")
     p.set_defaults(func=run)
 
@@ -60,6 +66,17 @@ def _section_has_provenance(text: str, line_idx: int, lines: list[str]) -> bool:
 
 
 def run(args) -> int:
+    # An empty HostAllowlist allows everything, so --network without
+    # --allow-host would silently be the unrestricted GET this gate exists to
+    # prevent. Same policy as `auth` and `probe`.
+    if getattr(args, "network", False) and not getattr(args, "allow_host", None):
+        print(
+            "ERROR: --network requires --allow-host HOST (repeatable). The URL is read "
+            "from handoff.json, which this command did not produce.",
+            file=sys.stderr,
+        )
+        return 1
+
     workspace = args.workspace or os.getcwd()
     checks: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -254,12 +271,18 @@ def run(args) -> int:
     # Optional network check
     if args.network and handoff_ok:
         try:
-            from ._http import build_client
+            from ._http import AllowlistViolation, HostAllowlist, build_client
+
+            # spec_url is read out of a local handoff.json, which is data this
+            # command did not produce. Gate it like every other outbound call
+            # rather than GETting whatever the file happens to name.
+            allowlist = HostAllowlist(args.allow_host)
             spec_url = (handoff.get("content_shape_signals") or {}).get("spec_url")
             urls_to_check = [spec_url] if spec_url else []
             with build_client(timeout=10.0) as client:
                 for url in urls_to_check:
                     try:
+                        allowlist.check(url)
                         r = client.get(url)
                         ok = r.status_code == 200
                         _add_check(
@@ -268,6 +291,8 @@ def run(args) -> int:
                             ok,
                             None if ok else f"URL {url} returned {r.status_code}",
                         )
+                    except AllowlistViolation as e:
+                        _add_check(checks, "network_allowlist", False, str(e))
                     except Exception as e:
                         _add_check(checks, "network_error", False, f"can't fetch {url}: {e}")
         except RuntimeError:

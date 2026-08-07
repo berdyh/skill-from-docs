@@ -16,7 +16,7 @@ REDACTED = "<redacted>"
 
 # Header names (case-insensitive match) that always get redacted.
 SENSITIVE_HEADER_RE = re.compile(
-    r"^(authorization|x-api-key|x-auth-token|api-key|token|cookie|x-csrf-token|set-cookie|location)$",
+    r"^(authorization|proxy-authorization|x-api-key|x-auth-token|api-key|token|cookie|x-csrf-token|set-cookie|location)$",
     re.IGNORECASE,
 )
 
