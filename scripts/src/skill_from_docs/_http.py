@@ -111,12 +111,10 @@ def request_with_retry(
         allowlist.check(url)
 
     attempts = 0
-    last_exc: Exception | None = None
     while True:
         try:
             response = client.request(method, url, headers=headers, content=content)
-        except Exception as e:  # network errors retried up to max_retries
-            last_exc = e
+        except Exception:  # network errors retried up to max_retries
             if attempts >= max_retries:
                 raise
             sleeper(2 ** attempts)
