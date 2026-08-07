@@ -3,16 +3,23 @@ on:
   pull_request:
     paths:
       - 'scripts/**'
+      - 'references/**'
       - '.github/workflows/scripts-smoke.yml'
   push:
     branches: [main]
-    paths: ['scripts/**']
+    paths:
+      - 'scripts/**'
+      - 'references/**'
+      - '.github/workflows/scripts-smoke.yml'
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python: ['3.10', '3.11', '3.12']
+        # pyproject declares requires-python = ">=3.10" with no upper bound,
+        # so the matrix has to exercise the upper end too.
+        python: ['3.10', '3.11', '3.12', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -20,6 +27,22 @@ jobs:
       - run: pip install -e ./scripts
       - run: pip install pytest pytest-cov
       - run: pytest scripts/test/ -v --cov=skill_from_docs --cov-report=term-missing
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      # Pinned: an unpinned ruff means a new release can fail CI with no
+      # change in this repo.
+      - run: pip install ruff==0.15.13
+      - run: ruff check scripts/src scripts/test
+
+  docs-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
       - name: Detect hardcoded endpoint count in case study
         run: |
           if grep -E "# → [0-9]+" references/case-study-hetzner-openapi.md; then
