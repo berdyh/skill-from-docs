@@ -49,8 +49,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     p.add_argument("--bad-token-pattern", default=FIXED_BAD_TOKEN)
     p.add_argument("--allow-host", action="append", default=[])
+    # Redirects are never followed; see cmd_probe for the reasoning. Accepted
+    # for compatibility, states the guarantee rather than toggling it.
     p.add_argument(
-        "--no-follow-redirects", dest="follow_redirects", action="store_false", default=False
+        "--no-follow-redirects",
+        dest="follow_redirects",
+        action="store_false",
+        default=False,
+        help="accepted for compatibility; redirects are never followed",
     )
     p.add_argument("--timeout", type=float, default=10.0)
     p.add_argument("--workspace")
