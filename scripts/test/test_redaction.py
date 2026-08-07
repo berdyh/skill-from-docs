@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 
+from urllib.parse import parse_qsl, urlparse
+
 from skill_from_docs._redaction import (
+    DEFAULT_BODY_KEYS,
     REDACTED,
+    SENSITIVE_QUERY_KEYS,
     compile_patterns,
     redact_body,
     redact_headers,
@@ -127,3 +131,62 @@ def test_url_query_redaction_in_manifest_and_auth_markdown(tmp_path):
     )
     assert "secret" not in md
     assert "api_key=<redacted>" in md or "<redacted>" in md
+
+
+def test_redact_url_preserves_percent_encoding():
+    """parse_qsl hands back DECODED text; writing it back raw corrupted the URL.
+    `?q=one%26two` became `?q=one&two` — one parameter silently became two, in a
+    fixture that claims to record the request actually sent."""
+    cases = {
+        "https://x/a?q=one%26two": "https://x/a?q=one%26two",
+        "https://x/a?filter=a%3Db": "https://x/a?filter=a%3Db",
+        "https://x/a?tag=a%2Bb": "https://x/a?tag=a%2Bb",
+        "https://x/a?n=%C3%A9": "https://x/a?n=%C3%A9",
+    }
+    for src, expected in cases.items():
+        assert redact_url(src) == expected
+
+
+def test_redact_url_roundtrips_to_the_same_pairs():
+    for src in (
+        "https://x/a?q=one%26two&name=x%20y",
+        "https://x/a?tag=a%2Bb&other=plain",
+        "https://x/a?k[]=1&k[]=2",
+    ):
+        before = parse_qsl(urlparse(src).query, keep_blank_values=True)
+        after = parse_qsl(urlparse(redact_url(src)).query, keep_blank_values=True)
+        assert before == after
+
+
+def test_redact_url_is_idempotent():
+    """`probe` redacts the URL into the fixture and `quick-diff` redacts it
+    again for its report. The damage used to compound across those two passes:
+    `a%2Bb` became `a+b` in the fixture, then `a b` in the report."""
+    for src in (
+        "https://x/a?tag=a%2Bb&token=secret",
+        "https://x/a?q=one%26two",
+        "https://api.x/t?client_secret=REAL",
+    ):
+        once = redact_url(src)
+        assert redact_url(once) == once
+
+
+def test_query_keys_cover_the_same_credentials_as_body_keys():
+    """A credential is no less sensitive for arriving in a query string — and a
+    query string additionally reaches logs, proxies and CDN caches."""
+    for key in DEFAULT_BODY_KEYS:
+        assert key.lower() in SENSITIVE_QUERY_KEYS, key
+    redacted = redact_url("https://api.x/oauth/token?client_secret=REAL&refresh_token=R2")
+    assert "REAL" not in redacted
+    assert "R2" not in redacted
+
+
+def test_redacted_sentinel_is_not_percent_encoded():
+    """The sentinel stays readable in fixtures and logs — the one deliberate
+    exception to re-encoding."""
+    assert redact_url("https://x/a?token=abc") == "https://x/a?token=<redacted>"
+
+
+def test_encoded_sensitive_key_is_still_recognised():
+    """Decoding before the sensitivity check is what makes this work."""
+    assert redact_url("https://x/a?%74oken=secret") == "https://x/a?token=<redacted>"

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Iterable
-from urllib.parse import parse_qsl, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlparse, urlunparse
 
 
 REDACTED = "<redacted>"
@@ -35,15 +35,15 @@ DEFAULT_BODY_KEYS = (
     "session",
 )
 
-# URL query parameter names treated as credentials.
-SENSITIVE_QUERY_KEYS = {
-    "token",
-    "api_key",
-    "apikey",
-    "access_token",
+# URL query parameter names treated as credentials. Kept in sync with
+# DEFAULT_BODY_KEYS — a credential is no less sensitive for arriving in a query
+# string than in a body, and query strings additionally reach logs, proxies, and
+# CDN caches. Lowercased for comparison; `apikey` covers the `apiKey` spelling.
+SENSITIVE_QUERY_KEYS = {k.lower() for k in DEFAULT_BODY_KEYS} | {
     "key",
-    "secret",
-    "password",
+    "auth",
+    "sig",
+    "signature",
 }
 
 
@@ -61,8 +61,16 @@ def redact_headers(headers: dict[str, str]) -> dict[str, str]:
 def redact_url(url: str) -> str:
     """Replace sensitive query-string values with `<redacted>`.
 
-    The query string is rebuilt without URL-encoding the literal `<redacted>`
-    sentinel so the result remains human-readable in fixtures and logs.
+    Keys and values are re-encoded on the way out. `parse_qsl` hands back
+    percent-DECODED text, so writing it back raw corrupts the URL: `?q=one%26two`
+    would become `?q=one&two`, turning one parameter into two in a fixture that
+    claims to record the request actually sent.
+
+    The `<redacted>` sentinel is the one deliberate exception — it is left
+    unencoded so the result stays readable in fixtures and logs.
+
+    Decoding before the sensitivity check is intentional: it means `?%74oken=x`
+    is still recognised as `token` and redacted.
     """
     try:
         parsed = urlparse(url)
@@ -73,10 +81,11 @@ def redact_url(url: str) -> str:
     pairs = parse_qsl(parsed.query, keep_blank_values=True)
     rebuilt: list[str] = []
     for k, v in pairs:
+        safe_k = quote(k, safe="")
         if k.lower() in SENSITIVE_QUERY_KEYS:
-            rebuilt.append(f"{k}={REDACTED}")
+            rebuilt.append(f"{safe_k}={REDACTED}")
         else:
-            rebuilt.append(f"{k}={v}")
+            rebuilt.append(f"{safe_k}={quote(v, safe='')}")
     return urlunparse(parsed._replace(query="&".join(rebuilt)))
 
 
