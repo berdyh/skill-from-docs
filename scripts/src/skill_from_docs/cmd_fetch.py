@@ -19,6 +19,7 @@ from ._http import (
     require_allowlist,
 )
 from ._manifest import file_entry, now_iso, record_run, sha256_bytes
+from ._redaction import redact_url
 from ._slug import default_workspace
 
 
@@ -277,7 +278,13 @@ def _build_source_map(spec: dict[str, Any], *, spec_url: str | None, sha256: str
                     "tags": op.get("tags", []),
                 }
     return {
-        "spec_url": spec_url,
+        # Redact HERE, not at each reader. This value is copied into
+        # source-map.json, every `<!-- source: -->` comment in docs.md,
+        # handoff.json's spec_url / provenance_index / coverage_checklist, and
+        # every probe fixture's spec_url_at_capture. A spec URL carrying
+        # `?api_key=` reached all of them; only cmd_quick_diff happened to
+        # redact on read. One redaction at the source closes every path.
+        "spec_url": redact_url(spec_url) if spec_url else spec_url,
         "spec_sha256": sha256,
         "fetched_at": now_iso(),
         "format": _detect_format(spec),
@@ -710,9 +717,6 @@ def run(args, *, log=None, transport=None) -> int:
             file=sys.stderr,
         )
 
-    sha = sha256_bytes(body)
-    source_map = _build_source_map(spec, spec_url=spec_url, sha256=sha)
-
     # 4. --count-endpoints short-circuit.
     if args.count_endpoints:
         print(_count_endpoints(spec))
@@ -723,9 +727,18 @@ def run(args, *, log=None, transport=None) -> int:
     out_map = args.output_source_map or os.path.join(workspace, "raw", "source-map.json")
     os.makedirs(os.path.dirname(out_spec) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(out_map) or ".", exist_ok=True)
+
+    # Hash the bytes we WRITE, not the bytes we fetched. `quick-diff` re-hashes
+    # raw/spec.json to detect spec drift, and that file is re-serialized here
+    # (indent=2, possibly $ref-resolved), so hashing the fetched body instead
+    # guaranteed a mismatch and made every spec_revision drift report a false
+    # positive.
+    spec_text = json.dumps(spec, indent=2) + "\n"
+    sha = sha256_bytes(spec_text.encode("utf-8"))
+    source_map = _build_source_map(spec, spec_url=spec_url, sha256=sha)
+
     with open(out_spec, "w", encoding="utf-8") as f:
-        json.dump(spec, f, indent=2)
-        f.write("\n")
+        f.write(spec_text)
     with open(out_map, "w", encoding="utf-8") as f:
         json.dump(source_map, f, indent=2)
         f.write("\n")
