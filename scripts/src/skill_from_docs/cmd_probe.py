@@ -17,7 +17,7 @@ from ._http import (
     HostAllowlist,
     build_client,
 )
-from ._manifest import file_entry, now_iso, record_run, sha256_file
+from ._manifest import now_iso, record_run, sha256_file
 from ._redaction import (
     compile_patterns,
     redact_body,

@@ -10,7 +10,6 @@ import sys
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-from . import __version__
 from ._http import (
     AllowlistViolation,
     DEFAULT_USER_AGENT,

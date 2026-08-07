@@ -227,7 +227,6 @@ def run(args) -> int:
     # 9. provenance_index covers every section
     if handoff_ok:
         provenance_index = handoff.get("provenance_index", {})
-        sections_h2_h3 = [t for _l, lvl, t in sections if lvl in ("h2", "h3")]
         # For H3 sections under API reference, check that provenance_index has them
         missing_index_sections: list[str] = []
         for _l, lvl, t in sections:

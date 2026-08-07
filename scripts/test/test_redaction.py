@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 
 from skill_from_docs._redaction import (
     REDACTED,

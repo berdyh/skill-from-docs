@@ -11,7 +11,6 @@ import httpx
 import pytest
 
 from skill_from_docs import cmd_fetch
-from skill_from_docs.cmd_fetch import RENDERER_PATTERNS
 
 
 def _make_args(**overrides):

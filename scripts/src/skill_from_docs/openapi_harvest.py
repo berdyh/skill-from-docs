@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import __version__
 from . import cmd_auth, cmd_consolidate, cmd_fetch, cmd_probe, cmd_quick_diff, cmd_validate
 
 

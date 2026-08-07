@@ -11,7 +11,7 @@ from collections import defaultdict
 from typing import Any
 
 from . import __version__
-from ._manifest import file_entry, now_iso, record_run, sha256_file
+from ._manifest import file_entry, now_iso, record_run
 from ._provenance import emit_probe, emit_source
 from ._sanitize import sanitize_spec_descriptions, sanitize_text, sanitize_text_for_markdown
 from ._schema import ProbeFixture
