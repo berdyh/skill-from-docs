@@ -60,6 +60,64 @@ def test_capture_redacts_headers_by_default(tmp_path: Path):
     assert data["response"]["headers"]["set-cookie"] == "<redacted>"
 
 
+def test_json_request_body_keys_are_redacted(tmp_path: Path):
+    """Regression: a JSON request body left as a string bypassed key redaction.
+
+    `redact_body` only redacts by key while walking a dict, so a body kept as
+    text wrote `{"password": "hunter2"}` verbatim into the fixture under the
+    default policy.
+    """
+
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(
+        workspace=str(tmp_path),
+        method="POST",
+        data='{"password": "hunter2", "api_key": "sk-live-123", "region": "eu"}',
+    )
+    rc = cmd_probe.run(args, transport=_mock(h))
+    assert rc == 0
+    fixture_path = next((tmp_path / "probes").iterdir())
+    raw = fixture_path.read_text()
+    assert "hunter2" not in raw
+    assert "sk-live-123" not in raw
+    body = json.loads(raw)["request"]["body"]
+    assert body["password"] == "<redacted>"
+    assert body["api_key"] == "<redacted>"
+    # Non-sensitive keys survive — this is redaction, not deletion.
+    assert body["region"] == "eu"
+
+
+def test_non_json_request_body_is_kept_as_text(tmp_path: Path):
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(
+        workspace=str(tmp_path),
+        method="POST",
+        data="name=widget&count=3",
+    )
+    rc = cmd_probe.run(args, transport=_mock(h))
+    assert rc == 0
+    fixture_path = next((tmp_path / "probes").iterdir())
+    assert json.loads(fixture_path.read_text())["request"]["body"] == "name=widget&count=3"
+
+
+def test_dry_run_redacts_json_request_body(tmp_path: Path, capsys):
+    args = _args(
+        workspace=str(tmp_path),
+        method="POST",
+        data='{"password": "hunter2"}',
+        dry_run=True,
+    )
+    rc = cmd_probe.run(args, transport=_mock(lambda req: httpx.Response(200)))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "hunter2" not in out
+    assert json.loads(out)["request"]["body"]["password"] == "<redacted>"
+
+
 def test_no_redact_keeps_headers(tmp_path: Path):
     def h(req):
         return httpx.Response(200, json={"token": "kept"})

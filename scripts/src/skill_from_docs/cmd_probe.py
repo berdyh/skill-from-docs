@@ -78,6 +78,23 @@ def _read_body(spec: str | None) -> bytes | None:
     return spec.encode("utf-8")
 
 
+def _decode_request_body(body_bytes: bytes | None) -> Any:
+    """Decode a request body for the fixture, parsing JSON where possible.
+
+    Parsing matters for more than tidiness: `redact_body` only applies
+    key-based redaction while walking dicts, so a body left as a string keeps
+    `{"password": "..."}` verbatim in the saved fixture. The response path gets
+    this for free via `resp.json()`; the request path has to ask.
+    """
+    if not body_bytes:
+        return None
+    text = body_bytes.decode("utf-8", errors="replace")
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return text
+
+
 def _fixture_slug(url: str, method: str) -> str:
     parsed = urlparse(url)
     path = parsed.path.strip("/") or "root"
@@ -181,7 +198,7 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
 
     if args.dry_run:
         req_headers, req_url, req_body = _apply_redaction(
-            hdrs, args.url, body_bytes.decode("utf-8", errors="replace") if body_bytes else None
+            hdrs, args.url, _decode_request_body(body_bytes)
         )
         print(json.dumps(
             {
@@ -239,7 +256,7 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
         resp_body = resp.text
 
     req_headers, req_url, req_body = _apply_redaction(
-        hdrs, args.url, body_bytes.decode("utf-8", errors="replace") if body_bytes else None
+        hdrs, args.url, _decode_request_body(body_bytes)
     )
     resp_headers = dict(resp.headers)
     if not args.no_redact:
