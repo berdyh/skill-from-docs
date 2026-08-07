@@ -10,6 +10,7 @@ from typing import Any
 
 from ._manifest import now_iso, verify_hashes
 from ._provenance import find_all_provenance
+from ._schema import lint_handoff
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -95,8 +96,17 @@ def run(args) -> int:
         try:
             with open(handoff_path, "r", encoding="utf-8") as f:
                 handoff = json.load(f)
-            handoff_ok = isinstance(handoff, dict) and handoff.get("version") == 1
-            _add_check(checks, "handoff_json_valid", handoff_ok, None if handoff_ok else "handoff.json missing required fields")
+            # `handoff_ok` gates the deeper content checks below, so it stays a
+            # structural verdict; lint_handoff supplies the specifics instead of
+            # the old catch-all "missing required fields".
+            shape_problems = lint_handoff(handoff)
+            handoff_ok = not shape_problems
+            _add_check(
+                checks,
+                "handoff_json_valid",
+                handoff_ok,
+                None if handoff_ok else "; ".join(shape_problems),
+            )
         except Exception as e:
             _add_check(checks, "handoff_json_valid", False, f"handoff.json parse error: {e}")
     else:
