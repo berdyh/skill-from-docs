@@ -103,3 +103,87 @@ class NormalizedSpec:
     source_map: dict[str, Any]
     sha256: str
     url: str | None = None
+
+
+# --- handoff.json contract -------------------------------------------------
+#
+# handoff.json is the packet skill-creator consumes; it is a cross-process
+# contract, so a shape error here surfaces as a confusing interview rather than
+# a crash. These constants and `lint_handoff` are the machine-checkable form of
+# the shape that SKILL.md describes in prose.
+#
+# Deliberately a linter over a plain dict rather than a dataclass: the packet
+# has conditionally-present keys (auth_method / security_warnings appear only
+# for auth-discovery harvests) and gap_list is populated after the dict is
+# built, both of which a fixed-field dataclass would flatten.
+
+HANDOFF_VERSION = 1
+
+HANDOFF_REQUIRED_KEYS: tuple[str, ...] = (
+    "version",
+    "proposed_name",
+    "tool_summary",
+    "user_declared_scope",
+    "user_declared_languages",
+    "archetype_primary",
+    "content_shape_signals",
+    "coverage_checklist",
+    "gap_list",
+    "provenance_index",
+    "image_inventory",
+    "suggested_test_cases",
+    "harvest_metadata",
+)
+
+# key -> (type, human-readable name) for keys whose type matters downstream.
+_HANDOFF_TYPES: dict[str, tuple[type | tuple[type, ...], str]] = {
+    "version": (int, "int"),
+    "proposed_name": (str, "string"),
+    "tool_summary": (str, "string"),
+    "user_declared_languages": (list, "array"),
+    "content_shape_signals": (dict, "object"),
+    "coverage_checklist": (list, "array"),
+    "gap_list": (list, "array"),
+    "provenance_index": (dict, "object"),
+    "image_inventory": (list, "array"),
+    "suggested_test_cases": (list, "array"),
+    "harvest_metadata": (dict, "object"),
+}
+
+HARVEST_METADATA_KEYS: tuple[str, ...] = (
+    "retrieved_date",
+    "tool_version",
+    "raw_page_count",
+    "docs_md_token_count",
+)
+
+
+def lint_handoff(data: Any) -> list[str]:
+    """Return one message per handoff.json shape problem; empty means valid."""
+    if not isinstance(data, dict):
+        return [f"handoff.json must be a JSON object, got {type(data).__name__}"]
+
+    problems: list[str] = []
+    for key in HANDOFF_REQUIRED_KEYS:
+        if key not in data:
+            problems.append(f"missing required key: {key}")
+
+    for key, (expected, label) in _HANDOFF_TYPES.items():
+        if key in data and not isinstance(data[key], expected):
+            problems.append(
+                f"{key} must be {label}, got {type(data[key]).__name__}"
+            )
+
+    version = data.get("version")
+    if isinstance(version, int) and version != HANDOFF_VERSION:
+        problems.append(
+            f"unsupported handoff version {version} (this tool emits {HANDOFF_VERSION})"
+        )
+
+    meta = data.get("harvest_metadata")
+    if isinstance(meta, dict):
+        for key in HARVEST_METADATA_KEYS:
+            if key not in meta:
+                problems.append(f"harvest_metadata missing key: {key}")
+
+    return problems

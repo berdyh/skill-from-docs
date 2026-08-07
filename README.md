@@ -41,6 +41,21 @@ git clone https://github.com/berdyh/skill-from-docs ~/.claude/skills/skill-from-
 git clone https://github.com/berdyh/skill-from-docs .claude/skills/skill-from-docs
 ```
 
+That is the whole install for five of the six archetypes. **Archetype 4
+(OpenAPI-only)** additionally uses the `openapi-harvest` CLI, which ships in
+`scripts/` and needs a second step — cloning alone does not put it on your PATH:
+
+```sh
+pip install -e ~/.claude/skills/skill-from-docs/scripts
+# or, isolated:
+pipx install -e ~/.claude/skills/skill-from-docs/scripts
+
+openapi-harvest --help   # verify
+```
+
+Requires Python ≥3.10. Skip it if you never harvest OpenAPI-only APIs; the skill
+detects the missing CLI during preflight and says so rather than failing midway.
+
 ## Use
 
 In Claude Code, invoke it naturally:

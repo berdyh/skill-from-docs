@@ -11,7 +11,6 @@ import argparse
 from pathlib import Path
 
 import httpx
-import pytest
 
 from skill_from_docs import cmd_fetch
 from skill_from_docs._http import build_client

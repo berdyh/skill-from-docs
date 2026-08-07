@@ -11,7 +11,9 @@ from skill_from_docs import cmd_consolidate, cmd_validate
 
 
 def _validate_args(workspace: str, **overrides):
-    base = dict(workspace=workspace, strict=False, network=False, json_out=False)
+    base = dict(
+        workspace=workspace, strict=False, network=False, json_out=False, allow_host=[]
+    )
     base.update(overrides)
     return argparse.Namespace(**base)
 
@@ -132,3 +134,19 @@ def test_strict_promotes_warnings(tmp_path: Path, fixtures_dir: Path):
     # Note: hash mismatch will also occur because we just wrote handoff.
     # Both --strict promotion and the manifest mismatch should produce rc==1.
     assert rc == 1
+
+
+def test_network_requires_allow_host(tmp_path: Path, capsys):
+    """spec_url comes out of handoff.json, which validate did not produce. An
+    empty HostAllowlist permits everything, so --network without --allow-host
+    would be an arbitrary-URL GET."""
+    rc = cmd_validate.run(_validate_args(str(tmp_path), network=True))
+    assert rc == 1
+    assert "--allow-host" in capsys.readouterr().err
+
+
+def test_network_rejects_empty_allow_host_string(tmp_path: Path, capsys):
+    """[''] is truthy but builds an empty allowlist, which permits every host."""
+    rc = cmd_validate.run(_validate_args(str(tmp_path), network=True, allow_host=[""]))
+    assert rc == 1
+    assert "--allow-host" in capsys.readouterr().err

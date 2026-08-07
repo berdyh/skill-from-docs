@@ -428,3 +428,10 @@ def test_handoff_carries_query_string_warnings_in_fixture_manifest(tmp_path: Pat
     assert data["manifest"]["auth_method"] == "query_string"
     assert len(data["manifest"]["security_warnings"]) >= 1
     assert "logs" in data["manifest"]["security_warnings"][0]
+
+
+def test_empty_allow_host_string_is_rejected(tmp_path: Path, capsys):
+    """[''] is truthy but builds an empty, permit-everything allowlist."""
+    args = _args(allow_host=[""], workspace=str(tmp_path))
+    assert cmd_auth.run(args, transport=httpx.MockTransport(lambda r: httpx.Response(200))) == 1
+    assert "--allow-host" in capsys.readouterr().err

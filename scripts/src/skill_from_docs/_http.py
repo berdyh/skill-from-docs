@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from typing import Iterable
 from urllib.parse import urlparse
@@ -111,12 +112,10 @@ def request_with_retry(
         allowlist.check(url)
 
     attempts = 0
-    last_exc: Exception | None = None
     while True:
         try:
             response = client.request(method, url, headers=headers, content=content)
-        except Exception as e:  # network errors retried up to max_retries
-            last_exc = e
+        except Exception:  # network errors retried up to max_retries
             if attempts >= max_retries:
                 raise
             sleeper(2 ** attempts)
@@ -134,6 +133,28 @@ def request_with_retry(
             attempts += 1
             continue
         return response
+
+
+def require_allowlist(hosts, *, subcommand: str, context: str | None = None) -> "HostAllowlist | None":
+    """Build a HostAllowlist and return it, or None if it would permit everything.
+
+    Callers must test the *constructed* allowlist rather than the raw argparse
+    list: `--allow-host ""` (an unset shell var) yields `[""]`, which is truthy,
+    but HostAllowlist drops empty strings and an empty allowlist permits every
+    host — so the flag that exists to restrict outbound calls would silently
+    allow them all. On None, the caller prints nothing extra and exits 1; this
+    function has already explained the problem.
+    """
+    allowlist = HostAllowlist(hosts or [])
+    if allowlist:
+        return allowlist
+    where = f" {context}" if context else ""
+    print(
+        f"ERROR: --allow-host HOST is required for {subcommand}{where} "
+        "and must name at least one non-empty host.",
+        file=sys.stderr,
+    )
+    return None
 
 
 def _parse_retry_after(value: str) -> float:

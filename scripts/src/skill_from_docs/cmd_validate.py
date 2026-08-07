@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from typing import Any
 
 from ._manifest import now_iso, verify_hashes
+from ._http import require_allowlist
 from ._provenance import find_all_provenance
+from ._schema import lint_handoff
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -21,6 +22,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("workspace", nargs="?")
     p.add_argument("--strict", action="store_true")
     p.add_argument("--network", action="store_true")
+    p.add_argument(
+        "--allow-host",
+        action="append",
+        default=[],
+        help="host allowed for --network re-fetches (repeatable; required with --network)",
+    )
     p.add_argument("--json", dest="json_out", action="store_true")
     p.set_defaults(func=run)
 
@@ -60,6 +67,16 @@ def _section_has_provenance(text: str, line_idx: int, lines: list[str]) -> bool:
 
 
 def run(args) -> int:
+    # The spec_url is read out of a local handoff.json, which this command did
+    # not produce, so --network is gated like every other outbound call.
+    network_allowlist = None
+    if getattr(args, "network", False):
+        network_allowlist = require_allowlist(
+            getattr(args, "allow_host", None), subcommand="validate", context="--network"
+        )
+        if network_allowlist is None:
+            return 1
+
     workspace = args.workspace or os.getcwd()
     checks: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -78,8 +95,17 @@ def run(args) -> int:
         try:
             with open(handoff_path, "r", encoding="utf-8") as f:
                 handoff = json.load(f)
-            handoff_ok = isinstance(handoff, dict) and handoff.get("version") == 1
-            _add_check(checks, "handoff_json_valid", handoff_ok, None if handoff_ok else "handoff.json missing required fields")
+            # `handoff_ok` gates the deeper content checks below, so it stays a
+            # structural verdict; lint_handoff supplies the specifics instead of
+            # the old catch-all "missing required fields".
+            shape_problems = lint_handoff(handoff)
+            handoff_ok = not shape_problems
+            _add_check(
+                checks,
+                "handoff_json_valid",
+                handoff_ok,
+                None if handoff_ok else "; ".join(shape_problems),
+            )
         except Exception as e:
             _add_check(checks, "handoff_json_valid", False, f"handoff.json parse error: {e}")
     else:
@@ -210,7 +236,6 @@ def run(args) -> int:
     # 9. provenance_index covers every section
     if handoff_ok:
         provenance_index = handoff.get("provenance_index", {})
-        sections_h2_h3 = [t for _l, lvl, t in sections if lvl in ("h2", "h3")]
         # For H3 sections under API reference, check that provenance_index has them
         missing_index_sections: list[str] = []
         for _l, lvl, t in sections:
@@ -254,12 +279,18 @@ def run(args) -> int:
     # Optional network check
     if args.network and handoff_ok:
         try:
-            from ._http import build_client
+            from ._http import AllowlistViolation, build_client
+
+            # spec_url is read out of a local handoff.json, which is data this
+            # command did not produce. Gate it like every other outbound call
+            # rather than GETting whatever the file happens to name.
+            allowlist = network_allowlist
             spec_url = (handoff.get("content_shape_signals") or {}).get("spec_url")
             urls_to_check = [spec_url] if spec_url else []
             with build_client(timeout=10.0) as client:
                 for url in urls_to_check:
                     try:
+                        allowlist.check(url)
                         r = client.get(url)
                         ok = r.status_code == 200
                         _add_check(
@@ -268,6 +299,8 @@ def run(args) -> int:
                             ok,
                             None if ok else f"URL {url} returned {r.status_code}",
                         )
+                    except AllowlistViolation as e:
+                        _add_check(checks, "network_allowlist", False, str(e))
                     except Exception as e:
                         _add_check(checks, "network_error", False, f"can't fetch {url}: {e}")
         except RuntimeError:

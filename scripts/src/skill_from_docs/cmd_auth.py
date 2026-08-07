@@ -15,6 +15,7 @@ from ._http import (
     HostAllowlist,
     build_client,
     request_with_retry,
+    require_allowlist,
 )
 from ._manifest import file_entry, now_iso, record_run
 from ._redaction import redact_body, redact_headers, redact_url
@@ -369,11 +370,10 @@ _RATE_LIMIT_HEADERS = (
 
 
 def run(args, *, transport=None) -> int:
-    if not args.allow_host:
-        print("ERROR: --allow-host is required for auth.", file=sys.stderr)
+    allowlist = require_allowlist(args.allow_host, subcommand="auth")
+    if allowlist is None:
         return 1
 
-    allowlist = HostAllowlist(args.allow_host)
     try:
         allowlist.check(args.endpoint)
     except AllowlistViolation as exc:

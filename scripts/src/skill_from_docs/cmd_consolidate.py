@@ -11,10 +11,10 @@ from collections import defaultdict
 from typing import Any
 
 from . import __version__
-from ._manifest import file_entry, now_iso, record_run, sha256_file
+from ._manifest import file_entry, now_iso, record_run
 from ._provenance import emit_probe, emit_source
 from ._sanitize import sanitize_spec_descriptions, sanitize_text, sanitize_text_for_markdown
-from ._schema import ProbeFixture
+from ._schema import HANDOFF_VERSION, ProbeFixture, lint_handoff
 
 
 CANONICAL_H2 = [
@@ -578,7 +578,7 @@ def _build_handoff(
         content_shape_signals["security_warnings"] = auth_security_warnings
 
     handoff = {
-        "version": 1,
+        "version": HANDOFF_VERSION,
         "proposed_name": proposed_name,
         "tool_summary": info.get("description", "")[:1024],
         "user_declared_scope": declared_scope,
@@ -601,6 +601,16 @@ def _build_handoff(
     for line_num, line in enumerate(docs_md_text.splitlines(), start=1):
         if "<!-- TODO" in line:
             handoff["gap_list"].append({"line": line_num, "text": line.strip()})
+
+    # Assert the packet we emit satisfies its own contract. skill-creator reads
+    # this file in another process; a shape error should fail here, loudly,
+    # rather than surface downstream as a confusing interview.
+    problems = lint_handoff(handoff)
+    if problems:  # pragma: no cover - guards against future edits to this dict
+        raise AssertionError(
+            "internal error: emitted handoff.json violates its own contract: "
+            + "; ".join(problems)
+        )
     return handoff
 
 

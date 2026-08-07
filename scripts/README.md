@@ -57,7 +57,10 @@ Or:  pip install -e ~/.claude/skills/skill-from-docs/scripts
 
 These are non-negotiable defaults:
 
-1. **`--allow-host` is required** on `auth` and `probe`. Without it, exit 1.
+1. **`--allow-host` is required** on `auth`, `probe`, `fetch` (when the source is a
+   URL), and `validate --network`. Without it, exit 1. It must name at least one
+   non-empty host — `--allow-host ""` from an unset shell var is rejected, not
+   silently treated as "allow everything".
 2. **Query-string auth is OPT-IN ONLY** via `--include-query-auth`.
 3. **Basic auth is OPT-IN ONLY** via `--basic-creds USER:PASS`.
 4. **The bad-token probe uses a fixed string** (`aaaaaaaa-bad-token-bbbbbbbb`).
@@ -65,8 +68,10 @@ These are non-negotiable defaults:
 5. **Redaction is the default in `probe`.** Headers in the sensitive set,
    sensitive body keys, sensitive URL query keys, `Set-Cookie`, `Location` —
    all redacted in the saved fixture. Opt-out via `--no-redact`.
-6. **Redirects are blocked by default.** The probe captures `302`s with the
-   `Location` header redacted; no auto-follow to attacker-controlled hosts.
+6. **Redirects are never followed.** The probe captures `302`s with the
+   `Location` header redacted. There is no opt-in: following a redirect safely
+   needs cross-origin credential stripping *on top of* a per-hop allowlist
+   check, and a captured `Location` answers the same question without either.
 7. **Prompt-injection guard runs by default** in `consolidate`. Escapes
    `<!--`/`-->`, escapes line-leading `#`, detects and strips agent-instruction
    patterns. Opt-out via `--no-sanitize-descriptions`.

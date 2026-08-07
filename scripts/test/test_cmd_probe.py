@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 
 from skill_from_docs import cmd_probe
 
@@ -58,6 +59,70 @@ def test_capture_redacts_headers_by_default(tmp_path: Path):
     assert data["response"]["body"]["token"] == "<redacted>"
     # httpx response headers are lowercased; redaction regex is case-insensitive.
     assert data["response"]["headers"]["set-cookie"] == "<redacted>"
+
+
+def test_json_request_body_keys_are_redacted(tmp_path: Path):
+    """Regression: a JSON request body left as a string bypassed key redaction.
+
+    `redact_body` only redacts by key while walking a dict, so a body kept as
+    text wrote `{"password": "hunter2"}` verbatim into the fixture under the
+    default policy.
+    """
+
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(
+        workspace=str(tmp_path),
+        method="POST",
+        data='{"password": "hunter2", "api_key": "sk-live-123", "region": "eu"}',
+    )
+    rc = cmd_probe.run(args, transport=_mock(h))
+    assert rc == 0
+    fixture_path = next((tmp_path / "probes").iterdir())
+    raw = fixture_path.read_text()
+    assert "hunter2" not in raw
+    assert "sk-live-123" not in raw
+    body = json.loads(raw)["request"]["body"]
+    assert body["password"] == "<redacted>"
+    assert body["api_key"] == "<redacted>"
+    # Non-sensitive keys survive — this is redaction, not deletion.
+    assert body["region"] == "eu"
+
+
+def test_form_encoded_request_body_is_structured(tmp_path: Path):
+    """Form bodies are parsed into a dict so key-based redaction can reach
+    them; non-sensitive keys round-trip unchanged."""
+
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(
+        workspace=str(tmp_path),
+        method="POST",
+        data="name=widget&count=3",
+    )
+    rc = cmd_probe.run(args, transport=_mock(h))
+    assert rc == 0
+    fixture_path = next((tmp_path / "probes").iterdir())
+    assert json.loads(fixture_path.read_text())["request"]["body"] == {
+        "name": "widget",
+        "count": "3",
+    }
+
+
+def test_dry_run_redacts_json_request_body(tmp_path: Path, capsys):
+    args = _args(
+        workspace=str(tmp_path),
+        method="POST",
+        data='{"password": "hunter2"}',
+        dry_run=True,
+    )
+    rc = cmd_probe.run(args, transport=_mock(lambda req: httpx.Response(200)))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "hunter2" not in out
+    assert json.loads(out)["request"]["body"]["password"] == "<redacted>"
 
 
 def test_no_redact_keeps_headers(tmp_path: Path):
@@ -183,3 +248,136 @@ def test_missing_allow_host_exits_1(tmp_path: Path):
     args = _args(workspace=str(tmp_path), allow_host=[])
     rc = cmd_probe.run(args)
     assert rc == 1
+
+
+def test_redirects_are_never_followed(tmp_path: Path):
+    """There is no flag that turns redirect-following on. Following one safely
+    would mean reproducing httpx's cross-origin credential stripping on top of
+    the allowlist check; the capability is not worth two subtle guards."""
+    from skill_from_docs import openapi_harvest
+
+    parser = openapi_harvest.build_parser()
+    base = ["probe", "https://api.example.com/x", "--scope", "ad-hoc", "--allow-host", "api.example.com"]
+    assert parser.parse_args(base).follow_redirects is False
+    assert parser.parse_args(base + ["--no-follow-redirects"]).follow_redirects is False
+    with pytest.raises(SystemExit):
+        parser.parse_args(base + ["--follow-redirects"])
+
+
+def test_proxy_authorization_is_redacted(tmp_path: Path):
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(
+        workspace=str(tmp_path),
+        header=["Proxy-Authorization: Basic c2VjcmV0"],
+    )
+    assert cmd_probe.run(args, transport=_mock(h)) == 0
+    raw = next((tmp_path / "probes").iterdir()).read_text()
+    assert "c2VjcmV0" not in raw
+
+
+def test_form_encoded_request_body_keys_are_redacted(tmp_path: Path):
+    """An OAuth2 token request is the most credential-dense body this tool
+    captures, and it is form-encoded, not JSON."""
+
+    def h(req):
+        return httpx.Response(200, json={"access_token": "x"})
+
+    args = _args(
+        workspace=str(tmp_path),
+        method="POST",
+        data="grant_type=password&client_secret=SUPERSECRET&password=hunter2&scope=read",
+        scope="auth-discovery",
+    )
+    assert cmd_probe.run(args, transport=_mock(h)) == 0
+    raw = next((tmp_path / "probes").iterdir()).read_text()
+    assert "hunter2" not in raw
+    body = json.loads(raw)["request"]["body"]
+    assert body["password"] == "<redacted>"
+    assert body["scope"] == "read"
+
+
+def test_free_text_body_is_not_mistaken_for_a_form(tmp_path: Path):
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    for payload in ("just some free text", "<xml>a=b</xml>", "a=1\nb=2"):
+        ws = tmp_path / payload[:4].replace("<", "_").replace("/", "_")
+        args = _args(workspace=str(ws), method="POST", data=payload)
+        assert cmd_probe.run(args, transport=_mock(h)) == 0
+        assert json.loads(next((ws / "probes").iterdir()).read_text())["request"]["body"] == payload
+
+
+def test_empty_allow_host_string_is_rejected(tmp_path: Path, capsys):
+    """`--allow-host ""` from an unset shell var is a truthy arg list but an
+    empty, permit-everything allowlist."""
+    args = _args(workspace=str(tmp_path), allow_host=[""])
+    assert cmd_probe.run(args, transport=_mock(lambda r: httpx.Response(200))) == 1
+    assert "--allow-host" in capsys.readouterr().err
+
+
+def test_base64_padded_form_value_still_redacted(tmp_path: Path):
+    """`=` inside a value (base64 padding) is the common shape for a client
+    secret; an over-strict form heuristic would drop it back to raw text."""
+
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(
+        workspace=str(tmp_path),
+        method="POST",
+        data="client_secret=c2VjcmV0dmFsdWU=&grant_type=client_credentials",
+        scope="auth-discovery",
+    )
+    assert cmd_probe.run(args, transport=_mock(h)) == 0
+    raw = next((tmp_path / "probes").iterdir()).read_text()
+    assert "c2VjcmV0dmFsdWU" not in raw
+    assert json.loads(raw)["request"]["body"]["client_secret"] == "<redacted>"
+
+
+def test_repeated_form_keys_are_preserved(tmp_path: Path):
+    """`scope=read&scope=write` must not collapse to the last value — the
+    fixture claims to record the request that was actually sent."""
+
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(
+        workspace=str(tmp_path), method="POST", data="scope=read&scope=write&grant_type=x"
+    )
+    assert cmd_probe.run(args, transport=_mock(h)) == 0
+    body = json.loads(next((tmp_path / "probes").iterdir()).read_text())["request"]["body"]
+    assert body["scope"] == ["read", "write"]
+
+
+def test_base64_blob_body_is_not_mistaken_for_a_form(tmp_path: Path):
+    """A padded base64 blob partitions into key=<blob>, sep='=', value=''.
+    Converting it would move the secret into a dict KEY."""
+
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(
+        workspace=str(tmp_path),
+        method="POST",
+        data="c2VjcmV0LWFwaS1rZXktYWJjMTIz=",
+        redact_body_pattern=[r"c2VjcmV0[A-Za-z0-9+/=-]*"],
+    )
+    assert cmd_probe.run(args, transport=_mock(h)) == 0
+    raw = next((tmp_path / "probes").iterdir()).read_text()
+    assert "c2VjcmV0LWFwaS1rZXktYWJjMTIz" not in raw
+
+
+def test_nan_body_falls_through_to_text(tmp_path: Path):
+    """json.loads accepts Python-only NaN; json.dump would then emit invalid
+    JSON into a fixture another process has to read."""
+
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(workspace=str(tmp_path), method="POST", data='{"lat": NaN}')
+    assert cmd_probe.run(args, transport=_mock(h)) == 0
+    raw = next((tmp_path / "probes").iterdir()).read_text()
+    json.loads(raw)  # fixture must be strictly valid JSON
+    assert json.loads(raw)["request"]["body"] == '{"lat": NaN}'

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from skill_from_docs._manifest import (
@@ -10,7 +9,6 @@ from skill_from_docs._manifest import (
     load_manifest,
     now_iso,
     record_run,
-    sha256_file,
     verify_hashes,
     write_manifest,
 )

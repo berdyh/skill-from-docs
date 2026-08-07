@@ -9,15 +9,16 @@ import re
 import sys
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from . import __version__
 from ._http import (
     AllowlistViolation,
     HostAllowlist,
     build_client,
+    require_allowlist,
 )
-from ._manifest import file_entry, now_iso, record_run, sha256_file
+from ._manifest import now_iso, record_run, sha256_file
 from ._redaction import (
     compile_patterns,
     redact_body,
@@ -48,11 +49,19 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--redact-body-pattern", action="append", default=[])
     p.add_argument("--allow-host", action="append", default=[])
     p.add_argument("--max-retries", type=int, default=3)
+    # Redirects are never followed. A 30x to an attacker host is the canonical
+    # token-leak path, and following one safely means reproducing httpx's
+    # cross-origin credential stripping on top of the allowlist check — two
+    # subtle guards to maintain for a capability nothing here needs. The
+    # `Location` header is captured (redacted) instead. `--no-follow-redirects`
+    # stays accepted so existing invocations keep working; it states the
+    # guarantee rather than toggling anything.
     p.add_argument(
         "--no-follow-redirects",
         dest="follow_redirects",
         action="store_false",
         default=False,
+        help="accepted for compatibility; redirects are never followed",
     )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--timeout", type=float, default=30.0)
@@ -78,6 +87,70 @@ def _read_body(spec: str | None) -> bytes | None:
     return spec.encode("utf-8")
 
 
+def _reject_json_constant(name: str):
+    """json.loads accepts Python-only NaN/Infinity; the fixture must stay valid
+    JSON for the process that reads it, so treat those bodies as text."""
+    raise ValueError(f"non-JSON constant in body: {name}")
+
+
+def _looks_form_encoded(text: str) -> bool:
+    """Heuristic for application/x-www-form-urlencoded without a Content-Type.
+
+    Deliberately strict: every `&`-separated segment must be a single `k=v`
+    pair with a non-empty key that looks like an identifier. A JSON body, an
+    XML body, or free text will not match.
+    """
+    if "=" not in text or "\n" in text:
+        return False
+    segments = text.split("&")
+    if len(segments) == 1 and not segments[0].partition("=")[2].strip("="):
+        # `c2VjcmV0...=` is base64 padding, not `key=`. Converting it would move
+        # the blob into a dict KEY, where redact_body's pattern pass never looks.
+        return False
+    for segment in segments:
+        # partition, not count("=") — a base64-padded value (`secret=abc==`) is
+        # the common shape for exactly the credentials this needs to reach.
+        key, sep, _value = segment.partition("=")
+        if not sep or not key or not re.fullmatch(r"[A-Za-z0-9_.\[\]-]+", key):
+            return False
+    return True
+
+
+def _decode_request_body(body_bytes: bytes | None) -> Any:
+    """Decode a request body for the fixture, structuring it where possible.
+
+    Structure matters for more than tidiness: `redact_body` only applies
+    key-based redaction while walking dicts, so a body left as a string keeps
+    `password=hunter2` verbatim in the saved fixture. The response path gets
+    this for free via `resp.json()`; the request path has to ask.
+
+    Form-encoded bodies matter as much as JSON here — an OAuth2 token request
+    (`grant_type=password&client_secret=...`) is the most credential-dense body
+    this tool will ever capture, and capturing it is exactly what
+    `--scope auth-discovery` is for.
+    """
+    if not body_bytes:
+        return None
+    text = body_bytes.decode("utf-8", errors="replace")
+    try:
+        return json.loads(text, parse_constant=_reject_json_constant)
+    except (ValueError, TypeError):
+        pass
+    if _looks_form_encoded(text):
+        pairs = parse_qsl(text, keep_blank_values=True)
+        out: dict[str, Any] = {}
+        for key, value in pairs:
+            # `scope=read&scope=write` is ordinary; collapsing to the last value
+            # would misrepresent the request the fixture claims to record.
+            if key in out:
+                existing = out[key]
+                out[key] = existing + [value] if isinstance(existing, list) else [existing, value]
+            else:
+                out[key] = value
+        return out
+    return text
+
+
 def _fixture_slug(url: str, method: str) -> str:
     parsed = urlparse(url)
     path = parsed.path.strip("/") or "root"
@@ -98,6 +171,9 @@ def _retry_with_policy(
 ):
     """Probe-specific retry: honors Retry-After on 429, backoff on 5xx,
     returns the last response on max retries exceeded.
+
+    Redirects are not followed; a 30x is returned as-is for the caller to
+    record.
     """
     if allowlist is not None:
         allowlist.check(url)
@@ -136,10 +212,10 @@ def _load_spec_meta(workspace: str) -> tuple[str | None, str | None]:
 
 
 def run(args, *, transport=None, sleeper=time.sleep) -> int:
-    if not args.allow_host:
-        print("ERROR: --allow-host is required for probe.", file=sys.stderr)
+    allowlist = require_allowlist(args.allow_host, subcommand="probe")
+    if allowlist is None:
         return 1
-    allowlist = HostAllowlist(args.allow_host)
+
     try:
         allowlist.check(args.url)
     except AllowlistViolation as exc:
@@ -181,7 +257,7 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
 
     if args.dry_run:
         req_headers, req_url, req_body = _apply_redaction(
-            hdrs, args.url, body_bytes.decode("utf-8", errors="replace") if body_bytes else None
+            hdrs, args.url, _decode_request_body(body_bytes)
         )
         print(json.dumps(
             {
@@ -201,7 +277,7 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
     t0 = time.perf_counter()
     with build_client(
         timeout=args.timeout,
-        follow_redirects=args.follow_redirects,
+        follow_redirects=False,
         transport=transport,
     ) as client:
         try:
@@ -239,7 +315,7 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
         resp_body = resp.text
 
     req_headers, req_url, req_body = _apply_redaction(
-        hdrs, args.url, body_bytes.decode("utf-8", errors="replace") if body_bytes else None
+        hdrs, args.url, _decode_request_body(body_bytes)
     )
     resp_headers = dict(resp.headers)
     if not args.no_redact:

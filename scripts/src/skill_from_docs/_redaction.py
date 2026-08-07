@@ -9,20 +9,22 @@ from __future__ import annotations
 
 import re
 from typing import Any, Iterable
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlparse, urlunparse
 
 
 REDACTED = "<redacted>"
 
 # Header names (case-insensitive match) that always get redacted.
 SENSITIVE_HEADER_RE = re.compile(
-    r"^(authorization|x-api-key|x-auth-token|api-key|token|cookie|x-csrf-token|set-cookie|location)$",
+    r"^(authorization|proxy-authorization|x-api-key|x-auth-token|api-key|token|cookie|x-csrf-token|set-cookie|location)$",
     re.IGNORECASE,
 )
 
 # Default body keys to redact recursively in JSON bodies.
 DEFAULT_BODY_KEYS = (
     "token",
+    "client_secret",
+    "client_assertion",
     "api_key",
     "apiKey",
     "secret",
@@ -99,8 +101,15 @@ def redact_body(
             for k, v in value.items():
                 if isinstance(k, str) and k.lower() in keys:
                     out[k] = REDACTED
-                else:
-                    out[k] = _walk(v)
+                    continue
+                # Patterns apply to keys too. A body misread as form-encoded
+                # would otherwise move a secret into a key, where a value-only
+                # pass would never see it.
+                new_k = k
+                if isinstance(k, str):
+                    for pat in patterns:
+                        new_k = pat.sub(REDACTED, new_k)
+                out[new_k] = _walk(v)
             return out
         if isinstance(value, list):
             return [_walk(v) for v in value]
