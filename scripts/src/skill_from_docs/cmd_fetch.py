@@ -168,20 +168,25 @@ def _collect_external_refs(node: Any, refs: list[str]) -> None:
             _collect_external_refs(item, refs)
 
 
-def _validate_external_refs(
+def _collect_external_ref_violations(
     spec: dict[str, Any],
     *,
     allowlist: HostAllowlist,
     source_host: str | None,
-) -> None:
-    """B3: reject `$ref` values that would cause prance to fetch a non-allowed
-    URL or a local file. Raises FetchError (exit 3) on the first violation.
+) -> list[str]:
+    """B3: find every `$ref` that would cause a fetch of a non-allowed URL or a
+    local file. Returns one message per violation; empty means clean.
 
     - Internal refs (`#/...`) are always safe — never collected.
     - `file://` and any non-http(s) scheme are rejected unconditionally.
     - http/https refs must target a host in `allowlist` OR the same host as
       the source spec.
+
+    Collecting rather than raising lets the caller choose the severity: fatal
+    when the refs are about to be dereferenced, advisory under --no-resolve
+    where nothing is fetched but the spec still lands on disk.
     """
+    violations: list[str] = []
     refs: list[str] = []
     _collect_external_refs(spec, refs)
     for ref in refs:
@@ -199,35 +204,43 @@ def _validate_external_refs(
             # is allowed when the source host is allowed. If source is local
             # (no spec_url), prance reads a sibling file — block it.
             if source_host is None:
-                raise FetchError(
-                    f"external $ref to sibling file is not allowed when source is local: {ref!r}",
-                    exit_code=3,
+                violations.append(
+                    f"external $ref to sibling file is not allowed when source is local: {ref!r}"
                 )
             continue
         if scheme in ("file",):
-            raise FetchError(
-                f"external $ref uses file:// scheme (not allowed): {ref!r}",
-                exit_code=3,
-            )
+            violations.append(f"external $ref uses file:// scheme (not allowed): {ref!r}")
+            continue
         if scheme not in ("http", "https"):
-            raise FetchError(
-                f"external $ref uses non-http(s) scheme {scheme!r}: {ref!r}",
-                exit_code=3,
-            )
+            violations.append(f"external $ref uses non-http(s) scheme {scheme!r}: {ref!r}")
+            continue
         host = (parsed.hostname or "").lower()
         if not host:
-            raise FetchError(
-                f"external $ref has no host: {ref!r}", exit_code=3
-            )
+            violations.append(f"external $ref has no host: {ref!r}")
+            continue
         allowed_hosts = set()
         if source_host:
             allowed_hosts.add(source_host.lower())
         # allowlist exposes its hosts via __contains__
         if host not in allowed_hosts and host not in allowlist:
-            raise FetchError(
-                f"external $ref host {host!r} is not in --allow-host: {ref!r}",
-                exit_code=3,
+            violations.append(
+                f"external $ref host {host!r} is not in --allow-host: {ref!r}"
             )
+    return violations
+
+
+def _validate_external_refs(
+    spec: dict[str, Any],
+    *,
+    allowlist: HostAllowlist,
+    source_host: str | None,
+) -> None:
+    """Raise FetchError (exit 3) on the first external-$ref violation."""
+    violations = _collect_external_ref_violations(
+        spec, allowlist=allowlist, source_host=source_host
+    )
+    if violations:
+        raise FetchError(violations[0], exit_code=3)
 
 
 def _resolve_refs(spec: dict[str, Any]) -> dict[str, Any]:
@@ -687,16 +700,30 @@ def run(args, *, log=None, transport=None) -> int:
     # B3: validate every external $ref BEFORE handing the spec to prance — a
     # poisoned `$ref: https://attacker.com/x` or `$ref: file:///etc/passwd`
     # would otherwise be fetched server-side.
+    #
+    # Validation runs even under --no-resolve. Nothing is dereferenced there, so
+    # a violation is not fatal — but the spec still gets written to raw/spec.json
+    # with the hostile refs intact, and downstream consumers (consolidate, the
+    # user's own tooling) may resolve them later. Warn so the artifact is not
+    # silently poisoned.
+    source_host = urlparse(spec_url).hostname if spec_url else None
+    ref_violations = _collect_external_ref_violations(
+        spec, allowlist=allowlist, source_host=source_host
+    )
     if not args.no_resolve:
-        source_host = urlparse(spec_url).hostname if spec_url else None
-        try:
-            _validate_external_refs(
-                spec, allowlist=allowlist, source_host=source_host
-            )
-        except FetchError as fe:
-            print(f"ERROR: {fe}", file=sys.stderr)
-            return fe.exit_code
+        if ref_violations:
+            print(f"ERROR: {ref_violations[0]}", file=sys.stderr)
+            return 3
         spec = _resolve_refs(spec)
+    elif ref_violations:
+        for v in ref_violations:
+            print(f"WARNING: {v}", file=sys.stderr)
+        print(
+            f"WARNING: {len(ref_violations)} unsafe $ref(s) preserved verbatim in the "
+            "output spec because --no-resolve was set; nothing was fetched, but do not "
+            "dereference this spec downstream without re-validating.",
+            file=sys.stderr,
+        )
 
     sha = sha256_bytes(body)
     source_map = _build_source_map(spec, spec_url=spec_url, sha256=sha)

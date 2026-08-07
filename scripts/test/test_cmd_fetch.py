@@ -255,6 +255,62 @@ def test_external_ref_https_outside_allowlist_rejected(tmp_path: Path):
     assert rc == 3
 
 
+def test_external_ref_warns_but_succeeds_under_no_resolve(tmp_path: Path, capsys):
+    """--no-resolve does not dereference, so a hostile $ref is not fatal — but
+    the spec still lands on disk, so it must not land silently."""
+    poisoned = {
+        "openapi": "3.0.3",
+        "info": {"title": "x", "version": "1"},
+        "paths": {
+            "/y": {"get": {"$ref": "https://attacker.com/x.json"}},
+            "/z": {"get": {"$ref": "file:///etc/passwd"}},
+        },
+    }
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(poisoned))
+    ws = tmp_path / "ws"
+    args = _make_args(
+        source=str(spec_path),
+        workspace=str(ws),
+        allow_host=["api.example.com"],
+        no_resolve=True,
+    )
+    rc = cmd_fetch.run(args)
+    assert rc == 0
+
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "attacker.com" in err
+    assert "file://" in err
+    # Warned, not silently swallowed — and not escalated to an error either.
+    assert "ERROR" not in err
+
+    # The refs are preserved verbatim; we warn about the artifact, we don't rewrite it.
+    written = json.loads((ws / "raw" / "spec.json").read_text())
+    assert written["paths"]["/y"]["get"]["$ref"] == "https://attacker.com/x.json"
+
+
+def test_local_sibling_ref_still_works_under_no_resolve(tmp_path: Path, capsys):
+    """A legitimate local multi-file spec: sibling refs are fatal on the resolve
+    path (prance would read the file), so --no-resolve is the escape hatch. It
+    must stay open."""
+    multifile = {
+        "openapi": "3.0.3",
+        "info": {"title": "x", "version": "1"},
+        "paths": {"/y": {"get": {"$ref": "./components.yaml#/get"}}},
+    }
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(multifile))
+    args = _make_args(
+        source=str(spec_path),
+        workspace=str(tmp_path / "ws"),
+        allow_host=["api.example.com"],
+        no_resolve=True,
+    )
+    assert cmd_fetch.run(args) == 0
+    assert "WARNING" in capsys.readouterr().err
+
+
 def test_external_ref_https_in_allowlist_accepted(tmp_path: Path):
     """B3: external $ref to a host in the allowlist is accepted (prance may
     or may not actually fetch — that's not our concern here)."""
