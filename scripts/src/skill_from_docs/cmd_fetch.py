@@ -347,10 +347,10 @@ def _discover(client, base_url: str, allowlist: HostAllowlist) -> tuple[bytes, s
             html = body.decode("utf-8", errors="replace")
             renderer_url = _try_renderers(html, base_url)
             if renderer_url:
-                try:
-                    allowlist.check(renderer_url)
-                except AllowlistViolation as exc:
-                    raise FetchError(str(exc), exit_code=1)
+                # Let AllowlistViolation propagate to the handler below — an
+                # off-allowlist renderer URL is a user error worth reporting,
+                # not something to fall through into common-path probing.
+                allowlist.check(renderer_url)
                 r2 = request_with_retry(
                     client, "GET", renderer_url, allowlist=allowlist, max_retries=0
                 )
@@ -358,9 +358,9 @@ def _discover(client, base_url: str, allowlist: HostAllowlist) -> tuple[bytes, s
                     return r2.content, renderer_url
     except AllowlistViolation as exc:
         raise FetchError(str(exc), exit_code=1)
-    except Exception as e:
+    except Exception:
         # Continue to common-path probing for connection errors.
-        last_err = e  # noqa: F841
+        pass
 
     # 2. Common spec paths against the origin.
     parsed = urlparse(base_url)

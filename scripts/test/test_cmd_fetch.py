@@ -114,6 +114,32 @@ def test_renderer_extraction_via_http(tmp_path: Path, fixtures_dir: Path):
     assert out["info"]["title"] == "Tiny API"
 
 
+def test_offallowlist_renderer_url_reports_allowlist_error(
+    tmp_path: Path, fixtures_dir: Path, capsys
+):
+    """The renderer points at a host the user didn't allow. That should exit 1
+    naming the allowlist, not fall through to common-path probing and die with
+    a misleading 'could not discover an OpenAPI spec'."""
+    html = (fixtures_dir / "swagger-ui-shell.html").read_text()
+    transport = _transport(
+        {
+            "https://docs.example.com/api/": httpx.Response(
+                200, text=html, headers={"Content-Type": "text/html"}
+            ),
+        }
+    )
+    args = _make_args(
+        source="https://docs.example.com/api/",
+        workspace=str(tmp_path),
+        allow_host=["docs.example.com"],  # api.example.com deliberately absent
+    )
+    rc = cmd_fetch.run(args, transport=transport)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "api.example.com" in err
+    assert "could not discover" not in err
+
+
 def test_fallback_to_common_paths(tmp_path: Path, fixtures_dir: Path):
     spec_text = (fixtures_dir / "tiny-openapi-3.json").read_text()
     transport = _transport(
