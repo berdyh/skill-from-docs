@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 
 from skill_from_docs import cmd_probe
 
@@ -249,20 +250,18 @@ def test_missing_allow_host_exits_1(tmp_path: Path):
     assert rc == 1
 
 
-def test_follow_redirects_flag_pair(tmp_path: Path):
-    """--no-follow-redirects used to be the only flag and was a no-op
-    (store_false with default=False). Redirects stay off by default; the
-    enabling counterpart now exists."""
-    import argparse
-
+def test_redirects_are_never_followed(tmp_path: Path):
+    """There is no flag that turns redirect-following on. Following one safely
+    would mean reproducing httpx's cross-origin credential stripping on top of
+    the allowlist check; the capability is not worth two subtle guards."""
     from skill_from_docs import openapi_harvest
 
     parser = openapi_harvest.build_parser()
     base = ["probe", "https://api.example.com/x", "--scope", "ad-hoc", "--allow-host", "api.example.com"]
     assert parser.parse_args(base).follow_redirects is False
     assert parser.parse_args(base + ["--no-follow-redirects"]).follow_redirects is False
-    assert parser.parse_args(base + ["--follow-redirects"]).follow_redirects is True
-    assert isinstance(parser, argparse.ArgumentParser)
+    with pytest.raises(SystemExit):
+        parser.parse_args(base + ["--follow-redirects"])
 
 
 def test_proxy_authorization_is_redacted(tmp_path: Path):
@@ -352,32 +351,33 @@ def test_repeated_form_keys_are_preserved(tmp_path: Path):
     assert body["scope"] == ["read", "write"]
 
 
-def test_follow_redirects_enforces_allowlist_per_hop(tmp_path: Path):
-    """--follow-redirects must not become an allowlist bypass: httpx following
-    a 30x itself would vet only the original URL."""
-    seen: list[str] = []
+def test_base64_blob_body_is_not_mistaken_for_a_form(tmp_path: Path):
+    """A padded base64 blob partitions into key=<blob>, sep='=', value=''.
+    Converting it would move the secret into a dict KEY."""
 
     def h(req):
-        seen.append(str(req.url))
-        if req.url.host == "api.example.com":
-            return httpx.Response(302, headers={"Location": "https://evil.example.net/leak"})
-        return httpx.Response(200, json={"leaked": True})
-
-    args = _args(workspace=str(tmp_path), follow_redirects=True)
-    rc = cmd_probe.run(args, transport=_mock(h))
-    assert rc == 1
-    # The off-allowlist hop was never requested.
-    assert all("evil.example.net" not in u for u in seen)
-    assert not list((tmp_path / "probes").iterdir())
-
-
-def test_follow_redirects_allowed_when_target_is_on_allowlist(tmp_path: Path):
-    def h(req):
-        if req.url.path == "/v1/locations":
-            return httpx.Response(302, headers={"Location": "https://api.example.com/v2/locations"})
         return httpx.Response(200, json={"ok": True})
 
-    args = _args(workspace=str(tmp_path), follow_redirects=True)
+    args = _args(
+        workspace=str(tmp_path),
+        method="POST",
+        data="c2VjcmV0LWFwaS1rZXktYWJjMTIz=",
+        redact_body_pattern=[r"c2VjcmV0[A-Za-z0-9+/=-]*"],
+    )
     assert cmd_probe.run(args, transport=_mock(h)) == 0
-    data = json.loads(next((tmp_path / "probes").iterdir()).read_text())
-    assert data["response"]["status"] == 200
+    raw = next((tmp_path / "probes").iterdir()).read_text()
+    assert "c2VjcmV0LWFwaS1rZXktYWJjMTIz" not in raw
+
+
+def test_nan_body_falls_through_to_text(tmp_path: Path):
+    """json.loads accepts Python-only NaN; json.dump would then emit invalid
+    JSON into a fixture another process has to read."""
+
+    def h(req):
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(workspace=str(tmp_path), method="POST", data='{"lat": NaN}')
+    assert cmd_probe.run(args, transport=_mock(h)) == 0
+    raw = next((tmp_path / "probes").iterdir()).read_text()
+    json.loads(raw)  # fixture must be strictly valid JSON
+    assert json.loads(raw)["request"]["body"] == '{"lat": NaN}'

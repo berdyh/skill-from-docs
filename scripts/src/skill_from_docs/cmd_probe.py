@@ -9,7 +9,7 @@ import re
 import sys
 import time
 from typing import Any
-from urllib.parse import parse_qsl, urljoin, urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from . import __version__
 from ._http import (
@@ -49,21 +49,19 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--redact-body-pattern", action="append", default=[])
     p.add_argument("--allow-host", action="append", default=[])
     p.add_argument("--max-retries", type=int, default=3)
-    # Redirects are blocked by default: a 30x to an attacker host is the
-    # canonical token-leak path. --no-follow-redirects is kept as an accepted
-    # no-op so existing invocations and docs keep working.
-    p.add_argument(
-        "--follow-redirects",
-        dest="follow_redirects",
-        action="store_true",
-        default=False,
-        help="follow 30x responses (default: off; the Location header is captured, not followed)",
-    )
+    # Redirects are never followed. A 30x to an attacker host is the canonical
+    # token-leak path, and following one safely means reproducing httpx's
+    # cross-origin credential stripping on top of the allowlist check — two
+    # subtle guards to maintain for a capability nothing here needs. The
+    # `Location` header is captured (redacted) instead. `--no-follow-redirects`
+    # stays accepted so existing invocations keep working; it states the
+    # guarantee rather than toggling anything.
     p.add_argument(
         "--no-follow-redirects",
         dest="follow_redirects",
         action="store_false",
-        help=argparse.SUPPRESS,
+        default=False,
+        help="accepted for compatibility; redirects are never followed",
     )
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--timeout", type=float, default=30.0)
@@ -89,6 +87,12 @@ def _read_body(spec: str | None) -> bytes | None:
     return spec.encode("utf-8")
 
 
+def _reject_json_constant(name: str):
+    """json.loads accepts Python-only NaN/Infinity; the fixture must stay valid
+    JSON for the process that reads it, so treat those bodies as text."""
+    raise ValueError(f"non-JSON constant in body: {name}")
+
+
 def _looks_form_encoded(text: str) -> bool:
     """Heuristic for application/x-www-form-urlencoded without a Content-Type.
 
@@ -98,7 +102,12 @@ def _looks_form_encoded(text: str) -> bool:
     """
     if "=" not in text or "\n" in text:
         return False
-    for segment in text.split("&"):
+    segments = text.split("&")
+    if len(segments) == 1 and not segments[0].partition("=")[2].strip("="):
+        # `c2VjcmV0...=` is base64 padding, not `key=`. Converting it would move
+        # the blob into a dict KEY, where redact_body's pattern pass never looks.
+        return False
+    for segment in segments:
         # partition, not count("=") — a base64-padded value (`secret=abc==`) is
         # the common shape for exactly the credentials this needs to reach.
         key, sep, _value = segment.partition("=")
@@ -124,7 +133,7 @@ def _decode_request_body(body_bytes: bytes | None) -> Any:
         return None
     text = body_bytes.decode("utf-8", errors="replace")
     try:
-        return json.loads(text)
+        return json.loads(text, parse_constant=_reject_json_constant)
     except (ValueError, TypeError):
         pass
     if _looks_form_encoded(text):
@@ -159,41 +168,20 @@ def _retry_with_policy(
     allowlist: HostAllowlist,
     max_retries: int,
     sleeper=time.sleep,
-    follow_redirects: bool = False,
-    max_redirects: int = 5,
 ):
     """Probe-specific retry: honors Retry-After on 429, backoff on 5xx,
     returns the last response on max retries exceeded.
 
-    Redirects are followed here rather than by httpx so that every hop is
-    allowlist-checked. Handing `follow_redirects=True` to the client would let
-    it chase a 30x to an arbitrary host with only the *original* URL vetted.
+    Redirects are not followed; a 30x is returned as-is for the caller to
+    record.
     """
     if allowlist is not None:
         allowlist.check(url)
 
     attempts = 0
-    redirects = 0
     last_resp = None
     while True:
         last_resp = client.request(method, url, headers=headers, content=content)
-        if (
-            follow_redirects
-            and last_resp.status_code in (301, 302, 303, 307, 308)
-            and redirects < max_redirects
-        ):
-            location = last_resp.headers.get("Location")
-            if location:
-                url = urljoin(url, location)
-                # Raises AllowlistViolation before the next request goes out.
-                if allowlist is not None:
-                    allowlist.check(url)
-                if last_resp.status_code == 303 or (
-                    last_resp.status_code in (301, 302) and method == "POST"
-                ):
-                    method, content = "GET", None
-                redirects += 1
-                continue
         if last_resp.status_code == 429 and attempts < max_retries:
             ra = last_resp.headers.get("Retry-After")
             try:
@@ -287,8 +275,6 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
 
     started = now_iso()
     t0 = time.perf_counter()
-    # Always False: _retry_with_policy follows redirects itself so it can
-    # allowlist-check each hop before the request goes out.
     with build_client(
         timeout=args.timeout,
         follow_redirects=False,
@@ -304,7 +290,6 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
                 allowlist=allowlist,
                 max_retries=args.max_retries,
                 sleeper=sleeper,
-                follow_redirects=args.follow_redirects,
             )
         except AllowlistViolation as exc:
             print(f"ERROR: {exc}", file=sys.stderr)

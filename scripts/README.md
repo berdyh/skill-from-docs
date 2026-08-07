@@ -68,11 +68,10 @@ These are non-negotiable defaults:
 5. **Redaction is the default in `probe`.** Headers in the sensitive set,
    sensitive body keys, sensitive URL query keys, `Set-Cookie`, `Location` —
    all redacted in the saved fixture. Opt-out via `--no-redact`.
-6. **Redirects are blocked by default.** The probe captures `302`s with the
-   `Location` header redacted; no auto-follow to attacker-controlled hosts.
-   `--follow-redirects` opts in, and every hop is allowlist-checked before the
-   request goes out (the redirect chain is walked by `probe`, not by httpx,
-   precisely so the allowlist applies to each hop rather than only the first).
+6. **Redirects are never followed.** The probe captures `302`s with the
+   `Location` header redacted. There is no opt-in: following a redirect safely
+   needs cross-origin credential stripping *on top of* a per-hop allowlist
+   check, and a captured `Location` answers the same question without either.
 7. **Prompt-injection guard runs by default** in `consolidate`. Escapes
    `<!--`/`-->`, escapes line-leading `#`, detects and strips agent-instruction
    patterns. Opt-out via `--no-sanitize-descriptions`.
