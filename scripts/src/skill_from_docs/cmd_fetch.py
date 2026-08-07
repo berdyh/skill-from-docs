@@ -734,7 +734,11 @@ def run(args, *, log=None, transport=None) -> int:
     record_run(
         workspace,
         subcommand="fetch",
-        args={"source": args.source, "no_resolve": args.no_resolve},
+        args={
+            "source": args.source,
+            "no_resolve": args.no_resolve,
+            "allow_host": sorted(args.allow_host or []),
+        },
         started_at=started,
         finished_at=finished,
         outputs=[file_entry(workspace, out_spec), file_entry(workspace, out_map)],

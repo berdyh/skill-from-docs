@@ -7,7 +7,7 @@ import json
 import os
 from typing import Any
 
-from ._manifest import now_iso, verify_hashes
+from ._manifest import now_iso, record_run, verify_hashes
 from ._http import require_allowlist
 from ._provenance import find_all_provenance
 from ._schema import lint_handoff
@@ -77,6 +77,7 @@ def run(args) -> int:
         if network_allowlist is None:
             return 1
 
+    started = now_iso()
     workspace = args.workspace or os.getcwd()
     checks: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -320,6 +321,24 @@ def run(args) -> int:
         f"Pass: {sum(1 for c in checks if c['passed'])}/{len(checks)}, "
         f"warn: {len(warnings)}, fail: {sum(1 for c in checks if not c['passed'])}"
     )
+
+    # Only --network touches the network, and it is the one subcommand whose
+    # target host is read out of a workspace file rather than the CLI, so it is
+    # the run most worth having in the audit trail. Local runs stay silent —
+    # recording them would churn manifest.json on every CI invocation.
+    if args.network:
+        record_run(
+            workspace,
+            subcommand="validate",
+            args={
+                "network": True,
+                "strict": bool(args.strict),
+                "allow_host": sorted(getattr(args, "allow_host", None) or []),
+            },
+            started_at=started,
+            finished_at=now_iso(),
+            outputs=[],
+        )
 
     if args.json_out:
         print(json.dumps(

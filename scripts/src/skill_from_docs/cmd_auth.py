@@ -557,7 +557,11 @@ def run(args, *, transport=None) -> int:
     record_run(
         workspace,
         subcommand="auth",
-        args={"endpoint": args.endpoint, "patterns_tried": len(attempts)},
+        args={
+            "endpoint": args.endpoint,
+            "patterns_tried": len(attempts),
+            "allow_host": sorted(args.allow_host or []),
+        },
         started_at=started,
         finished_at=finished,
         outputs=[file_entry(workspace, fixture_rel)],

@@ -352,7 +352,12 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
     record_run(
         workspace,
         subcommand="probe",
-        args={"url": args.url, "method": args.method, "scope": args.scope},
+        args={
+            "url": args.url,
+            "method": args.method,
+            "scope": args.scope,
+            "allow_host": sorted(args.allow_host or []),
+        },
         started_at=started,
         finished_at=finished,
         outputs=[{"path": os.path.relpath(out_path, workspace), "sha256": sha256_file(out_path)}],
