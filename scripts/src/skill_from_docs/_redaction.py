@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Iterable
-from urllib.parse import parse_qsl, quote, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, unquote, urlparse, urlunparse
 
 
 REDACTED = "<redacted>"
@@ -65,6 +65,77 @@ def redact_headers(headers: dict[str, str]) -> dict[str, str]:
 _QUERY_VALUE_SAFE = "/:@,!$'()*~"
 
 
+# --- A7: fallback for URLs `urlparse` cannot parse -------------------------
+#
+# A malformed IPv6 literal (`https://[::1/p?token=1`, missing the closing
+# `]`) makes `urlparse` raise. The old behaviour was `except Exception: return
+# url` — fail-open, in the one function whose job is stripping credentials.
+# Failing closed (a placeholder) was rejected: it would destroy the audit
+# trail for the common case of a genuinely malformed URL with no credential
+# in it, to protect the rare one that has both a syntax error and a secret.
+# This is the middle option: a best-effort regex pass over the raw string.
+#
+# Userinfo first, unconditionally at the front of the string, so a stray `=`
+# inside a password cannot later be mistaken for a query pair by the
+# key/value pass. Anchored on `scheme://...@` with no `/`, `?`, `#`, `@` or
+# whitespace in between — that is exactly how far userinfo can legally
+# extend, and it holds regardless of how mangled the *rest* of the URL is
+# (the example above is malformed entirely inside the host, well after where
+# this pattern stops looking).
+_FALLBACK_USERINFO_RE = re.compile(r"^(https?://)[^/?#@\s]+@")
+
+# `key=value` pairs anywhere in the (still raw, not query-isolated) string —
+# once urlparse has failed, there is no reliable way to know where the query
+# component starts, so this scans the whole thing. The value alternative
+# tries the literal `<redacted>` sentinel first so that a previously-redacted
+# value round-trips unchanged instead of being re-matched a character short
+# (see the idempotence note below).
+_FALLBACK_KV_RE = re.compile(
+    rf"(?P<key>[A-Za-z0-9_%+.\-]+)=(?P<value>{re.escape(REDACTED)}|[^&\s\"'<>\\]*)"
+)
+
+
+def _redact_url_fallback(url: str) -> str:
+    """Best-effort redaction for a URL `urlparse` could not parse.
+
+    Two passes, in this order:
+
+    1. Userinfo (`user:pass@host`), replaced with a constant `<redacted>@` —
+       the malformed part of the URL is, by construction, past this point
+       (see `_FALLBACK_USERINFO_RE`), so nothing here depends on being able
+       to parse the host. Idempotent because the replacement is a constant:
+       running it again matches `<redacted>@` and replaces it with the same
+       `<redacted>@`.
+    2. `key=value` pairs anywhere in the remaining string, redacting the
+       value when the (percent-decoded, lowercased) key is in
+       `SENSITIVE_QUERY_KEYS`. Idempotent because the value pattern matches
+       the literal `<redacted>` sentinel whole — without that alternative,
+       `[^&\\s"'<>\\\\]*` would stop at the leading `<` and leave a
+       one-character-short match, and a second pass would append a second
+       sentinel (the exact bug `_URL_IN_TEXT_RE` already guards against for
+       `redact_text`).
+
+    Not attempted: reconstructing a well-formed URL. The output is a
+    best-effort redaction of the input's *text*, not a parse-and-rebuild —
+    there is nothing reliable to rebuild from.
+    """
+
+    def _redact_userinfo(m: re.Match[str]) -> str:
+        return f"{m.group(1)}{REDACTED}@"
+
+    out = _FALLBACK_USERINFO_RE.sub(_redact_userinfo, url, count=1)
+
+    def _redact_kv(m: re.Match[str]) -> str:
+        # Working from raw text here (no `parse_qsl` to decode for us), so
+        # decode before the sensitivity check — same reasoning as the
+        # parseable path's `?%74oken=x`.
+        if unquote(m.group("key")).lower() in SENSITIVE_QUERY_KEYS:
+            return f"{m.group('key')}={REDACTED}"
+        return m.group(0)
+
+    return _FALLBACK_KV_RE.sub(_redact_kv, out)
+
+
 def redact_url(url: str) -> str:
     """Replace credentials in a URL with `<redacted>`.
 
@@ -88,11 +159,20 @@ def redact_url(url: str) -> str:
 
     Decoding before the sensitivity check is intentional: it means `?%74oken=x`
     is still recognised as `token` and redacted.
+
+    A7: `urlparse` can raise (a malformed IPv6 literal is the verified case).
+    Falling back to `url` unchanged there was fail-open — the one function
+    whose job is stripping credentials would hand a credential straight
+    through if the URL happened to also be syntactically broken.
+    `_redact_url_fallback` is the middle option: a regex pass over the raw
+    text, redacting recognised `key=value` pairs and userinfo without
+    requiring the URL to parse. See its docstring for what it does and does
+    not attempt.
     """
     try:
         parsed = urlparse(url)
     except Exception:
-        return url
+        return _redact_url_fallback(url)
 
     if parsed.username or parsed.password:
         host = parsed.hostname or ""

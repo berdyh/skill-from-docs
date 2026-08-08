@@ -248,3 +248,71 @@ def test_redact_text_is_idempotent():
     once = redact_text("failed for https://h/p?token=abc")
     assert once == redact_text(once)
     assert once.count(REDACTED) == 1
+
+
+# --- A7: fallback when urlparse raises --------------------------------------
+
+
+def test_redact_url_malformed_url_no_longer_fail_open():
+    """Verified failure: a malformed IPv6 literal makes urlparse raise, and
+    the old `except Exception: return url` handed the credential straight
+    through unchanged. This is the exact repro from DEFERRED.md A7."""
+    out = redact_url("https://[::1/p?token=1")
+    assert out != "https://[::1/p?token=1"
+    assert "token=1" not in out
+    assert REDACTED in out
+
+
+def test_redact_url_fallback_redacts_userinfo():
+    """The fallback must not be a hole around the userinfo redaction that
+    the parseable path already does."""
+    out = redact_url("https://user:s3cr3t@[::1/p?x=1")
+    assert "s3cr3t" not in out
+    assert "user:" not in out
+    assert out.startswith(f"https://{REDACTED}@")
+
+
+def test_redact_url_fallback_redacts_bare_userinfo_token():
+    out = redact_url("https://t0k3n@[::1/p")
+    assert "t0k3n" not in out
+    assert out.startswith(f"https://{REDACTED}@")
+
+
+def test_redact_url_fallback_preserves_benign_malformed_url():
+    """Failing closed (a placeholder) was rejected because it destroys the
+    audit trail for the common case: a malformed URL with no credential in
+    it at all. The fallback must leave a credential-free malformed URL
+    otherwise intact, not replace it wholesale."""
+    src = "https://[::1/p?filter=a/b,c"
+    out = redact_url(src)
+    assert out == src
+
+
+def test_redact_url_fallback_handles_form_encoded_style_query():
+    out = redact_url(
+        "https://[::1/p?client_secret=REAL1&refresh_token=REAL2&page=2"
+    )
+    assert "REAL1" not in out
+    assert "REAL2" not in out
+    assert "page=2" in out
+
+
+def test_redact_url_fallback_is_idempotent():
+    """The parseable path already had this bug once (`token=<redacted>` grew
+    a second sentinel because the regex stopped at `<`). The fallback path
+    must not reintroduce it."""
+    for src in (
+        "https://[::1/p?token=1",
+        "https://user:pass@[::1/p?api_key=abc&page=2",
+        "https://t0k3n@[::1/p?x=1",
+    ):
+        once = redact_url(src)
+        twice = redact_url(once)
+        assert once == twice, (src, once, twice)
+
+
+def test_redact_url_fallback_encoded_key_still_recognised():
+    """Mirrors the parseable path's `?%74oken=x` behaviour."""
+    out = redact_url("https://[::1/p?%74oken=secret")
+    assert "secret" not in out
+    assert REDACTED in out
