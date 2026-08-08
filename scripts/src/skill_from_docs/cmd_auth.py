@@ -17,6 +17,7 @@ from ._http import (
     build_client,
     request_with_retry,
     require_allowlist,
+    require_positive_timeout,
 )
 from ._io import write_json
 from ._manifest import file_entry, now_iso, record_run
@@ -507,6 +508,9 @@ _RATE_LIMIT_HEADERS = (
 def run(args, *, transport=None) -> int:
     allowlist = require_allowlist(args.allow_host, subcommand="auth")
     if allowlist is None:
+        return 1
+
+    if not require_positive_timeout(args.timeout, subcommand="auth"):
         return 1
 
     try:

@@ -17,6 +17,7 @@ from ._http import (
     build_client,
     request_with_retry,
     require_allowlist,
+    require_positive_timeout,
 )
 from ._io import write_json
 from ._manifest import now_iso, record_run, sha256_file
@@ -170,6 +171,9 @@ def _load_spec_meta(workspace: str) -> tuple[str | None, str | None]:
 def run(args, *, transport=None, sleeper=time.sleep) -> int:
     allowlist = require_allowlist(args.allow_host, subcommand="probe")
     if allowlist is None:
+        return 1
+
+    if not require_positive_timeout(args.timeout, subcommand="probe"):
         return 1
 
     try:

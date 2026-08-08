@@ -666,3 +666,26 @@ def test_probe_comment_comes_from_the_shared_emitter():
         scope="auth-discovery",
         fixture="probes/auth-api-example-com-401.json",
     )
+
+
+@pytest.mark.parametrize("bad", [0, 0.0, -1.0])
+def test_non_positive_timeout_is_a_config_error_not_a_network_one(
+    tmp_path: Path, capsys, bad
+):
+    """`auth` is where a wrong exit code costs the most.
+
+    A degenerate `--timeout` came back as exit 2 against a real socket — the
+    same code the endpoint being genuinely unreachable produces — so the natural
+    response was to retry, with a real token, against a cascade that had issued
+    nothing. Reject it as user error before the token goes near a client.
+    """
+    calls: list[str] = []
+
+    def h(req):
+        calls.append(str(req.url))
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(workspace=str(tmp_path), timeout=bad)
+    assert cmd_auth.run(args, transport=_make_transport(h)) == 1
+    assert "--timeout" in capsys.readouterr().err
+    assert calls == []

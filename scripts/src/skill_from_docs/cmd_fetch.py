@@ -18,6 +18,7 @@ from ._http import (
     build_client,
     request_with_retry,
     require_allowlist,
+    require_positive_timeout,
 )
 from . import _cli
 from ._io import write_text
@@ -684,16 +685,9 @@ def run(args, *, log=None, transport=None) -> int:
         )
         return 1
 
-    # A10: a non-positive --timeout is a config mistake, and it used to present
-    # as a network one. httpx rejects the value ("Timeout value out of range")
-    # or connects instantly and fails, `_discover` swallowed that per candidate,
-    # and `fetch` reported "could not discover an OpenAPI spec" having issued
-    # nothing. Reject it here where the cause is still visible.
-    if args.timeout <= 0:
-        print(
-            f"ERROR: --timeout must be positive (got {args.timeout}).",
-            file=sys.stderr,
-        )
+    # A10. See `_http.require_positive_timeout` for why this is here rather than
+    # an argparse `type=`.
+    if not require_positive_timeout(args.timeout, subcommand="fetch"):
         return 1
 
     workspace = args.workspace or default_workspace(args.source)

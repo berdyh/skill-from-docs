@@ -414,3 +414,32 @@ def test_nan_body_falls_through_to_text(tmp_path: Path):
     raw = next((tmp_path / "probes").iterdir()).read_text()
     json.loads(raw)  # fixture must be strictly valid JSON
     assert json.loads(raw)["request"]["body"] == '{"lat": NaN}'
+
+
+@pytest.mark.parametrize("bad", [0, 0.0, -1.0])
+def test_non_positive_timeout_is_a_config_error_not_a_network_one(
+    tmp_path: Path, capsys, bad
+):
+    """The same class as fetch's A10, one step less severe.
+
+    Nothing rejected the degenerate value, so what happened next was the
+    transport's business: against a real socket `request_with_retry` burns its
+    whole 1s/2s/4s backoff on a request that could never be issued and then
+    reports exit 2 — the code that means "retry" — never naming `--timeout`.
+    Under the mock transport here it was worse still and simply passed, which is
+    exactly what this test observes without the guard (rc 0, request issued).
+
+    Reject it as user error, before a client exists and before the workspace is
+    touched.
+    """
+    calls: list[str] = []
+
+    def h(req):
+        calls.append(str(req.url))
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(workspace=str(tmp_path), timeout=bad)
+    assert cmd_probe.run(args, transport=_mock(h)) == 1
+    assert "--timeout" in capsys.readouterr().err
+    assert calls == []
+    assert not (tmp_path / "probes").exists()
