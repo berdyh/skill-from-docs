@@ -189,9 +189,61 @@ def test_rerunning_consolidate_still_validates(tmp_path: Path, fixtures_dir: Pat
     It used to make `validate` fail: every run appends a fresh digest for
     docs.md, and hash verification walked every historical entry, so the first
     run's superseded hash mismatched.
+
+    The spec is edited between the two runs on purpose. consolidate is
+    byte-deterministic, so two runs over an unchanged spec record the *same*
+    digest twice and the old code passes too — a test that skips this step
+    passes with the fix reverted and pins nothing.
     """
     ws = _seed_workspace(tmp_path, fixtures_dir)
-    assert cmd_consolidate.run(_consolidate_args(str(ws))) == 0
+
+    spec_path = ws / "raw" / "spec.json"
+    spec = json.loads(spec_path.read_text())
+    spec["info"]["version"] = "2.0.0"
+    spec_path.write_text(json.dumps(spec, indent=2))
+
     assert cmd_consolidate.run(_consolidate_args(str(ws))) == 0
     assert cmd_validate.run(_validate_args(str(ws))) == 0
     assert "hash mismatch" not in capsys.readouterr().out
+
+
+def test_local_file_harvest_still_verdicts_pass(tmp_path: Path, fixtures_dir: Path, capsys):
+    """A local-file harvest has no spec_url, and that is not a problem.
+
+    `archetype4_warn_spec_url` fires for every `fetch ./spec.json` workspace, so
+    letting the advisory `warnings` list move the non-strict verdict turned the
+    ordinary offline flow into `warn` on a clean workspace. The README's own
+    smoke example prints `verdict: pass`; consumers assert on it.
+    """
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    rc = cmd_validate.run(_validate_args(str(ws), json_out=True))
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["verdict"] == "pass"
+    # The advisory findings are still reported, just not verdict-moving.
+    assert any(w["id"] == "archetype4_warn_spec_url" for w in payload["warnings"])
+
+
+def test_strict_still_blocks_on_advisory_warnings(tmp_path: Path, fixtures_dir: Path, capsys):
+    """--strict is the channel that makes the `warnings` list blocking."""
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    rc = cmd_validate.run(_validate_args(str(ws), strict=True, json_out=True))
+    assert rc == 1
+    assert json.loads(capsys.readouterr().out)["verdict"] == "fail"
+
+
+def test_validate_never_creates_the_workspace_it_reports_on(tmp_path: Path, capsys):
+    """`validate` reports on a workspace; it must not build one.
+
+    `record_run` writes through `write_manifest`, which makes the workspace
+    directory. Unguarded, validate healed the thing it was checking: a first run
+    failed `manifest_exists` and created a manifest, so a bare retry of a red CI
+    step went green with nothing fixed.
+    """
+    missing = tmp_path / "typo"
+    args = _validate_args(str(missing), network=True, allow_host=["example.com"])
+
+    assert cmd_validate.run(args) == 1
+    assert not missing.exists()
+    assert cmd_validate.run(args) == 1, "a bare retry must not go green"
+    assert "manifest.json missing" in capsys.readouterr().out

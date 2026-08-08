@@ -37,7 +37,9 @@ Requires Python 3.10+.
 An **endpoint** is one operation: a path item keyed by one of the eight HTTP
 methods OpenAPI defines, `trace` included. `fetch --count-endpoints`,
 `raw/source-map.json`, `docs.md` and `handoff.json`'s `endpoint_count` all count
-the same set — one workspace, one number.
+the same set — one workspace, one number. A `handoff.json` produced before this
+was unified can disagree with a freshly generated one (`consolidate` used to omit
+`trace`); re-run `consolidate` on any workspace whose count you rely on.
 
 `auth` writes its cascade into the fixture manifest at
 `probes/auth-<host>-<status>.json`: `winner_pattern` (the pattern that returned
@@ -128,11 +130,21 @@ state. Document only — no lock implementation in v1.
 Stable v1. CI consumers may assert on `verdict` and `summary`.
 
 **Verdicts.** `fail` means a check with `severity: "error"` did not pass — the
-workspace is not ready to hand off, exit 1. `warn` means only advisory findings
-turned up (an unreferenced capture, a missing optional archetype-4 signal); exit
-is still 0 so a pipeline keeps going. `pass` means neither. `--strict` promotes
-every advisory finding to a blocking one, so under `--strict` the same workspace
-reports `fail` and exits 1 — that is how you make warnings gate a pipeline.
+workspace is not ready to hand off, exit 1. `warn` means the only failing checks
+were advisory ones, today just the unreferenced-capture check; exit is still 0 so
+a pipeline keeps going. `pass` means neither.
+
+The `warnings` array is a third, softer channel — "recommended optional field
+absent". It is reported but never moves the non-strict verdict, because
+`spec_url` is legitimately absent for every local-file harvest and a verdict that
+says `warn` for the ordinary case is a verdict nobody reads.
+
+`--strict` promotes everything — advisory checks and the `warnings` array — to
+blocking, so the same workspace reports `fail` and exits 1.
+
+**If you gate CI on `validate`, use `--strict`.** A default run exits 0 on an
+unreferenced capture, and an unreferenced probe fixture holds a captured live-API
+response that nothing in `docs.md` accounts for.
 
 `scripts/test/test_cmd_validate.py` reads this file and asserts the three values
 above are exactly the ones the code can emit, so the list cannot drift again.

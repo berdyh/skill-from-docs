@@ -318,13 +318,18 @@ def run(args) -> int:
         except RuntimeError:
             pass
 
-    # Compute verdict. Two channels feed it: failing `checks`, which carry a
-    # severity, and `warnings`, which are advisory by construction.
+    # Compute verdict from the `checks` list, keyed on severity. `warnings` is
+    # a display and --strict channel only: it is populated by "recommended
+    # optional field absent", and `spec_url` is legitimately absent for every
+    # local-file harvest. Letting it move the non-strict verdict made the
+    # ordinary `fetch ./spec.json` -> consolidate -> validate flow report `warn`
+    # on a clean workspace, and a verdict that is `warn` for the normal case is
+    # a verdict nobody reads.
     errors = [c for c in checks if not c["passed"] and c["severity"] == "error"]
-    soft = [c for c in checks if not c["passed"] and c["severity"] != "error"] + warnings
+    soft = [c for c in checks if not c["passed"] and c["severity"] != "error"]
     if args.strict:
-        # --strict promotes every advisory finding to a blocking one.
-        verdict = "fail" if (errors or soft) else "pass"
+        # --strict promotes every advisory finding, both channels, to blocking.
+        verdict = "fail" if (errors or soft or warnings) else "pass"
     elif errors:
         verdict = "fail"
     elif soft:
@@ -334,14 +339,21 @@ def run(args) -> int:
 
     summary = (
         f"Pass: {sum(1 for c in checks if c['passed'])}/{len(checks)}, "
-        f"warn: {len(soft)}, fail: {len(errors)}"
+        f"warn: {len(soft) + len(warnings)}, fail: {len(errors)}"
     )
 
     # Only --network touches the network, and it is the one subcommand whose
     # target host is read out of a workspace file rather than the CLI, so it is
     # the run most worth having in the audit trail. Local runs stay silent —
     # recording them would churn manifest.json on every CI invocation.
-    if args.network:
+    #
+    # Guarded on the manifest already existing, because `record_run` writes
+    # through `write_manifest`, which `os.makedirs` the workspace. Unguarded,
+    # `validate` healed the very thing it was checking: a first run failed
+    # `manifest_exists` and created a manifest, so a bare retry of a red CI step
+    # went green with nothing fixed. `validate --network /typo` also silently
+    # created `/typo`. This command reports on a workspace; it does not build one.
+    if args.network and os.path.exists(manifest_path):
         record_run(
             workspace,
             subcommand="validate",

@@ -146,7 +146,15 @@ Two distinct provenance shapes — spec-source and probe-source — sit side by 
 
 **How output integrates into `docs.md`.** It doesn't; `validate` is read-only. But every failure points at a specific line in `docs.md` or a specific file in `raw/` or `probes/`, so the fix path is mechanical.
 
-**How it shows up in `handoff.json`.** `validate` reads `handoff.json` and verifies it against the workspace. Failures it catches: every H2 + H3 section has a `<!-- source: -->` or `<!-- probe: -->` comment or carries `_Not documented upstream._`; every `<!-- TODO -->` marker has a matching `gap_list` entry; every file in `raw/` and `probes/` is referenced by some provenance comment (orphan-capture detection); every provenance comment's local file path resolves; every recorded manifest hash matches the file's current sha256; for archetype 4, `has_openapi_spec` is true, `spec_url` non-empty, `endpoint_count` ≥ 1.
+**How it shows up in `handoff.json`.** `validate` reads `handoff.json` and verifies it against the workspace, and sorts what it finds into three tiers.
+
+*Blocking* (verdict `fail`, exit 1): every H2 + H3 section has a `<!-- source: -->` or `<!-- probe: -->` comment or carries `_Not documented upstream._`; every `<!-- TODO -->` marker has a matching `gap_list` entry; every provenance comment's local file path resolves; the newest recorded manifest hash for each path matches the file's current sha256; for archetype 4, `has_openapi_spec` is true and `endpoint_count` ≥ 1.
+
+*Advisory* (verdict `warn`, exit 0): every file in `raw/` and `probes/` is referenced by some provenance comment (orphan-capture detection).
+
+*Reported but not verdict-moving*: recommended-but-optional archetype-4 signals — `spec_url`, `spec_format`, `tag_count` — plus `provenance_index` and `coverage_checklist` coverage. `spec_url` is legitimately absent for a local-file harvest, which is why these never fail a default run.
+
+`--strict` promotes both lower tiers to blocking. Use it when `validate` is a CI gate.
 
 **Security defaults.** Local-only by default — no network calls. `--network` re-fetches every source URL and verifies HTTP 200 with matching content-type; it **requires `--allow-host HOST`** (repeatable, non-empty), because the URL it fetches is read from `handoff.json`, which `validate` did not produce. `--strict` promotes warnings to errors (for CI consumers).
 
