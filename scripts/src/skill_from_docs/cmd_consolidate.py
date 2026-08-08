@@ -8,7 +8,8 @@ import os
 import re
 import sys
 from collections import defaultdict
-from typing import Any
+from typing import Any, Iterable, Iterator
+from urllib.parse import urlparse
 
 from . import __version__
 from ._manifest import file_entry, now_iso, record_run
@@ -57,11 +58,73 @@ def _load_spec(workspace: str) -> tuple[dict[str, Any] | None, dict[str, Any] | 
     return spec, source_map, spec_path
 
 
-def _load_probes(workspace: str) -> list[tuple[ProbeFixture, str]]:
-    """Return [(fixture, filename), ...] from the workspace probes/ directory."""
+def _probe_url_path(url: str) -> str:
+    """The path component of a probe's request URL, or `""` if it cannot be
+    parsed. `urlparse` raises on a malformed IPv6 literal (`http://[::1`); a
+    fixture carrying one used to take the whole run down with a traceback,
+    breaking the numeric exit-code contract. An unparseable URL now simply
+    matches no endpoint, which surfaces as the usual orphan-probe warning.
+    """
+    try:
+        return urlparse(url).path
+    except ValueError:
+        return ""
+
+
+class ProbeIndex:
+    """Probe fixtures, with each request URL's path parsed once at load.
+
+    Matching is by path suffix, and five independent passes over the spec each
+    ask the same questions. The old `_match_probe` called `urlparse` per
+    (probe, path) pair: 105,842 calls and 0.80 s of a 1.28 s profiled run at
+    Stripe scale, for a value with 30 distinct inputs. Parsing at load kills the
+    per-call cost; memoising the scan per path kills the pass multiplier.
+    """
+
+    __slots__ = ("_entries", "_paths", "_cache")
+
+    def __init__(self, entries: Iterable[tuple[ProbeFixture, str]] = ()) -> None:
+        self._entries: list[tuple[ProbeFixture, str]] = list(entries)
+        self._paths: list[str] = [_probe_url_path(f.request.url) for f, _n in self._entries]
+        self._cache: dict[str, list[int]] = {}
+
+    def __iter__(self) -> Iterator[tuple[ProbeFixture, str]]:
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __bool__(self) -> bool:
+        return bool(self._entries)
+
+    def _indices_for(self, path: str) -> list[int]:
+        hit = self._cache.get(path)
+        if hit is None:
+            # `pp == path` is the degenerate case of the suffix test.
+            hit = [i for i, pp in enumerate(self._paths) if pp.endswith(path)]
+            self._cache[path] = hit
+        return hit
+
+    def for_path(self, path: str) -> list[tuple[ProbeFixture, str]]:
+        """Fixtures whose URL path ends with `path`, in load order."""
+        return [self._entries[i] for i in self._indices_for(path)]
+
+    def has_match(self, path: str) -> bool:
+        return bool(self._indices_for(path))
+
+    def unmatched(self, paths: Iterable[str]) -> list[tuple[ProbeFixture, str]]:
+        """Fixtures matching none of `paths`, in load order."""
+        seen: set[int] = set()
+        for path in paths:
+            seen.update(self._indices_for(path))
+        return [e for i, e in enumerate(self._entries) if i not in seen]
+
+
+def _load_probes(workspace: str) -> ProbeIndex:
+    """Index the workspace's probes/ directory."""
     probes_dir = os.path.join(workspace, "probes")
     if not os.path.isdir(probes_dir):
-        return []
+        return ProbeIndex()
     out: list[tuple[ProbeFixture, str]] = []
     for name in sorted(os.listdir(probes_dir)):
         if not name.endswith(".json"):
@@ -71,7 +134,7 @@ def _load_probes(workspace: str) -> list[tuple[ProbeFixture, str]]:
             out.append((ProbeFixture.from_dict(data), name))
         except Exception:
             continue
-    return out
+    return ProbeIndex(out)
 
 
 def _load_narratives(workspace: str, narrative_dir: str | None) -> dict[str, str]:
@@ -179,15 +242,6 @@ def _endpoint_block(
     return lines
 
 
-def _match_probe(probe: ProbeFixture, path: str) -> bool:
-    """Match by path suffix."""
-    from urllib.parse import urlparse as _u
-    pp = _u(probe.request.url).path
-    return pp == path or pp.endswith(path)
-
-
-
-
 def _emit_narrative_section(
     lines: list[str],
     narratives: dict[str, str],
@@ -219,7 +273,7 @@ def _build_docs_md(
     spec: dict[str, Any] | None,
     source_map: dict[str, Any] | None,
     spec_path: str | None,
-    probes: list[tuple[ProbeFixture, str]],
+    probes: ProbeIndex,
     narratives: dict[str, str],
     *,
     tags_filter: list[str],
@@ -305,17 +359,14 @@ def _build_docs_md(
         by_tag = _group_ops_by_tag(spec)
         by_tag = _filter_tags(by_tag, tags_filter)
 
+        spec_paths = [path for ops in by_tag.values() for path, _m, _op in ops]
+
         # Detect probes outside the filter
         if tags_filter:
-            for probe, _filename in probes:
-                hits = 0
-                for tag, ops in by_tag.items():
-                    if any(_match_probe(probe, path) for path, _m, _op in ops):
-                        hits += 1
-                if hits == 0:
-                    warnings.append(
-                        f"probe {probe.request.method} {probe.request.url} references endpoint outside --tag filter"
-                    )
+            for probe, _filename in probes.unmatched(spec_paths):
+                warnings.append(
+                    f"probe {probe.request.method} {probe.request.url} references endpoint outside --tag filter"
+                )
 
         if not by_tag:
             lines.append("_No endpoints match the filter._")
@@ -344,16 +395,7 @@ def _build_docs_md(
             )
             lines.append("")
             ops = sorted(by_tag[tag], key=lambda t: (t[0], t[1]))
-            tagged_probes = (
-                [(p, fn) for p, fn in probes if any(_match_probe(p, op_path) for op_path, _, _ in ops)]
-                if merge_probes
-                else []
-            )
             for path, method, op in ops:
-                if merge_probes:
-                    relevant = [(p, fn) for p, fn in probes if _match_probe(p, path)]
-                else:
-                    relevant = []
                 lines.extend(
                     _endpoint_block(
                         path,
@@ -362,24 +404,18 @@ def _build_docs_md(
                         spec_url=spec_url,
                         retrieved=retrieved,
                         raw_file=spec_raw_rel,
-                        probes_for_endpoint=relevant,
+                        probes_for_endpoint=probes.for_path(path) if merge_probes else [],
                     )
                 )
-            if not tagged_probes and merge_probes:
+            if merge_probes and not any(probes.has_match(p) for p, _m, _op in ops):
                 lines.append(f"<!-- TODO: no probe captured for tag {tag} -->")
                 lines.append("")
         # Detect probes for endpoints not in spec at all
-        if merge_probes:
-            for probe, _filename in probes:
-                any_match = False
-                for tag, ops in by_tag.items():
-                    if any(_match_probe(probe, path) for path, _m, _op in ops):
-                        any_match = True
-                        break
-                if not any_match and not tags_filter:
-                    warnings.append(
-                        f"probe {probe.request.method} {probe.request.url} does not match any spec endpoint"
-                    )
+        if merge_probes and not tags_filter:
+            for probe, _filename in probes.unmatched(spec_paths):
+                warnings.append(
+                    f"probe {probe.request.method} {probe.request.url} does not match any spec endpoint"
+                )
     else:
         lines.append("_No spec available._")
         lines.append("")
@@ -425,7 +461,7 @@ def _build_docs_md(
 
 
 def _collect_auth_method_signals(
-    probes: list[tuple[ProbeFixture, str]],
+    probes: ProbeIndex,
 ) -> tuple[str | None, list[str]]:
     """Find the auth-discovery probe (if any) and lift its auth_method +
     security_warnings out of the fixture manifest so they can flow into
@@ -449,7 +485,7 @@ def _build_handoff(
     workspace: str,
     spec: dict[str, Any] | None,
     source_map: dict[str, Any] | None,
-    probes: list[tuple[ProbeFixture, str]],
+    probes: ProbeIndex,
     retrieved: str,
     docs_md_text: str,
     *,
@@ -496,17 +532,16 @@ def _build_handoff(
                         "raw_file": "raw/spec.json",
                     }
                 )
-                for probe, filename in probes:
-                    if _match_probe(probe, path):
-                        provenance_index[section_key]["probes"].append(
-                            {
-                                "method": probe.request.method,
-                                "url": probe.request.url,
-                                "status": probe.response.status,
-                                "scope": probe.scope,
-                                "fixture": f"probes/{filename}",
-                            }
-                        )
+                for probe, filename in probes.for_path(path):
+                    provenance_index[section_key]["probes"].append(
+                        {
+                            "method": probe.request.method,
+                            "url": probe.request.url,
+                            "status": probe.response.status,
+                            "scope": probe.scope,
+                            "fixture": f"probes/{filename}",
+                        }
+                    )
 
     # H9: populate coverage_checklist from sections actually present in docs.md.
     coverage_checklist = _derive_coverage_checklist(docs_md_text, spec_url)
@@ -720,7 +755,7 @@ def run(args) -> int:
                 file=sys.stderr,
             )
 
-    probes = _load_probes(workspace) if args.merge_probes else []
+    probes = _load_probes(workspace) if args.merge_probes else ProbeIndex()
     narratives = _load_narratives(workspace, args.narrative_dir)
     if args.sanitize:
         sanitized_narratives: dict[str, str] = {}
