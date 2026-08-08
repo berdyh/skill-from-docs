@@ -1,4 +1,4 @@
-"""D2's "do instead": an end-to-end sentinel-credential leak guard.
+"""D2's "do instead": an end-to-end sentinel-credential boundary guard.
 
 DEFERRED.md D2 rejected a redaction choke point at the write boundary
 (exemptions for `raw/spec.json` would have reintroduced the per-call-site
@@ -14,16 +14,32 @@ This is that test. It is entirely offline (httpx.MockTransport, no network),
 puts a distinctive sentinel string into every input position a credential can
 occupy (URL query string, URL userinfo, request headers, JSON request body,
 form-encoded request body, and a nested body key), and then walks every file
-the run produced asserting the sentinel appears nowhere.
+the run produced. The sentinel value is unique per position so a failure names
+exactly which one leaked.
 
-The sentinel value is unique per position so a failure names exactly which
-one leaked.
+**It asserts a boundary, not an absence.** A8 gave the workspace exactly one
+place a live credential is allowed to land — `raw/source-map.json`'s
+`fetch_url`, which is how the audit trail records a URL that can still be
+re-fetched after `redact_url` has eaten a benign `?key=petstore`. Every other
+file, named explicitly below, must still be clean. Two properties do the work
+the old blanket "appears nowhere" assertion used to:
+
+- `EXPECTED_HOLDER` is the only file allowed to contain a sentinel, and only
+  at the one key `fetch_url`. A sentinel anywhere else in that same file — or
+  in any other file — fails.
+- `MUST_NOT_CONTAIN` names `docs.md`, `handoff.json` and every probe fixture
+  outright. Those are the artifacts that leave the machine; a hole there is
+  the leak this whole file exists to catch, so they are asserted by name and
+  not merely covered by the walk.
+
+Plus the file mode: the credential-bearing file is `0o600`.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import stat
 from pathlib import Path
 
 import httpx
@@ -31,6 +47,23 @@ import httpx
 from conftest import make_mock_transport
 
 from skill_from_docs import cmd_consolidate, cmd_fetch, cmd_probe
+
+
+# The one file A8 allows to hold an unredacted URL, and the one key in it.
+EXPECTED_HOLDER = Path("raw/source-map.json")
+EXPECTED_HOLDER_KEY = "fetch_url"
+
+# Named explicitly rather than left to the walk: these are the artifacts handed
+# to skill-creator, so "the walk happened to cover them" is not good enough.
+MUST_NOT_CONTAIN = (
+    Path("docs.md"),
+    Path("handoff.json"),
+    Path("manifest.json"),
+    Path("raw/spec.json"),
+    Path("probes/a.json"),
+    Path("probes/b.json"),
+    Path("probes/c.json"),
+)
 
 
 SENTINEL_BASE = "SNTNL7f3c9a2b1d4e"
@@ -191,35 +224,57 @@ def test_sentinel_credential_never_reaches_a_workspace_file(tmp_path: Path, fixt
     assert (tmp_path / "docs.md").exists()
     assert (tmp_path / "handoff.json").exists()
 
-    # --- walk every file the run produced; the sentinel must appear nowhere.
+    # --- walk every file the run produced ------------------------------------
     #
-    # No exemptions were needed: none of the sentinel positions above land
-    # inside raw/spec.json (the one artifact that is deliberately exempt from
-    # body redaction) because the sentinels ride in the *fetch/probe request*
+    # raw/spec.json needs no exemption: none of the sentinel positions above
+    # land inside it, because the sentinels ride in the *fetch/probe request*
     # (URL, headers, request body) rather than in spec content itself — the
-    # spec bytes written to raw/spec.json come straight from the mocked
-    # response fixture, which never contains a sentinel.
+    # spec bytes written there come straight from the mocked response fixture,
+    # which never contains a sentinel. It is in MUST_NOT_CONTAIN for that
+    # reason.
     checked_files: list[Path] = []
-    leaks: list[tuple[str, str]] = []
+    found: list[tuple[Path, str]] = []
     for path in sorted(tmp_path.rglob("*")):
         if not path.is_file():
             continue
-        checked_files.append(path)
+        rel = path.relative_to(tmp_path)
+        checked_files.append(rel)
         text = path.read_text(encoding="utf-8", errors="replace")
         for sentinel in ALL_SENTINELS:
             if sentinel in text:
-                leaks.append((str(path.relative_to(tmp_path)), sentinel))
+                found.append((rel, sentinel))
 
     # Sanity: the run actually produced the files this test means to check.
-    relative = {p.relative_to(tmp_path) for p in checked_files}
-    for expected in (
-        Path("raw/spec.json"),
-        Path("raw/source-map.json"),
-        Path("docs.md"),
-        Path("handoff.json"),
-        Path("manifest.json"),
-    ):
+    relative = set(checked_files)
+    for expected in (EXPECTED_HOLDER, *MUST_NOT_CONTAIN):
         assert expected in relative, f"expected artifact missing: {expected}"
     assert len(list((tmp_path / "probes").glob("*.json"))) == 3
 
-    assert not leaks, f"sentinel credential leaked into workspace files: {leaks}"
+    # 1. The named artifacts — the ones handed to skill-creator — are clean.
+    #    Asserted by name so that renaming or dropping one of them fails here
+    #    rather than silently shrinking the guarantee.
+    named_leaks = [(str(p), s) for p, s in found if p in MUST_NOT_CONTAIN]
+    assert not named_leaks, f"sentinel leaked into a handoff artifact: {named_leaks}"
+
+    # 2. Nothing outside the one permitted holder carries a sentinel either,
+    #    including files this test does not know the name of.
+    stray_leaks = [(str(p), s) for p, s in found if p != EXPECTED_HOLDER]
+    assert not stray_leaks, f"sentinel leaked into workspace files: {stray_leaks}"
+
+    # 3. The permitted holder carries it at exactly one key — `fetch_url`, the
+    #    URL A8 records so the audit trail stays re-fetchable — and nowhere
+    #    else in the file. `spec_url`, which is the value everything downstream
+    #    copies, is the redacted spelling.
+    source_map = json.loads((tmp_path / EXPECTED_HOLDER).read_text())
+    assert source_map[EXPECTED_HOLDER_KEY] == fetch_source
+    assert S_FETCH_QUERY in source_map[EXPECTED_HOLDER_KEY]
+    assert S_FETCH_QUERY not in source_map["spec_url"]
+
+    rest = {k: v for k, v in source_map.items() if k != EXPECTED_HOLDER_KEY}
+    rest_leaks = [s for s in ALL_SENTINELS if s in json.dumps(rest)]
+    assert not rest_leaks, f"sentinel outside {EXPECTED_HOLDER_KEY}: {rest_leaks}"
+
+    # 4. And it is not world-readable. This file did not hold a credential
+    #    before A8; the mode is what makes putting one there defensible.
+    mode = stat.S_IMODE((tmp_path / EXPECTED_HOLDER).stat().st_mode)
+    assert mode == 0o600, f"{EXPECTED_HOLDER} is {oct(mode)}, want 0o600"

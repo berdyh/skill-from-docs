@@ -11,7 +11,8 @@ from typing import Any
 from ._manifest import now_iso, record_run, superseded_mismatches, verify_hashes
 from ._http import require_allowlist
 from ._provenance import find_all_provenance
-from ._schema import lint_handoff
+from ._redaction import redact_text
+from ._schema import lint_handoff, read_fetch_url
 
 
 # The `verdict` values `validate --json` can emit. scripts/README.md documents
@@ -167,7 +168,74 @@ def _check_coverage_checklist_sources(
             )
 
 
-def run(args) -> int:
+def _check_network(
+    workspace: str,
+    handoff: dict[str, Any],
+    checks: list[dict[str, Any]],
+    network_allowlist,
+    transport,
+) -> None:
+    """Re-fetch the spec URL the workspace records.
+
+    Two URLs, and which one goes where is the whole of A8:
+
+    - The **display** URL, out of `handoff.json`. It is `redact_url`'d, so it is
+      safe. Everything that leaves this function carries it and only it: the
+      check `id`, every message, and the manifest entry `run` writes afterwards.
+    - The **fetchable** URL, out of `raw/source-map.json` via `read_fetch_url`.
+      It can carry a live credential. It is passed to `client.get` and nowhere
+      else — in particular not into an error string, which is how failure mode 3
+      ("credentials travel further than the call that produced them") has bitten
+      this repo before. httpx quotes the request URL in its own exception text,
+      so `str(e)` goes through `redact_text` rather than being trusted.
+
+    `read_fetch_url` returns a reason instead of a URL when there is nothing
+    re-fetchable — a workspace harvested before A8 whose `spec_url` is redacted.
+    That is reported as a **passing** check carrying the explanation: the point
+    of A8 is that `validate` stops reporting failures that are not real, and a
+    skip that flipped the verdict would be the same lie in a new place.
+    """
+    from ._http import AllowlistViolation, build_client
+
+    # spec_url is read out of a local handoff.json, which is data this command
+    # did not produce. Gate it like every other outbound call rather than
+    # GETting whatever the file happens to name — the allowlist is bound to the
+    # client, so `client.get` is the gate.
+    display_url = (handoff.get("content_shape_signals") or {}).get("spec_url")
+    if not display_url:
+        return
+
+    fetch_url, skip_reason = read_fetch_url(workspace, display_url)
+    if fetch_url is None:
+        _add_check(checks, f"network_skipped_{_id_suffix(display_url)}", True, skip_reason)
+        return
+
+    try:
+        with build_client(
+            allowlist=network_allowlist, timeout=10.0, transport=transport
+        ) as client:
+            r = client.get(fetch_url)
+            ok = r.status_code == 200
+            _add_check(
+                checks,
+                f"network_{_id_suffix(display_url)}",
+                ok,
+                None if ok else f"URL {display_url} returned {r.status_code}",
+            )
+    except AllowlistViolation as e:
+        _add_check(checks, "network_allowlist", False, redact_text(str(e)))
+    except RuntimeError:  # pragma: no cover - httpx missing
+        return
+    except Exception as e:
+        _add_check(
+            checks,
+            "network_error",
+            False,
+            f"can't fetch {display_url}: {redact_text(str(e))}",
+        )
+
+
+def run(args, *, transport=None) -> int:
     # The spec_url is read out of a local handoff.json, which this command did
     # not produce, so --network is gated like every other outbound call.
     network_allowlist = None
@@ -331,32 +399,7 @@ def run(args) -> int:
 
     # Optional network check
     if args.network and handoff_ok:
-        try:
-            from ._http import AllowlistViolation, build_client
-
-            # spec_url is read out of a local handoff.json, which is data this
-            # command did not produce. Gate it like every other outbound call
-            # rather than GETting whatever the file happens to name — the
-            # allowlist is bound to the client, so `client.get` is the gate.
-            spec_url = (handoff.get("content_shape_signals") or {}).get("spec_url")
-            urls_to_check = [spec_url] if spec_url else []
-            with build_client(allowlist=network_allowlist, timeout=10.0) as client:
-                for url in urls_to_check:
-                    try:
-                        r = client.get(url)
-                        ok = r.status_code == 200
-                        _add_check(
-                            checks,
-                            f"network_{_id_suffix(url)}",
-                            ok,
-                            None if ok else f"URL {url} returned {r.status_code}",
-                        )
-                    except AllowlistViolation as e:
-                        _add_check(checks, "network_allowlist", False, str(e))
-                    except Exception as e:
-                        _add_check(checks, "network_error", False, f"can't fetch {url}: {e}")
-        except RuntimeError:
-            pass
+        _check_network(workspace, handoff, checks, network_allowlist, transport)
 
     # Compute verdict from the `checks` list, keyed on severity. `warnings` is
     # a display and --strict channel only: it is populated by "recommended

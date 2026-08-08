@@ -11,9 +11,9 @@ maintainability specialists, adversarial pass) and a four-angle `/simplify` swee
 Effort tags are the reviewers' estimates: **S** ≈ under an hour, **M** ≈ half a day,
 **L** ≈ more.
 
-**Status:** §A1–A6, §B1 (the duplicated spec walk) and §B8 (dead code) are **done** — see
-§F. §A7–A12 (raised reviewing the A1–A6 fixes), §B2–B7, §C and §E are open. §D is
-decided, not pending.
+**Status:** §A1–A6, §A8, §B1 (the duplicated spec walk) and §B8 (dead code) are **done** —
+see §F. §A7 and §A9–A12 (raised reviewing the A1–A6 fixes), §B2–B7, §C and §E are open.
+§D is decided, not pending.
 
 ---
 
@@ -82,17 +82,13 @@ placeholder and losing the URL entirely, which damages the audit trail for the c
 case (a genuinely malformed URL with no credential in it) to protect the rare one. A
 regex `key=value` pass over the raw string is the middle option.
 
-### A8. `key` in `SENSITIVE_QUERY_KEYS` destroys benign provenance URLs — S, contested
+### A8. `key` in `SENSITIVE_QUERY_KEYS` destroys benign provenance URLs — DONE
 
-`redact_url("https://api.example.com/spec.json?key=petstore")` yields `key=<redacted>`.
-That string is what lands in `raw/source-map.json`, every `<!-- source: -->` comment, and
-`handoff.json` — so the audit trail records a URL that cannot be re-fetched, and
-`validate --network` will try to GET it and report a failure.
+Fixed by the schema change this entry proposed: `raw/source-map.json` now records the
+display URL (`spec_url`, redacted) and the fetchable URL (`fetch_url`, verbatim)
+separately. See §F for what changed and where the fetchable URL lives.
 
-Left as-is deliberately: `?key=<apikey>` is at least as common as `?key=<resource-name>`,
-and the failure mode of the other choice is a leaked credential in a file that leaves the
-machine. Recorded because the cost is real and someone will hit it. The principled fix is
-to record the fetchable URL separately from the display URL, which is a schema change.
+`key` stays in `SENSITIVE_QUERY_KEYS` — dropping it was always the wrong trade.
 
 ### A9. `verify_hashes` can be satisfied by appending a run — S
 
@@ -221,11 +217,10 @@ becomes a membership test and `_classify_winner` a dict lookup.
 
 ### B7. Smaller duplications — S each
 
-- **`_spec_pointer` vs `_jp_escape`** (`cmd_consolidate.py:128` / `cmd_fetch.py:252`) —
-  two JSON-Pointer builders that must agree for provenance to be traceable across
-  `source-map.json` and `docs.md`. They currently do. The consolidate copy carries a
-  provable no-op branch (`f"~1{escaped[2:]}"` reconstructs `escaped`) — vestigial scar
-  tissue from a double-escape bug the other one documents fixing.
+- **`_spec_pointer` vs `_jp_escape`** — DONE. Both JSON-Pointer builders are gone;
+  `_spec.json_pointer` is the only one, and `cmd_fetch`, `cmd_consolidate` and `_handoff`
+  all call it. (The consolidate copy went with **B1**, the no-op branch inside it with
+  **B8**, and the `cmd_fetch` copy with B1's fourth call site.)
 - **Two probe-orphan scans** (`cmd_consolidate.py:342` and `:405`) differing only in
   guard and message; the first uses a counter as a boolean and never breaks.
 - **Nine section emitters** (`cmd_consolidate.py:282-455`) with ~100 lines of identical
@@ -368,9 +363,10 @@ the neighbouring "CI exercises this sequence on every PR" claim that nothing bac
 `test_documented_offline_smoke.py` and the `cli-contract` CI job now run the sequence as
 written, so it fails loudly if it rots again.)*
 
-**Wrong behaviour descriptions.** `--network` is documented as re-fetching *every*
-`<!-- source: -->` URL and verifying content-type; it fetches exactly one URL and checks
-only `status_code == 200`. The cascade order is documented as direct → common paths →
+**Wrong behaviour descriptions.** *(Resolved: `--network` was documented as re-fetching
+every `<!-- source: -->` URL and verifying content-type; it fetches exactly one URL and
+checks only `status_code == 200`. `probing-tools.md` now says so, corrected alongside
+A8, which rewrote that code path.)* The cascade order is documented as direct → common paths →
 renderer regex in three places; the code does direct → renderer → common paths. Two docs
 promise a "community mirror fallback" step that does not exist. A quoted stderr string
 (`"prefer-header-automatically"`) appears nowhere in the source, and the quoted staleness
@@ -440,6 +436,52 @@ Two things were fixed alongside A3, because it made them reachable rather than t
 
 Kept so a future scan does not re-report these as new, and so the "already fixed before
 the report landed" cases are not re-investigated.
+
+### A8 — the display/fetchable URL split
+
+`redact_url("...?key=petstore")` yields `?key=<redacted>`, and that string was the only
+URL the workspace recorded. Two real costs: the audit trail named a URL nobody could
+re-fetch, and `validate --network` GET it and reported a 404 that was not real. Dropping
+`key` from `SENSITIVE_QUERY_KEYS` would have traded a broken audit trail for a leaked
+credential, so the fix is the schema change the entry proposed.
+
+**Where the fetchable URL lives:** `raw/source-map.json`, as `fetch_url`, next to the
+redacted `spec_url`. `manifest.json` was the other candidate — `validate --network` is the
+consumer, and it already reads the manifest — and was rejected on three counts. It is
+read-modify-write, so a credential there is rewritten on every subsequent run rather than
+written once. `_manifest._redact_recursive` redacts every URL-shaped string it stores, so
+`fetch_url` would need an exemption, which is exactly the per-call-site judgement §D2
+rejected a write-boundary choke point for reintroducing. And `source-map.json` is already
+the file that answers "where did this spec come from", written exactly once, by `fetch`.
+
+Three properties make the split hold, and each has a test rather than a convention:
+
+- **`_schema.read_source_map` strips `fetch_url`.** `consolidate` and `probe` — the
+  subcommands that write `docs.md`, `handoff.json` and the probe fixtures — read through
+  it, so they are never handed the value. `read_fetch_url` is the only reader and
+  `validate --network` its only caller. `test_sentinel_credential_e2e.py` now asserts the
+  boundary rather than an absence: the sentinel is in `source-map.json`'s `fetch_url` and
+  in no other key of that file and no other file, with `docs.md`, `handoff.json` and every
+  probe fixture named explicitly.
+- **`validate --network` fetches one URL and prints another.** The GET uses `fetch_url`;
+  every check id, message and `--json` field carries the redacted `spec_url`. `str(e)`
+  goes through `redact_text` because httpx quotes the request URL in its own exception
+  text — failure mode 3, and `URL {url} returned 404` is the shape it takes.
+- **The file is written `0o600`,** via `_schema.write_source_map`, with the mode set on
+  the descriptor before any content is written so overwriting a world-readable file from
+  an older run does not leave a window.
+
+Backward compatibility: a workspace harvested before this has no `fetch_url`. If its
+`spec_url` carries no redaction sentinel it is fetchable as-is and nothing changes. If it
+is redacted, the check is **skipped with an explanation**, emitted as a *passing* check so
+it moves no verdict in either `--strict` mode — reporting a failure there is the bug being
+fixed, and a skip that flipped the verdict would be the same lie relocated.
+
+Failure mode 5 (two layers disagreeing about which artifact they compare) is guarded
+structurally: everything that *compares* URLs still compares `spec_url`, and
+`read_fetch_url` — the one place the two forms meet — normalizes both through `redact_url`
+before treating them as the same URL. A workspace whose two recorded URLs disagree is
+skipped, not fetched.
 
 ### `ISSUES-2026-05-16.md` scan report — all 9 closed
 

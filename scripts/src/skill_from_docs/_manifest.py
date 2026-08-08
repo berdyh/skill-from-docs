@@ -19,6 +19,13 @@ def _redact_recursive(value: Any) -> Any:
     """Walk a JSON-like value and apply redact_url to any string that looks
     like an http(s) URL with sensitive query params. Used so manifest entries
     never persist raw credential-bearing URLs to disk. (B1)
+
+    This is unconditional, and `manifest.json` is therefore **not** where A8's
+    fetchable spec URL lives — that is `raw/source-map.json`'s `fetch_url`.
+    Putting it here would need an exemption from this walk, which is the
+    per-call-site judgement §D2 rejected a write-boundary choke point for
+    reintroducing; the manifest is also read-modify-written on every run, where
+    the source map is written once. Do not add one.
     """
     if isinstance(value, dict):
         return {k: _redact_recursive(v) for k, v in value.items()}

@@ -12,6 +12,8 @@ For the worked walkthrough that exercises every subcommand against a real API, s
 
 **Purpose.** Resolve a spec URL through the renderer cascade, validate it against the OpenAPI 3.0/3.1 schema with `prance[osv]`, flatten `$ref`s, and emit a normalized `spec.json` plus a `source-map.json` sidecar that preserves original JSON Pointers for downstream provenance.
 
+**`source-map.json` records the spec URL twice, and holds a credential.** `spec_url` is the display form — redacted, and the only spelling copied into `docs.md`, `handoff.json` or a probe fixture. `fetch_url` is the same URL verbatim, so the audit trail still names something re-fetchable after redaction has replaced a benign `?key=petstore` with `?key=<redacted>`; it is absent for a local-file harvest. Because `fetch_url` can carry a live credential, `fetch` writes the file `0o600` and **`source-map.json` must not leave the machine** — it is the one workspace artifact that is not safe to hand on. `validate --network` is its only reader.
+
 **When to reach for it.** Always, as the first subcommand in any archetype-4 harvest. Also for the magical-moment demo: `openapi-harvest fetch URL --count-endpoints` prints the operation count to stdout and exits 0, no workspace required.
 
 **How output integrates into `docs.md`.** `consolidate` reads `raw/spec.json` and `raw/source-map.json` to emit per-tag H3 sub-sections under `## API reference`. Provenance comment shape:
@@ -140,7 +142,7 @@ Two distinct provenance shapes — spec-source and probe-source — sit side by 
 
 ## `validate` — local-by-default completion check
 
-**Purpose.** Verify the workspace is internally consistent and ready for handoff. Local-syntax checks always run; network checks (re-fetching every `<!-- source: -->` URL) are opt-in.
+**Purpose.** Verify the workspace is internally consistent and ready for handoff. Local-syntax checks always run; the network check (one re-fetch of the spec URL) is opt-in.
 
 **When to reach for it.** Before invoking `skill-creator`. Also useful in CI: `--strict --json` emits a machine-readable result.
 
@@ -156,7 +158,9 @@ Two distinct provenance shapes — spec-source and probe-source — sit side by 
 
 `--strict` promotes both lower tiers to blocking. Use it when `validate` is a CI gate.
 
-**Security defaults.** Local-only by default — no network calls. `--network` re-fetches every source URL and verifies HTTP 200 with matching content-type; it **requires `--allow-host HOST`** (repeatable, non-empty), because the URL it fetches is read from `handoff.json`, which `validate` did not produce. `--strict` promotes warnings to errors (for CI consumers).
+**Security defaults.** Local-only by default — no network calls. `--network` re-fetches one URL — the spec URL — and checks it returns HTTP 200. It **requires `--allow-host HOST`** (repeatable, non-empty), because the URL is read from workspace files `validate` did not produce. `--strict` promotes warnings to errors (for CI consumers).
+
+Which URL it fetches is deliberate: `handoff.json`'s redacted `spec_url` supplies every id and message that `validate` prints, while the GET itself uses `raw/source-map.json`'s `fetch_url`. A redacted URL cannot be fetched, so using it would report a failure that is not real; printing the fetchable one would leak the credential the redaction exists to hide. When a workspace records no usable `fetch_url` — one harvested before the field existed, or one whose two recorded URLs disagree — the check is **skipped and says so**, as a passing check that moves no verdict in either `--strict` mode.
 
 ---
 

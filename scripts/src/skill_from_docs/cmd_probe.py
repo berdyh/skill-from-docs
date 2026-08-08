@@ -25,7 +25,13 @@ from ._redaction import (
     redact_headers,
     redact_url,
 )
-from ._schema import ProbeFixture, ProbeManifest, ProbeRequest, ProbeResponse
+from ._schema import (
+    ProbeFixture,
+    ProbeManifest,
+    ProbeRequest,
+    ProbeResponse,
+    read_source_map,
+)
 from ._slug import default_workspace
 
 
@@ -159,16 +165,16 @@ def _fixture_slug(url: str, method: str) -> str:
 
 
 def _load_spec_meta(workspace: str) -> tuple[str | None, str | None]:
-    """Return (spec_url_at_capture, spec_sha256_at_capture) from raw/source-map.json."""
-    path = os.path.join(workspace, "raw", "source-map.json")
-    if not os.path.exists(path):
-        return None, None
+    """Return (spec_url_at_capture, spec_sha256_at_capture) from raw/source-map.json.
+
+    `read_source_map` strips `fetch_url`, so the unredacted spec URL cannot
+    reach a probe fixture's `spec_url_at_capture` even by accident (A8).
+    """
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get("spec_url"), data.get("spec_sha256")
+        data = read_source_map(workspace)
     except Exception:
         return None, None
+    return data.get("spec_url"), data.get("spec_sha256")
 
 
 def run(args, *, transport=None, sleeper=time.sleep) -> int:

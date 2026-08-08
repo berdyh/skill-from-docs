@@ -22,7 +22,7 @@ from ._handoff import CANONICAL_SECTIONS, build_handoff
 from ._manifest import file_entry, now_iso, record_run
 from ._provenance import emit_probe, emit_source
 from ._sanitize import sanitize_spec_descriptions, sanitize_text, sanitize_text_for_markdown
-from ._schema import ProbeFixture
+from ._schema import ProbeFixture, read_source_map
 from ._spec import iter_operations, json_pointer
 
 # One source of truth for the canonical H2s, indexed by the name
@@ -66,11 +66,13 @@ def _read_text(path: str) -> str:
 
 def _load_spec(workspace: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
     spec_path = os.path.join(workspace, "raw", "spec.json")
-    map_path = os.path.join(workspace, "raw", "source-map.json")
     if not os.path.exists(spec_path):
         return None, None, None
     spec = _read_json(spec_path)
-    source_map = _read_json(map_path) if os.path.exists(map_path) else {}
+    # `read_source_map`, not `_read_json`: it strips `fetch_url`, so the layer
+    # that writes `docs.md` and `handoff.json` is never handed the unredacted
+    # spec URL in the first place (A8). Everything below reads `spec_url`.
+    source_map = read_source_map(workspace)
     return spec, source_map, spec_path
 
 
