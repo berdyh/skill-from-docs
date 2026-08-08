@@ -635,3 +635,34 @@ def test_winner_classification_reads_kind_not_the_display_name():
     assert cmd_auth._classify_winner(by_name["Basic auth"].kind)[0] == "basic"
     assert cmd_auth._classify_winner(by_name["query ?api_key="].kind)[0] == "query_string"
     assert cmd_auth._classify_winner(None) == (None, [])
+
+
+def test_probe_comment_comes_from_the_shared_emitter():
+    """B7: the auth markdown's provenance comment is `_provenance.emit_probe`'s
+    output, not a second implementation of the same format. Output is
+    byte-identical either way, so this pins the coupling rather than a bug: it
+    goes red if the emitter's format moves and a copy here does not."""
+    from skill_from_docs._provenance import emit_probe
+
+    report = {
+        "endpoint": "https://api.example.com/v1/x",
+        "captured_at": "2026-01-01T00:00:00Z",
+        "unauthenticated": {"status": 401, "www_authenticate": None, "body": {}},
+        "bad_token": {"status": 401, "body": {}},
+        "attempts": [],
+        "winner": None,
+        "rate_limit_headers": {},
+        "fixture_relpath": "probes/auth-api-example-com-401.json",
+    }
+    line = next(
+        ln for ln in cmd_auth._format_markdown(report).splitlines()
+        if ln.startswith("<!-- probe:")
+    )
+    assert line == emit_probe(
+        "GET",
+        "https://api.example.com/v1/x",
+        status=401,
+        retrieved="2026-01-01T00:00:00Z",
+        scope="auth-discovery",
+        fixture="probes/auth-api-example-com-401.json",
+    )

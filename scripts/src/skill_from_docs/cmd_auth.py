@@ -20,6 +20,7 @@ from ._http import (
     require_allowlist,
 )
 from ._manifest import file_entry, now_iso, record_run
+from ._provenance import emit_probe
 from ._redaction import redact_body, redact_headers, redact_text, redact_url
 from ._schema import ProbeFixture, ProbeManifest, ProbeRequest, ProbeResponse
 from ._slug import default_workspace
@@ -441,9 +442,14 @@ def _format_markdown(report: dict[str, Any]) -> str:
             else report["unauthenticated"]["status"]
         )
         lines.append(
-            f"<!-- probe: GET {endpoint_display} status: {winner_status} "
-            f"retrieved: {report['captured_at']} scope: auth-discovery "
-            f"fixture: {fixture_rel} -->"
+            emit_probe(
+                "GET",
+                endpoint_display,
+                status=winner_status,
+                retrieved=report["captured_at"],
+                scope="auth-discovery",
+                fixture=fixture_rel,
+            )
         )
     lines.append("")
 
