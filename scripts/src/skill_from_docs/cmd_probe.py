@@ -236,6 +236,7 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
     started = now_iso()
     t0 = time.perf_counter()
     with build_client(
+        allowlist=allowlist,
         timeout=args.timeout,
         follow_redirects=False,
         transport=transport,
@@ -253,7 +254,6 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
                 args.url,
                 headers=hdrs,
                 content=body_bytes,
-                allowlist=allowlist,
                 max_retries=args.max_retries,
                 sleeper=sleeper,
             )

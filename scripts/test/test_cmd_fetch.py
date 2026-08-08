@@ -230,25 +230,21 @@ def test_fetch_local_path_skips_allow_host(tmp_path: Path, fixtures_dir: Path):
 def test_staleness_only_allows_api_github_com():
     """B2: the staleness check function constructs a URL that always targets
     api.github.com — never user-controllable."""
-    import httpx as _httpx
-
     captured_urls: list[str] = []
 
-    def handler(req: _httpx.Request) -> _httpx.Response:
+    def handler(req: httpx.Request) -> httpx.Response:
         captured_urls.append(str(req.url))
-        return _httpx.Response(
+        return httpx.Response(
             200,
             json=[{"commit": {"committer": {"date": "2026-04-01T00:00:00Z"}}}],
         )
 
-    transport = _httpx.MockTransport(handler)
-    with _httpx.Client(transport=transport, trust_env=False) as client:
-        cmd_fetch._check_staleness(
-            "https://raw.githubusercontent.com/owner/repo/main/openapi.json",
-            days=1,
-            client=client,
-            log=lambda m: None,
-        )
+    cmd_fetch._check_staleness(
+        "https://raw.githubusercontent.com/owner/repo/main/openapi.json",
+        days=1,
+        log=lambda m: None,
+        transport=httpx.MockTransport(handler),
+    )
     assert captured_urls
     for url in captured_urls:
         host = re.match(r"https://([^/]+)/", url).group(1)

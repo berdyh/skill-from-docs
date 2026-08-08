@@ -521,9 +521,11 @@ def _parse_iso_date(date_str: str):
 def _check_staleness(
     source_url: str,
     days: int,
-    client,
     *,
     log,
+    timeout: float = 10.0,
+    transport=None,
+    user_agent: str | None = None,
     explicit_host: str | None = None,
     explicit_style: str | None = None,
 ) -> None:
@@ -531,10 +533,14 @@ def _check_staleness(
     URL's host; falls back to explicit flags for self-hosted instances; skips
     with an actionable note when neither resolves.
 
-    Replaces the original GitHub-only logic. The derived `api_host` becomes a
-    function-local allowlist for the single staleness call — global
-    `--allow-host` is NOT honored here, preserving the narrowed attack surface
-    the codex review imposed.
+    The derived `api_host` is the *only* host this call may reach, and global
+    `--allow-host` does not widen it — `api.github.com` is deliberately not on
+    the fetch allowlist. That is why this builds its own single-host client
+    rather than borrowing the caller's: `GuardedClient.narrowed` only ever
+    restricts, so narrowing a client bound to {raw.githubusercontent.com} down
+    to {api.github.com} correctly permits nothing. A second client states the
+    same per-call policy without giving `narrowed` a widening mode — which is
+    the failure this codebase has shipped before (failure mode 6).
     """
     if days <= 0:
         return
@@ -552,31 +558,31 @@ def _check_staleness(
         )
         return
 
-    # Function-local allowlist: only the derived/explicit api_host is allowed
-    # for this one outbound call. Global --allow-host does not widen this scope.
-    local_allowlist = HostAllowlist([target.api_host])
-    try:
-        local_allowlist.check(target.api_url)
-    except AllowlistViolation as exc:
-        log(f"staleness check: internal allowlist mismatch ({exc})")
-        return
-
-    try:
-        resp = client.get(target.api_url)
-    except Exception as e:
-        log(f"staleness check failed ({target.style}): {e}")
-        return
-    if resp.status_code != 200:
-        log(
-            f"staleness check: {target.style} commits API returned "
-            f"{resp.status_code}"
-        )
-        return
-    try:
-        payload = resp.json()
-    except Exception:
-        log(f"staleness check: {target.style} response was not JSON")
-        return
+    with build_client(
+        allowlist=HostAllowlist([target.api_host]),
+        timeout=timeout,
+        user_agent=user_agent,
+        transport=transport,
+    ) as client:
+        try:
+            resp = client.get(target.api_url)
+        except AllowlistViolation as exc:
+            log(f"staleness check: internal allowlist mismatch ({exc})")
+            return
+        except Exception as e:
+            log(f"staleness check failed ({target.style}): {e}")
+            return
+        if resp.status_code != 200:
+            log(
+                f"staleness check: {target.style} commits API returned "
+                f"{resp.status_code}"
+            )
+            return
+        try:
+            payload = resp.json()
+        except Exception:
+            log(f"staleness check: {target.style} response was not JSON")
+            return
 
     date_str = _extract_commit_date(payload, target.style)
     if not date_str:
@@ -644,6 +650,7 @@ def run(args, *, log=None, transport=None) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
         with build_client(
+            allowlist=allowlist,
             timeout=args.timeout,
             user_agent=args.user_agent or DEFAULT_USER_AGENT,
             transport=transport,
@@ -661,14 +668,19 @@ def run(args, *, log=None, transport=None) -> int:
             except Exception as e:
                 print(f"ERROR: network error: {e}", file=sys.stderr)
                 return 2
-            _check_staleness(
-                spec_url,
-                args.staleness_days,
-                client,
-                log=log,
-                explicit_host=args.staleness_api_host,
-                explicit_style=args.staleness_api_style,
-            )
+        # Outside the block on purpose: the staleness call must NOT ride on the
+        # fetch client, whose allowlist does not (and must not) list the commits
+        # API host. It builds its own, bound to that one host.
+        _check_staleness(
+            spec_url,
+            args.staleness_days,
+            log=log,
+            timeout=args.timeout,
+            transport=transport,
+            user_agent=args.user_agent,
+            explicit_host=args.staleness_api_host,
+            explicit_style=args.staleness_api_style,
+        )
     else:
         if not os.path.exists(args.source):
             print(f"ERROR: file not found: {args.source}", file=sys.stderr)

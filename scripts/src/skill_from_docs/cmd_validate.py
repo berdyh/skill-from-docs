@@ -295,14 +295,13 @@ def run(args) -> int:
 
             # spec_url is read out of a local handoff.json, which is data this
             # command did not produce. Gate it like every other outbound call
-            # rather than GETting whatever the file happens to name.
-            allowlist = network_allowlist
+            # rather than GETting whatever the file happens to name — the
+            # allowlist is bound to the client, so `client.get` is the gate.
             spec_url = (handoff.get("content_shape_signals") or {}).get("spec_url")
             urls_to_check = [spec_url] if spec_url else []
-            with build_client(timeout=10.0) as client:
+            with build_client(allowlist=network_allowlist, timeout=10.0) as client:
                 for url in urls_to_check:
                     try:
-                        allowlist.check(url)
                         r = client.get(url)
                         ok = r.status_code == 200
                         _add_check(
