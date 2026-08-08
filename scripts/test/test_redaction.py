@@ -214,3 +214,37 @@ def test_redact_text_handles_several_urls_in_one_string():
     out = redact_text("a https://x.test/?token=A then https://y.test/?token=B")
     assert "A" not in out.split("then")[0].split("token=")[1]
     assert out.count("<redacted>") == 2
+
+
+def test_redact_url_redacts_userinfo_credentials():
+    """`https://user:pass@host/...` passes the allowlist — urlparse().hostname
+    strips userinfo — so the credential reaches source-map.json, docs.md,
+    handoff.json and every fixture's spec_url_at_capture."""
+    assert redact_url("https://user:s3cr3t@api.example.com/spec.json") == (
+        f"https://{REDACTED}@api.example.com/spec.json"
+    )
+    assert redact_url("https://tok3n@api.example.com:8443/x") == (
+        f"https://{REDACTED}@api.example.com:8443/x"
+    )
+    out = redact_url("https://u:p@h/v1?api_key=k&page=2")
+    assert "p@" not in out and "=k" not in out
+    assert "page=2" in out
+    # No userinfo: the netloc is left exactly as it was.
+    assert redact_url("https://api.example.com/x?a=1") == "https://api.example.com/x?a=1"
+
+
+def test_redact_url_does_not_gratuitously_encode_benign_values():
+    """A recorded URL is an audit artifact. Only the characters that could
+    split one parameter into two are escaped."""
+    assert redact_url("https://h/p?filter=a/b,c") == "https://h/p?filter=a/b,c"
+    assert redact_url("https://h/p?cb=https://x.test/done") == "https://h/p?cb=https://x.test/done"
+    # ...but the split-causing ones still are, which is the bug this guards.
+    assert redact_url("https://h/p?q=one%26two") == "https://h/p?q=one%26two"
+
+
+def test_redact_text_is_idempotent():
+    """cmd_auth redacts URLs elsewhere, so an error string can already contain
+    the sentinel; redacting twice must not append a second one."""
+    once = redact_text("failed for https://h/p?token=abc")
+    assert once == redact_text(once)
+    assert once.count(REDACTED) == 1

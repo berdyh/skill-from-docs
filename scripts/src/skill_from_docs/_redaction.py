@@ -58,16 +58,33 @@ def redact_headers(headers: dict[str, str]) -> dict[str, str]:
     return out
 
 
+# Characters left literal when re-encoding a non-sensitive query value. These
+# are all legal in a query per RFC 3986. `&`, `=`, `+` and `#` are deliberately
+# NOT here: leaving them literal is what would let a single value split back
+# into two parameters, which is the corruption the re-encoding exists to stop.
+_QUERY_VALUE_SAFE = "/:@,!$'()*~"
+
+
 def redact_url(url: str) -> str:
-    """Replace sensitive query-string values with `<redacted>`.
+    """Replace credentials in a URL with `<redacted>`.
+
+    Covers both places a credential rides in a URL: the query string, and the
+    userinfo component (`https://user:pass@host/...`). Userinfo matters even
+    though `HostAllowlist` ignores it — `urlparse().hostname` strips userinfo,
+    so an allowlisted host still admits `https://user:pass@host/spec.json`, and
+    that string is what reaches `raw/source-map.json`, every `<!-- source: -->`
+    comment in docs.md, handoff.json, and every probe fixture.
 
     Keys and values are re-encoded on the way out. `parse_qsl` hands back
     percent-DECODED text, so writing it back raw corrupts the URL: `?q=one%26two`
     would become `?q=one&two`, turning one parameter into two in a fixture that
-    claims to record the request actually sent.
+    claims to record the request actually sent. Only the characters that could
+    cause that split are escaped — a URL is recorded as an audit artifact, so
+    gratuitously percent-encoding `?filter=a/b,c` is its own kind of damage.
 
     The `<redacted>` sentinel is the one deliberate exception — it is left
-    unencoded so the result stays readable in fixtures and logs.
+    unencoded so the result stays readable in fixtures and logs, and so
+    re-redacting an already-redacted URL is a no-op.
 
     Decoding before the sensitivity check is intentional: it means `?%74oken=x`
     is still recognised as `token` and redacted.
@@ -76,23 +93,33 @@ def redact_url(url: str) -> str:
         parsed = urlparse(url)
     except Exception:
         return url
-    if not parsed.query:
-        return url
-    pairs = parse_qsl(parsed.query, keep_blank_values=True)
-    rebuilt: list[str] = []
-    for k, v in pairs:
-        safe_k = quote(k, safe="")
-        if k.lower() in SENSITIVE_QUERY_KEYS:
-            rebuilt.append(f"{safe_k}={REDACTED}")
-        else:
-            rebuilt.append(f"{safe_k}={quote(v, safe='')}")
-    return urlunparse(parsed._replace(query="&".join(rebuilt)))
+
+    if parsed.username or parsed.password:
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        parsed = parsed._replace(netloc=f"{REDACTED}@{host}")
+
+    if parsed.query:
+        pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        rebuilt: list[str] = []
+        for k, v in pairs:
+            safe_k = quote(k, safe="")
+            if k.lower() in SENSITIVE_QUERY_KEYS:
+                rebuilt.append(f"{safe_k}={REDACTED}")
+            else:
+                rebuilt.append(f"{safe_k}={quote(v, safe=_QUERY_VALUE_SAFE)}")
+        parsed = parsed._replace(query="&".join(rebuilt))
+
+    return urlunparse(parsed)
 
 
 # A URL embedded in free text — an exception message, a log line. Stops at
 # whitespace, quotes, and the punctuation that usually ends a sentence rather
-# than a URL.
-_URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'<>\\]+")
+# than a URL. The `<redacted>` alternative keeps the sentinel inside the match
+# so redacting twice is a no-op: without it the match stopped at `token=` and
+# the second pass appended a second sentinel.
+_URL_IN_TEXT_RE = re.compile(rf"https?://(?:{re.escape(REDACTED)}|[^\s\"'<>\\])+")
 
 
 def redact_text(text: str) -> str:
