@@ -10,6 +10,11 @@ Hand it a docs URL, a GitHub repo, or an OpenAPI spec. It produces a workspace a
 - `handoff.json` — pre-filled answers for skill-creator's interview (tool summary, declared scope, content-shape signals, coverage checklist, provenance index)
 - `images/` + `images-manifest.json` — per-image transcribed sidecars
 - `raw/` + `url-queue.json` — raw fetched pages and the URL queue (used by the "Refresh" cache option)
+- `manifest.json` — append-only run log with a sha256 for every input and output, which `validate` checks
+
+`docs.md` and `handoff.json` are the two artifacts that leave the machine, and
+credentials are redacted from both. See [Credentials on disk](#credentials-on-disk)
+for the one file that is different.
 
 skill-creator reads from this workspace, runs its standard interview (overriding the pre-filled answers as needed), and produces the final `~/.claude/skills/<name>/` skill.
 
@@ -88,17 +93,17 @@ skill-from-docs/
 │   ├── doc-template.md                       # structure for the consolidated docs.md
 │   ├── probing-tools.md                      # openapi-harvest subcommand reference + security model
 │   ├── case-study-fusesoc.md                 # deep walkthrough: multi-source scattered
+│   ├── case-study-hetzner-openapi.md         # deep walkthrough: OpenAPI-only, with optional live probing
 │   ├── case-study-resend-spa.md              # vignette: SPA / JS-rendered
-│   ├── case-study-yandex-nonenglish.md       # vignette: non-English partial
-│   └── case-study-hetzner-openapi.md         # vignette: OpenAPI-only (archetype 4) with optional live probing
+│   └── case-study-yandex-nonenglish.md       # vignette: non-English partial
 └── scripts/                                  # optional CLI dev kit for archetype-4 harvesting
     ├── README.md
     ├── pyproject.toml
-    ├── src/skill_from_docs/                  # openapi-harvest CLI (6 subcommands)
-    └── test/                                 # ~71 pytest tests + fixtures
+    ├── src/skill_from_docs/                  # openapi-harvest CLI (6 subcommands over a shared substrate)
+    └── test/                                 # offline pytest suite + fixtures
 ```
 
-The case studies are tiered. FuseSoC is a deep end-to-end walkthrough — read it once in full to understand how all four phases fit together. Resend and Yandex are shorter, focused on the one hard decision specific to their archetype. Read the case that matches what you classified in Phase 1 Step 0.
+The case studies are tiered. FuseSoC and Hetzner are the two deep end-to-end walkthroughs — read whichever matches what you classified in Phase 1 Step 0, once in full, to see how all four phases fit together. Resend and Yandex are shorter, focused on the one hard decision specific to their archetype.
 
 ## The six docs archetypes
 
@@ -119,6 +124,34 @@ For OpenAPI-only APIs, `skill-from-docs` ships an optional CLI tool, `openapi-ha
 
 Install with `pip install -e ./scripts`. See [scripts/README.md](scripts/README.md) for the full error contract, security model, and smoke-test sequence, and [references/case-study-hetzner-openapi.md](references/case-study-hetzner-openapi.md) for a worked walkthrough against Hetzner Cloud (works offline using bundled fixtures, no third-party signup required).
 
+Its security defaults are restrictive on purpose, and each one is a deliberate
+choice rather than an oversight: `--allow-host` is **required** before any
+credentialed request, and the allowlist is bound to the HTTP client itself so a
+call to an unlisted host fails structurally rather than by convention; redirects
+are never followed; query-string and Basic auth are opt-in; request/response
+redaction and description sanitizing are on by default. Loosening any of them is
+a behaviour change — the rationale for each is in
+[references/probing-tools.md](references/probing-tools.md).
+
+### Credentials on disk
+
+If you harvest a spec whose URL carries a credential
+(`https://api.example.com/spec.json?key=<secret>`), the workspace keeps the
+usable URL in **`raw/source-map.json`** under `fetch_url`, and that file is
+created mode `0600`.
+
+It has to be stored somewhere: the recorded URL is the audit trail, and a
+redacted one cannot be re-fetched — `validate --network` would try it and report
+a failure that is not real. Everything else records only the redacted form.
+`docs.md`, `handoff.json`, `manifest.json` and every probe fixture are clean, and
+`consolidate`/`probe` read through an accessor that strips the field, so they
+cannot leak a value they are never handed.
+
+What this means for you: the workspace is as sensitive as the credential you
+gave it. Do not commit it or copy it to a shared machine. Workspaces created
+before this behaviour existed have no `fetch_url`; `validate --network` skips the
+re-fetch and says so rather than failing.
+
 ## Limits
 
 - This skill covers harvesting only. It does not produce a SKILL.md, choose an output structure, or evaluate the resulting skill — those live in `skill-creator`.
@@ -130,7 +163,7 @@ Install with `pip install -e ./scripts`. See [scripts/README.md](scripts/README.
 
 Issues and PRs welcome. Particularly valued:
 
-- Case studies for the remaining archetypes — *OpenAPI-only*, *sparse README + examples*, and *well-structured docs site* don't yet have dedicated walkthroughs. The last two are the lowest priority (they're the easy cases) but useful for completeness.
+- Case studies for the remaining archetypes — *sparse README + examples* and *well-structured docs site* don't yet have dedicated walkthroughs. Both are low priority (they're the easy cases) but useful for completeness.
 - New archetype-combination cases (e.g. *non-English + SPA*, *OpenAPI-only + non-English*).
 - Additional platform patterns in `references/discovery.md`.
 - Refinements to the archetype recognition signals.
