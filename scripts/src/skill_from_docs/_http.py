@@ -119,6 +119,7 @@ def request_with_retry(
     max_retries: int = 3,
     headers: dict[str, str] | None = None,
     content: bytes | None = None,
+    timeout: float | None = None,
     sleeper=time.sleep,
 ):
     """Run a request with 429-Retry-After + 5xx exponential-backoff retries.
@@ -126,15 +127,19 @@ def request_with_retry(
     Returns the final response (success OR last failing). Raises
     AllowlistViolation if the URL host isn't allowed.
 
+    `timeout` overrides the client's timeout for this request only — used for
+    speculative probes that should not inherit a long download budget.
+
     Backoff schedule: 1s, 2s, 4s, ...
     """
     if allowlist is not None:
         allowlist.check(url)
 
+    extra = {} if timeout is None else {"timeout": timeout}
     attempts = 0
     while True:
         try:
-            response = client.request(method, url, headers=headers, content=content)
+            response = client.request(method, url, headers=headers, content=content, **extra)
         except Exception:  # network errors retried up to max_retries
             if attempts >= max_retries:
                 raise

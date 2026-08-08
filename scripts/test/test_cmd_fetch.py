@@ -453,3 +453,42 @@ def test_recorded_spec_hash_matches_the_written_file(tmp_path: Path, fixtures_di
 
     recorded = json.loads((ws / "raw" / "source-map.json").read_text())["spec_sha256"]
     assert recorded == sha256_file(str(ws / "raw" / "spec.json"))
+
+
+def test_discovery_probes_do_not_inherit_the_download_timeout(tmp_path: Path):
+    """Seven speculative paths x --timeout is the 210s worst case.
+
+    Only the URL the user actually named keeps the full budget; the guesses
+    that follow get a short leash.
+    """
+    seen: list[tuple[str, float | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        t = request.extensions.get("timeout") or {}
+        seen.append((str(request.url), t.get("read")))
+        return httpx.Response(404, text="")
+
+    args = _make_args(
+        source="https://api.example.com/docs", workspace=str(tmp_path), timeout=30.0
+    )
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 1
+
+    direct, probes = seen[0], seen[1:]
+    assert direct == ("https://api.example.com/docs", 30.0)
+    assert len(probes) == len(cmd_fetch.COMMON_SPEC_PATHS)
+    assert {t for _u, t in probes} == {cmd_fetch.DISCOVERY_PROBE_TIMEOUT}
+
+
+def test_discovery_probe_timeout_never_exceeds_the_user_timeout(tmp_path: Path):
+    """A --timeout tighter than the clamp wins; the clamp is a ceiling."""
+    seen: list[float | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.extensions.get("timeout") or {}).get("read"))
+        return httpx.Response(404, text="")
+
+    args = _make_args(
+        source="https://api.example.com/docs", workspace=str(tmp_path), timeout=1.0
+    )
+    cmd_fetch.run(args, transport=httpx.MockTransport(handler))
+    assert set(seen[1:]) == {1.0}

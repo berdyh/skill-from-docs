@@ -24,6 +24,13 @@ from ._slug import default_workspace
 from ._spec import count_operations, iter_operations, json_pointer
 
 
+# Per-request ceiling for the speculative common-path probes below. They are
+# guesses against paths the user never named, so they get a short leash;
+# `--timeout` still governs the URL the user did name. Concurrency was
+# considered and rejected — it fires seven requests at a stranger's origin to
+# save under a second on a command whose next act is downloading a large spec.
+DISCOVERY_PROBE_TIMEOUT = 5.0
+
 COMMON_SPEC_PATHS = (
     "/openapi.json",
     "/openapi.yaml",
@@ -296,8 +303,14 @@ def _try_renderers(html: str, base_url: str) -> str | None:
     return None
 
 
-def _discover(client, base_url: str, allowlist: HostAllowlist) -> tuple[bytes, str]:
-    """Discovery cascade. Returns (spec_bytes, final_url) or raises FetchError."""
+def _discover(
+    client, base_url: str, allowlist: HostAllowlist, *, probe_timeout: float
+) -> tuple[bytes, str]:
+    """Discovery cascade. Returns (spec_bytes, final_url) or raises FetchError.
+
+    `probe_timeout` bounds only the speculative common-path probes in step 2.
+    The URL the user actually gave us keeps the full `--timeout`.
+    """
     # 1. Direct fetch.
     try:
         resp = request_with_retry(client, "GET", base_url, allowlist=allowlist, max_retries=0)
@@ -325,7 +338,10 @@ def _discover(client, base_url: str, allowlist: HostAllowlist) -> tuple[bytes, s
         # Continue to common-path probing for connection errors.
         pass
 
-    # 2. Common spec paths against the origin.
+    # 2. Common spec paths against the origin. These are guesses, tried one at
+    # a time, so they must not each inherit the spec-download timeout: against
+    # a host that blackholes rather than refuses, 7 paths x --timeout (30s by
+    # default) meant discovery took 210s to report failure.
     parsed = urlparse(base_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
     for path in COMMON_SPEC_PATHS:
@@ -336,7 +352,12 @@ def _discover(client, base_url: str, allowlist: HostAllowlist) -> tuple[bytes, s
             continue
         try:
             resp = request_with_retry(
-                client, "GET", candidate, allowlist=allowlist, max_retries=0
+                client,
+                "GET",
+                candidate,
+                allowlist=allowlist,
+                max_retries=0,
+                timeout=probe_timeout,
             )
         except Exception:
             continue
@@ -628,7 +649,12 @@ def run(args, *, log=None, transport=None) -> int:
             transport=transport,
         ) as client:
             try:
-                body, spec_url = _discover(client, args.source, allowlist)
+                body, spec_url = _discover(
+                    client,
+                    args.source,
+                    allowlist,
+                    probe_timeout=min(args.timeout, DISCOVERY_PROBE_TIMEOUT),
+                )
             except FetchError as fe:
                 print(f"ERROR: {fe}", file=sys.stderr)
                 return fe.exit_code
