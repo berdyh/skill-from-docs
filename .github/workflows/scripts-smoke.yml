@@ -4,12 +4,18 @@ on:
     paths:
       - 'scripts/**'
       - 'references/**'
+      # docs-guard also scans these two, so a change to either must run it.
+      - 'SKILL.md'
+      - 'README.md'
       - '.github/workflows/scripts-smoke.yml'
   push:
     branches: [main]
     paths:
       - 'scripts/**'
       - 'references/**'
+      # docs-guard also scans these two, so a change to either must run it.
+      - 'SKILL.md'
+      - 'README.md'
       - '.github/workflows/scripts-smoke.yml'
 jobs:
   test:
@@ -77,13 +83,47 @@ jobs:
           openapi-harvest consolidate ws --merge-probes
           openapi-harvest validate ws --strict
 
+  # A handful of forbidden literals, not a doc-lint framework. DEFERRED.md §D3
+  # measured a real linter against the ~20 drifts this repo has actually shipped
+  # and it would have caught approximately none of them — every one was semantic.
+  # What a linter *can* catch is the small set of literals that were wrong, got
+  # fixed, and would rot again the same way. Each rule below names one of those
+  # and says why, because a contributor who trips it needs to know the reason,
+  # not just that the string is banned. The executable half of this guarantee
+  # lives in `scripts/test/test_documented_offline_smoke.py` and the
+  # `cli-contract` job above; those run the documented commands for real.
   docs-guard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Detect hardcoded endpoint count in case study
+
+      - name: No hardcoded endpoint count in the case study
         run: |
-          if grep -E "# → [0-9]+" references/case-study-hetzner-openapi.md; then
-            echo "::error::Case study hardcodes a specific endpoint count, which will rot. Say that the command prints the current endpoint count instead."
+          if grep -nE "# → [0-9]+" references/case-study-hetzner-openapi.md; then
+            echo "::error::references/case-study-hetzner-openapi.md hardcodes an endpoint count. It tracks an upstream community mirror that changes without notice, so any number written here is wrong on some future day and nothing will notice. Say that the command prints the current endpoint count instead."
+            exit 1
+          fi
+
+      # scripts/README.md is deliberately NOT scanned here. Its one `Pass: N/N`
+      # lives in the `validate --json` schema block, and
+      # test_cmd_validate.py::test_summary_string_is_the_shape_the_readme_documents
+      # parses it back out and asserts the format and the arithmetic against a
+      # live run. An executable check beats a grep, so that file is governed by
+      # the test instead of by this rule.
+      - name: No hardcoded validate check count
+        run: |
+          if grep -rnE "Pass: [0-9]+/[0-9]+" references/ SKILL.md README.md; then
+            echo "::error::A doc hardcodes a 'Pass: N/N' summary from openapi-harvest validate. The check total is dynamic — validate emits one check per docs.md section, so it moves with the spec's tag and endpoint count and with how much narrative was merged. 'Pass: 10/10' was documented while the real number was 16, and it will drift again. Write 'Pass: <n>/<n>' or describe the output instead."
+            exit 1
+          fi
+
+      - name: No invented probe-fixture filenames
+        run: |
+          if grep -rn "auth-discovery.json" references/ scripts/README.md SKILL.md README.md; then
+            echo "::error::A doc names a fixture file 'auth-discovery.json'. No such file is ever written: 'auth-discovery' is a --scope label, and openapi-harvest auth writes probes/auth-<host>-<baseline-status>.json. Cite the real name, or refer to the scope without a filename."
+            exit 1
+          fi
+          if grep -rn "locations-200.json" references/ scripts/README.md SKILL.md README.md; then
+            echo "::error::A doc names a probe fixture 'locations-200.json'. openapi-harvest probe derives the filename from the method and URL path and never includes a status code — it writes probes/get-v1-locations.json. (The bundled offline fixtures under scripts/test/fixtures/ do use -200 names; copy them with a glob rather than naming one, so this rule stays scoped to claims about probe output.)"
             exit 1
           fi
