@@ -143,3 +143,20 @@ def test_verify_hashes_uses_the_newest_entry_per_path(tmp_path: Path):
 
     target.write_text("tampered\n")
     assert [f for f in verify_hashes(str(ws)) if "docs.md" in f]
+
+
+def test_file_entry_handles_a_relative_workspace(tmp_path: Path, monkeypatch):
+    """`consolidate myws` passes a relative workspace, so docs_path is relative
+    too. Joining the workspace onto it again looked for `myws/myws/docs.md` and
+    crashed after docs.md had already been written."""
+    ws = tmp_path / "myws"
+    ws.mkdir()
+    (ws / "docs.md").write_text("hi\n")
+    monkeypatch.chdir(tmp_path)
+
+    for workspace, path in (
+        ("myws", "myws/docs.md"),   # both cwd-relative, as consolidate passes them
+        ("myws", "docs.md"),        # workspace-relative
+        (str(ws), str(ws / "docs.md")),  # both absolute
+    ):
+        assert file_entry(workspace, path)["path"] == "docs.md"

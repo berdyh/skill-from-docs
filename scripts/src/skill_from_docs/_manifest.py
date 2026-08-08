@@ -128,7 +128,18 @@ def verify_hashes(workspace: str) -> list[str]:
 
 
 def file_entry(workspace: str, path: str) -> dict[str, Any]:
-    """Build an `{path, sha256}` entry for a file inside the workspace."""
-    full = path if os.path.isabs(path) else os.path.join(workspace, path)
-    rel = os.path.relpath(full, workspace) if os.path.isabs(path) else path
-    return {"path": rel, "sha256": sha256_file(full)}
+    """Build an `{path, sha256}` entry for a file inside the workspace.
+
+    `path` may be absolute, workspace-relative, or cwd-relative — callers pass
+    all three. Resolving both sides against the cwd first is what keeps them
+    equivalent: the old form joined `workspace` onto any non-absolute path, so
+    `consolidate myws` (a relative workspace, and `docs_path` therefore also
+    relative) looked for `myws/myws/docs.md` and crashed with FileNotFoundError
+    after docs.md had already been written.
+    """
+    abs_workspace = os.path.abspath(workspace)
+    full = os.path.abspath(path)
+    if not os.path.exists(full):
+        # Not cwd-relative — try it as workspace-relative before giving up.
+        full = os.path.abspath(os.path.join(abs_workspace, path))
+    return {"path": os.path.relpath(full, abs_workspace), "sha256": sha256_file(full)}

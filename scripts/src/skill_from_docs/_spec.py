@@ -41,7 +41,11 @@ def iter_operations(spec: dict[str, Any] | None) -> Iterator[tuple[str, str, dic
     if not isinstance(paths, dict):
         return
     for path, methods in paths.items():
-        if not isinstance(methods, dict):
+        # YAML does not require mapping keys to be strings, so a remote spec can
+        # hand us `paths: {1: {get: ...}}`. Downstream does `path.replace(...)`
+        # to build a JSON Pointer, which would raise AttributeError and break
+        # the numeric exit-code contract with a traceback.
+        if not isinstance(path, str) or not isinstance(methods, dict):
             continue
         for method, op in methods.items():
             if not isinstance(method, str) or method.lower() not in HTTP_METHODS:

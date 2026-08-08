@@ -103,3 +103,13 @@ def test_count_operations_matches_iter_operations(fixtures_dir: Path):
     for name in ("tiny-openapi-3.json", "tiny-openapi-3.1.json", "trace-openapi.json"):
         spec = json.loads((fixtures_dir / name).read_text())
         assert count_operations(spec) == len(list(iter_operations(spec)))
+
+
+def test_iter_operations_skips_non_string_path_keys():
+    """YAML does not require mapping keys to be strings, so a remote spec can
+    hand us `paths: {1: {...}}`. json_pointer would AttributeError on it and
+    replace the numeric exit-code contract with a traceback."""
+    assert list(iter_operations({"paths": {1: {"get": {}}}})) == []
+    assert [p for p, _m, _o in iter_operations({"paths": {1: {"get": {}}, "/ok": {"get": {}}}})] == [
+        "/ok"
+    ]
