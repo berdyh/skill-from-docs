@@ -4,10 +4,11 @@ Three contracts live here: the probe-fixture dataclasses, the `handoff.json`
 linter, and the `raw/source-map.json` accessors.
 
 **`raw/source-map.json` holds a live credential and must not leave the machine.**
-That is new as of A8 and is the reason this module writes the file itself
-instead of leaving six lines of `open`/`json.dump` in `cmd_fetch`. See the
-"source-map.json contract" section below for the display/fetchable split, and
-`write_source_map` for the `0o600` guarantee.
+That is new as of A8 and is the reason this module owns the write rather than
+leaving it inline in `cmd_fetch`: the `0o600` mode has to travel with the write,
+and it now does — `write_source_map` is the one caller of `_io.write_json` that
+passes a mode. See the "source-map.json contract" section below for the
+display/fetchable split, and `write_source_map` for the guarantee itself.
 """
 
 from __future__ import annotations
