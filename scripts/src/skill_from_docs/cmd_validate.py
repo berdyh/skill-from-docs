@@ -8,6 +8,7 @@ import json
 import os
 from typing import Any
 
+from . import _cli
 from ._manifest import now_iso, record_run, superseded_mismatches, verify_hashes
 from ._http import require_allowlist
 from ._provenance import find_all_provenance
@@ -26,16 +27,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "validate",
         help="completion check (local-by-default)",
         description="Verify a harvested workspace is complete (docs.md, handoff.json, provenance, hashes).",
+        parents=[_cli.allow_host()],
     )
     p.add_argument("workspace", nargs="?")
     p.add_argument("--strict", action="store_true")
     p.add_argument("--network", action="store_true")
-    p.add_argument(
-        "--allow-host",
-        action="append",
-        default=[],
-        help="host allowed for --network re-fetches (repeatable; required with --network)",
-    )
     p.add_argument("--json", dest="json_out", action="store_true")
     p.set_defaults(func=run)
 

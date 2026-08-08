@@ -11,7 +11,7 @@ import time
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
-from . import __version__
+from . import __version__, _cli
 from ._http import (
     AllowlistViolation,
     build_client,
@@ -44,6 +44,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "probe",
         help="capture one live response",
         description="Capture a single HTTP request/response pair as a redacted JSON fixture.",
+        parents=[
+            _cli.allow_host(),
+            _cli.no_follow_redirects(),
+            _cli.timeout(default=30.0),
+            _cli.workspace_flag(),
+            _cli.quiet(),
+        ],
     )
     p.add_argument("url")
     p.add_argument("-X", "--method", default="GET")
@@ -54,26 +61,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--no-redact", action="store_true")
     p.add_argument("--redact-body-key", action="append", default=[])
     p.add_argument("--redact-body-pattern", action="append", default=[])
-    p.add_argument("--allow-host", action="append", default=[])
     p.add_argument("--max-retries", type=int, default=3)
-    # Redirects are never followed. A 30x to an attacker host is the canonical
-    # token-leak path, and following one safely means reproducing httpx's
-    # cross-origin credential stripping on top of the allowlist check — two
-    # subtle guards to maintain for a capability nothing here needs. The
-    # `Location` header is captured (redacted) instead. `--no-follow-redirects`
-    # stays accepted so existing invocations keep working; it states the
-    # guarantee rather than toggling anything.
-    p.add_argument(
-        "--no-follow-redirects",
-        dest="follow_redirects",
-        action="store_false",
-        default=False,
-        help="accepted for compatibility; redirects are never followed",
-    )
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--timeout", type=float, default=30.0)
-    p.add_argument("--workspace")
-    p.add_argument("-q", "--quiet", action="store_true")
     p.set_defaults(func=run)
 
 

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 from urllib.parse import urlparse
 
+from . import _cli
 from ._handoff import CANONICAL_SECTIONS, build_handoff
 from ._io import write_json, write_text
 from ._manifest import file_entry, now_iso, record_run
@@ -37,6 +38,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "consolidate",
         help="emit docs.md + handoff.json",
         description="Walk a workspace and assemble docs.md (canonical H2s, per-tag H3s) plus handoff.json.",
+        parents=[_cli.quiet()],
     )
     p.add_argument("workspace", nargs="?")
     p.add_argument("--merge-probes", action="store_true")
@@ -46,7 +48,6 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--no-emit-handoff", dest="emit_handoff", action="store_false")
     p.add_argument("--no-sanitize-descriptions", dest="sanitize", action="store_false", default=True)
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("-q", "--quiet", action="store_true")
     p.set_defaults(func=run)
 
 
