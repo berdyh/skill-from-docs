@@ -14,9 +14,37 @@ from urllib.parse import parse_qsl, quote, unquote, urlparse, urlunparse
 
 REDACTED = "<redacted>"
 
-# Header names (case-insensitive match) that always get redacted.
+
+def _normalize_key(k: str) -> str:
+    """Comparison form shared by every sensitive-key check in this module.
+
+    `api-key`, `X-API-Key` and `api_key` must all be the same test — header
+    names are conventionally hyphenated, JSON/query keys are conventionally
+    snake_case, and the three sensitive-key sets below were built by three
+    different people at three different times. Normalizing once here, rather
+    than three times slightly differently, is what keeps them from drifting
+    the way they already have (see DEFERRED.md's "Recurring failure modes").
+    """
+    return k.lower().replace("-", "_")
+
+
+# Header names (case-insensitive, exact match) that always get redacted. Kept
+# as an explicit tuple, not just baked into the regex, so SENSITIVE_QUERY_KEYS
+# below can fold the same spellings in without re-typing them.
+SENSITIVE_HEADER_NAMES = (
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "x-auth-token",
+    "api-key",
+    "token",
+    "cookie",
+    "x-csrf-token",
+    "set-cookie",
+    "location",
+)
 SENSITIVE_HEADER_RE = re.compile(
-    r"^(authorization|proxy-authorization|x-api-key|x-auth-token|api-key|token|cookie|x-csrf-token|set-cookie|location)$",
+    r"^(" + "|".join(re.escape(name) for name in SENSITIVE_HEADER_NAMES) + r")$",
     re.IGNORECASE,
 )
 
@@ -35,16 +63,30 @@ DEFAULT_BODY_KEYS = (
     "session",
 )
 
-# URL query parameter names treated as credentials. Kept in sync with
-# DEFAULT_BODY_KEYS — a credential is no less sensitive for arriving in a query
-# string than in a body, and query strings additionally reach logs, proxies, and
-# CDN caches. Lowercased for comparison; `apikey` covers the `apiKey` spelling.
-SENSITIVE_QUERY_KEYS = {k.lower() for k in DEFAULT_BODY_KEYS} | {
-    "key",
-    "auth",
-    "sig",
-    "signature",
-}
+# URL query parameter names treated as credentials. Union of:
+#   - DEFAULT_BODY_KEYS — a credential is no less sensitive for arriving in a
+#     query string than in a body, and query strings additionally reach logs,
+#     proxies, and CDN caches;
+#   - SENSITIVE_HEADER_NAMES — the same reasoning in the other direction: a
+#     tool can pass the same credential as `?Authorization=Bearer+x` instead
+#     of a header, and `SENSITIVE_HEADER_RE` already knows every one of these
+#     spellings, so re-deriving them here rather than re-typing them is what
+#     keeps the two sets from drifting apart again;
+#   - spellings that are common in query strings / cookies but do not match
+#     any body-key or header-name spelling above: `key` (contested — see
+#     DEFERRED.md A8, a resource-name `?key=` is at least as common as a
+#     credential one, kept because the credential case is worse to miss),
+#     `auth`, `sig`, `signature`, `pwd`, `passwd`, `sessionid`.
+# All comparisons go through `_normalize_key`, so this set is stored already
+# normalized; membership tests must normalize the incoming key the same way.
+# These three sets have drifted apart before — `client_secret`, `refresh_token`,
+# `client_assertion`, `private_key` and `session` were once missing from the
+# query set, which was a live leak.
+SENSITIVE_QUERY_KEYS = (
+    {_normalize_key(k) for k in DEFAULT_BODY_KEYS}
+    | {_normalize_key(name) for name in SENSITIVE_HEADER_NAMES}
+    | {"key", "auth", "sig", "signature", "pwd", "passwd", "sessionid"}
+)
 
 
 def redact_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -95,6 +137,14 @@ _FALLBACK_KV_RE = re.compile(
 )
 
 
+def _is_sensitive_query_key(key: str) -> bool:
+    """`key` must already be percent-DECODED. `redact_url`'s parseable path
+    gets this for free from `parse_qsl`; the fallback path below decodes
+    explicitly before calling this, since it is working from raw URL text.
+    Decoding here too would double-unquote an already-decoded key."""
+    return _normalize_key(key) in SENSITIVE_QUERY_KEYS
+
+
 def _redact_url_fallback(url: str) -> str:
     """Best-effort redaction for a URL `urlparse` could not parse.
 
@@ -107,13 +157,12 @@ def _redact_url_fallback(url: str) -> str:
        running it again matches `<redacted>@` and replaces it with the same
        `<redacted>@`.
     2. `key=value` pairs anywhere in the remaining string, redacting the
-       value when the (percent-decoded, lowercased) key is in
-       `SENSITIVE_QUERY_KEYS`. Idempotent because the value pattern matches
-       the literal `<redacted>` sentinel whole — without that alternative,
-       `[^&\\s"'<>\\\\]*` would stop at the leading `<` and leave a
-       one-character-short match, and a second pass would append a second
-       sentinel (the exact bug `_URL_IN_TEXT_RE` already guards against for
-       `redact_text`).
+       value when the key normalizes to something in `SENSITIVE_QUERY_KEYS`.
+       Idempotent because the value pattern matches the literal `<redacted>`
+       sentinel whole — without that alternative, `[^&\\s"'<>\\\\]*` would
+       stop at the leading `<` and leave a one-character-short match, and a
+       second pass would append a second sentinel (the exact bug
+       `_URL_IN_TEXT_RE` already guards against for `redact_text`).
 
     Not attempted: reconstructing a well-formed URL. The output is a
     best-effort redaction of the input's *text*, not a parse-and-rebuild —
@@ -129,7 +178,7 @@ def _redact_url_fallback(url: str) -> str:
         # Working from raw text here (no `parse_qsl` to decode for us), so
         # decode before the sensitivity check — same reasoning as the
         # parseable path's `?%74oken=x`.
-        if unquote(m.group("key")).lower() in SENSITIVE_QUERY_KEYS:
+        if _is_sensitive_query_key(unquote(m.group("key"))):
             return f"{m.group('key')}={REDACTED}"
         return m.group(0)
 
@@ -185,7 +234,7 @@ def redact_url(url: str) -> str:
         rebuilt: list[str] = []
         for k, v in pairs:
             safe_k = quote(k, safe="")
-            if k.lower() in SENSITIVE_QUERY_KEYS:
+            if _is_sensitive_query_key(k):
                 rebuilt.append(f"{safe_k}={REDACTED}")
             else:
                 rebuilt.append(f"{safe_k}={quote(v, safe=_QUERY_VALUE_SAFE)}")
@@ -225,15 +274,19 @@ def redact_body(
     - If body is a dict, redacts values for default + extra keys.
     - If body is a list, recurses into elements.
     - If body is a string, applies regex patterns.
+
+    Key comparison goes through `_normalize_key`, same as `redact_url`'s query
+    keys — a body key spelled `client-secret` is the same test as
+    `client_secret`, not a miss.
     """
-    keys = {k.lower() for k in DEFAULT_BODY_KEYS}
-    keys.update(k.lower() for k in extra_keys)
+    keys = {_normalize_key(k) for k in DEFAULT_BODY_KEYS}
+    keys.update(_normalize_key(k) for k in extra_keys)
 
     def _walk(value: Any) -> Any:
         if isinstance(value, dict):
             out: dict[str, Any] = {}
             for k, v in value.items():
-                if isinstance(k, str) and k.lower() in keys:
+                if isinstance(k, str) and _normalize_key(k) in keys:
                     out[k] = REDACTED
                     continue
                 # Patterns apply to keys too. A body misread as form-encoded

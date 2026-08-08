@@ -8,6 +8,7 @@ from urllib.parse import parse_qsl, urlparse
 from skill_from_docs._redaction import (
     DEFAULT_BODY_KEYS,
     REDACTED,
+    SENSITIVE_HEADER_NAMES,
     SENSITIVE_QUERY_KEYS,
     compile_patterns,
     redact_body,
@@ -316,3 +317,50 @@ def test_redact_url_fallback_encoded_key_still_recognised():
     out = redact_url("https://[::1/p?%74oken=secret")
     assert "secret" not in out
     assert REDACTED in out
+
+
+# --- Query-key set reconciliation with SENSITIVE_HEADER_RE ------------------
+
+
+def test_query_keys_cover_header_spellings():
+    """A credential is no less sensitive for arriving in a query string
+    instead of a header (`?Authorization=Bearer+x` instead of the header) —
+    SENSITIVE_QUERY_KEYS must recognise every spelling SENSITIVE_HEADER_RE
+    does, normalized the same way."""
+    for name in SENSITIVE_HEADER_NAMES:
+        assert name.lower().replace("-", "_") in SENSITIVE_QUERY_KEYS, name
+
+
+def test_query_keys_cover_previously_missing_spellings():
+    """Verified gaps from the last review: these all used to survive
+    redact_url unredacted."""
+    cases = {
+        "https://api.x/p?api-key=REAL": "REAL",
+        "https://api.x/p?x-api-key=REAL": "REAL",
+        "https://api.x/p?sessionid=REAL": "REAL",
+        "https://api.x/p?pwd=REAL": "REAL",
+        "https://api.x/p?passwd=REAL": "REAL",
+        "https://api.x/p?Authorization=Bearer%20REAL": "REAL",
+    }
+    for url, secret in cases.items():
+        out = redact_url(url)
+        assert secret not in out, (url, out)
+        assert REDACTED in out, (url, out)
+
+
+def test_query_key_bare_key_untouched_by_reconciliation():
+    """A8 is a separate, deliberately-contested decision (see DEFERRED.md) —
+    this reconciliation must not have removed or added behaviour around the
+    bare `key` spelling."""
+    assert "key" in SENSITIVE_QUERY_KEYS
+    assert redact_url("https://api.x/p?key=petstore") == (
+        f"https://api.x/p?key={REDACTED}"
+    )
+
+
+def test_redact_body_key_comparison_is_normalized():
+    """Body keys go through the same normalization as query keys now, so a
+    hyphenated key spelling is not a miss."""
+    out = redact_body({"client-secret": "REAL", "fine": "ok"})
+    assert out["client-secret"] == REDACTED
+    assert out["fine"] == "ok"
