@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -124,6 +125,44 @@ def test_readme_documents_exactly_the_emittable_verdicts():
     )
     documented = {v.strip().strip('",') for v in line.split(":", 1)[1].split("|")}
     assert documented == set(cmd_validate.VERDICTS)
+
+
+SUMMARY_RE = re.compile(r"Pass: (\d+)/(\d+), warn: (\d+), fail: (\d+)")
+
+
+def test_summary_string_is_the_shape_the_readme_documents(
+    tmp_path: Path, fixtures_dir: Path, capsys
+):
+    """`summary` is documented alongside `verdict` as a stable v1 contract CI
+    consumers may assert on, and nothing checked it: renaming `Pass: ` to
+    `PASSED: ` broke no test. Read both sides, as the `verdict` test does, so
+    neither the code nor the README can drift alone — and pin what the four
+    numbers count, since a summary whose arithmetic changes is as breaking to a
+    consumer as one whose wording does.
+    """
+    readme = Path(__file__).resolve().parents[1] / "README.md"
+    documented = re.search(r'"summary":\s*"([^"]+)"', readme.read_text())
+    assert documented and SUMMARY_RE.fullmatch(documented.group(1))
+
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    # An unreferenced capture, so the advisory counts are not trivially zero.
+    (ws / "raw" / "extra.json").write_text("{}")
+    cmd_validate.run(_validate_args(str(ws), json_out=True))
+    payload = json.loads(capsys.readouterr().out)
+
+    match = SUMMARY_RE.fullmatch(payload["summary"])
+    assert match, payload["summary"]
+    passed, total, warned, failed = (int(g) for g in match.groups())
+    checks = payload["checks"]
+    soft = [c for c in checks if not c["passed"] and c["severity"] != "error"]
+
+    assert passed == sum(1 for c in checks if c["passed"])
+    assert total == len(checks)
+    assert failed == sum(1 for c in checks if not c["passed"] and c["severity"] == "error")
+    # Both advisory channels are counted together — `checks` entries carrying a
+    # non-error severity, plus every entry of the `warnings` array.
+    assert warned == len(soft) + len(payload["warnings"])
+    assert soft and payload["warnings"], "neither channel should be empty here"
 
 
 def test_json_output_schema(tmp_path: Path, fixtures_dir: Path, capsys):
@@ -335,3 +374,22 @@ def test_validate_never_creates_the_workspace_it_reports_on(tmp_path: Path, caps
     assert not missing.exists()
     assert cmd_validate.run(args) == 1, "a bare retry must not go green"
     assert "manifest.json missing" in capsys.readouterr().out
+
+
+def test_validate_never_creates_the_manifest_it_reports_missing(tmp_path: Path, capsys):
+    """The same guard, on the case the workspace already exists.
+
+    `os.path.exists(manifest_path)` is the predicate, not `exists(workspace)` —
+    a real workspace with no `manifest.json` is the likelier way to hit this
+    than a mistyped path, and it is the one where the self-heal is invisible:
+    the directory was already there, so the only evidence is that the retry
+    stops saying `manifest.json missing`.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    args = _validate_args(str(ws), network=True, allow_host=["example.com"])
+
+    assert cmd_validate.run(args) == 1
+    assert not (ws / "manifest.json").exists()
+    assert cmd_validate.run(args) == 1, "a bare retry must not go green"
+    assert capsys.readouterr().out.count("manifest.json missing") == 2
