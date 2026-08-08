@@ -154,12 +154,21 @@ def run(args) -> int:
         None if todos_ok else f"{todos_in_docs} TODOs in docs.md but only {gap_count} gap_list entries",
     )
 
-    # 5. Every file in raw/ and probes/ is referenced
+    # 5+6. Every file in raw/ and probes/ is referenced, and every local file a
+    # provenance comment references exists. Two questions, one walk: both read
+    # the same two fields of the same entries, so the second
+    # `find_all_provenance(docs_text)` re-parsed the whole document to ask a
+    # different question about an identical list.
     referenced_files: set[str] = set()
+    missing_targets: list[str] = []
     for entry in find_all_provenance(docs_text):
         for field_name in ("raw_file", "fixture"):
-            if field_name in entry.fields:
-                referenced_files.add(entry.fields[field_name])
+            if field_name not in entry.fields:
+                continue
+            ref = entry.fields[field_name]
+            referenced_files.add(ref)
+            if not os.path.exists(os.path.join(workspace, ref)):
+                missing_targets.append(ref)
 
     for sub in ("raw", "probes"):
         d = os.path.join(workspace, sub)
@@ -183,19 +192,16 @@ def run(args) -> int:
                     severity="warn",
                 )
 
-    # 6. Provenance comments' local file paths resolve
-    for entry in find_all_provenance(docs_text):
-        for field_name in ("raw_file", "fixture"):
-            if field_name in entry.fields:
-                rel = entry.fields[field_name]
-                full = os.path.join(workspace, rel)
-                if not os.path.exists(full):
-                    _add_check(
-                        checks,
-                        f"missing_provenance_target_{rel.replace('/', '_')}",
-                        False,
-                        f"provenance references missing file: {rel}",
-                    )
+    # Emitted after the orphan-capture checks, and once per reference rather
+    # than once per file, so merging the two walks left the `checks` list
+    # byte-identical to what the two separate loops produced.
+    for ref in missing_targets:
+        _add_check(
+            checks,
+            f"missing_provenance_target_{ref.replace('/', '_')}",
+            False,
+            f"provenance references missing file: {ref}",
+        )
 
     # 7. manifest.json hash verify
     manifest_path = os.path.join(workspace, "manifest.json")

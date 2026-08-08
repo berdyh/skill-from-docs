@@ -208,6 +208,34 @@ def test_rerunning_consolidate_still_validates(tmp_path: Path, fixtures_dir: Pat
     assert "hash mismatch" not in capsys.readouterr().out
 
 
+def test_orphan_and_missing_target_checks_keep_their_order_and_multiplicity(
+    tmp_path: Path, fixtures_dir: Path, capsys
+):
+    """Checks 5 and 6 read the same provenance fields, so they run as one walk.
+
+    Their emitted output is a stable contract, and the two easy ways to break it
+    while merging are both pinned here: the orphan-capture checks still come
+    first, and a file referenced twice still produces two `missing_provenance_
+    target` entries rather than being collapsed by the `referenced_files` set.
+    """
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    (ws / "raw" / "extra.json").write_text("{}")
+    (ws / "docs.md").write_text(
+        (ws / "docs.md").read_text()
+        + "\n## Extra\n"
+        + "<!-- source: https://a raw_file: raw/gone.json retrieved: 2026-01-01 -->\n"
+        + "<!-- source: https://b raw_file: raw/gone.json retrieved: 2026-01-01 -->\n"
+    )
+
+    cmd_validate.run(_validate_args(str(ws), json_out=True))
+    ids = [c["id"] for c in json.loads(capsys.readouterr().out)["checks"]]
+
+    assert ids.count("missing_provenance_target_raw_gone.json") == 2
+    assert ids.index("orphan_capture_raw_extra.json") < ids.index(
+        "missing_provenance_target_raw_gone.json"
+    )
+
+
 def test_appending_a_run_cannot_hide_an_edit_from_the_report(
     tmp_path: Path, fixtures_dir: Path, capsys
 ):
