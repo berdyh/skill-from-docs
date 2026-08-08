@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 
 from skill_from_docs import cmd_consolidate
+from skill_from_docs._handoff import CANONICAL_SECTIONS
 from skill_from_docs._schema import ProbeFixture
 
 
@@ -510,3 +511,20 @@ def test_spec_is_walked_exactly_once(tmp_path: Path, fixtures_dir: Path, monkeyp
     monkeypatch.setattr(cmd_consolidate, "iter_operations", counting)
     assert cmd_consolidate.run(_args(str(tmp_path), merge_probes=True)) == 0
     assert len(calls) == 1, f"spec traversed {len(calls)} times"
+
+
+def test_canonical_section_headings_are_the_ones_rendered(tmp_path: Path, fixtures_dir: Path):
+    """The canonical H2 list had two copies that spelled
+    "Rate limits, quotas, versioning" differently. Every heading in the one
+    remaining list must be the heading docs.md actually writes, and every
+    checklist name must come back in handoff.coverage_checklist."""
+    (tmp_path / "raw").mkdir()
+    shutil.copy(fixtures_dir / "tiny-openapi-3.json", tmp_path / "raw" / "spec.json")
+    assert cmd_consolidate.run(_args(str(tmp_path))) == 0
+    docs = (tmp_path / "docs.md").read_text().splitlines()
+    handoff = json.loads((tmp_path / "handoff.json").read_text())
+    names = [item["name"] for item in handoff["coverage_checklist"]]
+    for section in CANONICAL_SECTIONS:
+        assert f"## {section.heading}" in docs, section.heading
+        assert section.name in names, section.name
+    assert "## Rate limits, quotas, versioning" in docs
