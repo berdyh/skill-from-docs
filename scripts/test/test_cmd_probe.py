@@ -216,6 +216,39 @@ def test_5xx_exponential_backoff_max_3(tmp_path: Path):
     assert sleeps == [1.0, 2.0, 4.0]
 
 
+def test_transient_network_errors_are_retried(tmp_path: Path):
+    """B2: `probe` is the subcommand most likely to hit a flaky live API and
+    the only one exposing `--max-retries` — and it was the one that did NOT
+    retry network errors, because its local retry loop was forked from
+    `request_with_retry` before that helper grew the behaviour. The fork is
+    gone; this pins what deleting it bought."""
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def h(req):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise httpx.ConnectError("connection reset", request=req)
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(workspace=str(tmp_path), max_retries=3)
+    assert cmd_probe.run(args, transport=_mock(h), sleeper=sleeps.append) == 0
+    assert calls["n"] == 3
+    assert sleeps == [1.0, 2.0]
+
+
+def test_network_errors_still_give_up_after_max_retries(tmp_path: Path):
+    """Retrying is bounded by --max-retries, and exhausting it is exit 2."""
+    sleeps: list[float] = []
+
+    def h(req):
+        raise httpx.ConnectError("connection reset", request=req)
+
+    args = _args(workspace=str(tmp_path), max_retries=2)
+    assert cmd_probe.run(args, transport=_mock(h), sleeper=sleeps.append) == 2
+    assert sleeps == [1.0, 2.0]
+
+
 def test_redirect_blocked_by_default(tmp_path: Path):
     def h(req):
         # Return a 302 with a Location header. With follow_redirects=False
