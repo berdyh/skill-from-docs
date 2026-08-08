@@ -668,6 +668,18 @@ def run(args, *, log=None, transport=None) -> int:
         )
         return 1
 
+    # A10: a non-positive --timeout is a config mistake, and it used to present
+    # as a network one. httpx rejects the value ("Timeout value out of range")
+    # or connects instantly and fails, `_discover` swallowed that per candidate,
+    # and `fetch` reported "could not discover an OpenAPI spec" having issued
+    # nothing. Reject it here where the cause is still visible.
+    if args.timeout <= 0:
+        print(
+            f"ERROR: --timeout must be positive (got {args.timeout}).",
+            file=sys.stderr,
+        )
+        return 1
+
     workspace = args.workspace or default_workspace(args.source)
     os.makedirs(workspace, exist_ok=True)
     os.makedirs(os.path.join(workspace, "raw"), exist_ok=True)

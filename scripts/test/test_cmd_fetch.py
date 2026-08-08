@@ -475,6 +475,28 @@ def test_discovery_probes_do_not_inherit_the_download_timeout(tmp_path: Path):
     assert {t for _u, t in probes} == {cmd_fetch.DISCOVERY_PROBE_TIMEOUT}
 
 
+@pytest.mark.parametrize("bad", [0, 0.0, -1.0])
+def test_non_positive_timeout_is_reported_as_a_config_error(tmp_path: Path, capsys, bad):
+    """A10: `min(--timeout, DISCOVERY_PROBE_TIMEOUT)` forwarded the degenerate
+    value to httpx, which raises before issuing anything, and `_discover`
+    swallowed it once per candidate. All seven probes were skipped and `fetch`
+    reported "could not discover an OpenAPI spec" — a network-shaped message
+    for a config mistake. Reject it where the cause is still visible."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(404, text="")
+
+    args = _make_args(workspace=str(tmp_path), timeout=bad)
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 1
+    err = capsys.readouterr().err
+    assert "--timeout" in err
+    assert "could not discover" not in err
+    # And nothing was attempted: this is rejected before any client is built.
+    assert calls == []
+
+
 def test_a_request_that_cannot_be_issued_is_not_reported_as_a_404(
     tmp_path: Path, capsys
 ):
