@@ -476,3 +476,20 @@ def test_orphan_probe_scan_emits_one_message_per_probe(tmp_path: Path, fixtures_
     assert warns == [
         "WARN: probe GET https://api.example.com/unknown references endpoint outside --tag filter"
     ]
+
+
+def test_empty_narrative_file_is_treated_as_absent(tmp_path: Path, fixtures_dir: Path):
+    """An empty `narrative/example.md` used to render as an empty body plus a
+    provenance comment, because that one section tested `"example" in
+    narratives` while the other five tested the body's truthiness. All nine
+    sections now share one emitter, so an empty file falls back everywhere."""
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "narrative").mkdir()
+    shutil.copy(fixtures_dir / "tiny-openapi-3.json", tmp_path / "raw" / "spec.json")
+    (tmp_path / "narrative" / "example.md").write_text("")
+    (tmp_path / "narrative" / "errors.md").write_text("")
+    assert cmd_consolidate.run(_args(str(tmp_path))) == 0
+    docs = (tmp_path / "docs.md").read_text()
+    assert "<!-- TODO: provide a minimal working example -->" in docs
+    assert "raw_file: narrative/example.md" not in docs
+    assert "raw_file: narrative/errors.md" not in docs

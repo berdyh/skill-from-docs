@@ -242,31 +242,173 @@ def _endpoint_block(
     return lines
 
 
+def _emit_section(lines: list[str], heading: str, body: Iterable[str]) -> None:
+    """Write one `## <heading>` section: the heading, a blank, the body, and
+    exactly one trailing blank line. Nine sections used to repeat this
+    scaffolding by hand, ~100 lines of it.
+
+    Trailing blanks already in `body` are collapsed into that one separator, so
+    a body that naturally ends in a blank (every endpoint block does) does not
+    open a double gap before the next H2.
+    """
+    lines.append(f"## {heading}")
+    lines.append("")
+    body = list(body)
+    while body and body[-1] == "":
+        body.pop()
+    lines.extend(body)
+    lines.append("")
+
+
 def _emit_narrative_section(
     lines: list[str],
+    heading: str,
     narratives: dict[str, str],
     key: str,
-    filename: str,
     retrieved: str,
+    *,
+    missing_todo: str | None = None,
 ) -> None:
-    """H6: write a section body sourced from a narrative file, emitting a
+    """H6: write a section body sourced from `narrative/<key>.md`, emitting a
     `<!-- source: narrative file: ... -->` provenance comment so `validate`
-    accepts the section. Falls back to `_Not documented upstream._` when no
-    narrative exists for the section.
+    accepts the section. Falls back to `_Not documented upstream._` (plus
+    `missing_todo`, if the section has one) when no narrative exists.
     """
     body = narratives.get(key)
     if body:
-        lines.append(body)
+        section = [
+            body,
+            "",
+            emit_source("(narrative)", retrieved=retrieved, raw_file=f"narrative/{key}.md"),
+        ]
+    else:
+        section = ["_Not documented upstream._"]
+        if missing_todo:
+            section.extend(["", missing_todo])
+    _emit_section(lines, heading, section)
+
+
+def _authentication_body(
+    spec: dict[str, Any] | None,
+    source_map: dict[str, Any] | None,
+    narratives: dict[str, str],
+    retrieved: str,
+) -> list[str]:
+    auth_body = narratives.get("authentication")
+    spec_url_for_auth = (source_map or {}).get("spec_url")
+    if auth_body:
+        return [
+            auth_body,
+            "",
+            emit_source(
+                spec_url_for_auth or "(narrative)",
+                retrieved=retrieved,
+                raw_file="narrative/authentication.md",
+            ),
+        ]
+    sec = (spec or {}).get("components", {}).get("securitySchemes", {})
+    if not sec:
+        return ["_Not documented upstream._"]
+    lines: list[str] = []
+    for name, scheme in sec.items():
+        if not isinstance(scheme, dict):
+            continue
+        lines.append(f"- `{name}`: type=`{scheme.get('type')}` scheme=`{scheme.get('scheme')}`")
+    lines.append("")
+    lines.append(
+        emit_source(
+            spec_url_for_auth or "(local spec)",
+            retrieved=retrieved,
+            raw_file="raw/spec.json",
+            spec_pointer="/components/securitySchemes",
+        )
+    )
+    return lines
+
+
+def _api_reference_body(
+    spec: dict[str, Any] | None,
+    source_map: dict[str, Any] | None,
+    spec_path: str | None,
+    probes: ProbeIndex,
+    *,
+    tags_filter: list[str],
+    merge_probes: bool,
+    retrieved: str,
+    warnings: list[str],
+) -> list[str]:
+    if not spec:
+        return ["_No spec available._"]
+
+    spec_url = (source_map or {}).get("spec_url")
+    spec_raw_rel = (
+        os.path.relpath(spec_path, os.path.dirname(os.path.dirname(spec_path)))
+        if spec_path
+        else "raw/spec.json"
+    )
+    by_tag = _group_ops_by_tag(spec)
+    by_tag = _filter_tags(by_tag, tags_filter)
+    spec_paths = [path for ops in by_tag.values() for path, _m, _op in ops]
+    lines: list[str] = []
+
+    if not by_tag:
+        lines.append("_No endpoints match the filter._")
         lines.append("")
+    for tag in sorted(by_tag.keys()):
+        # H8: sanitize tag name before emitting as a heading AND as part
+        # of the spec pointer in the provenance comment. A `\n` in the tag
+        # name would otherwise split the comment across lines.
+        safe_tag = sanitize_text_for_markdown(
+            tag, source_pointer=f"tags/{tag}"
+        )
+        # For pointer use: keep alphanumerics + dash/underscore; replace
+        # anything else with `_`. This keeps the pointer renderable in
+        # a single HTML comment.
+        pointer_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", safe_tag)[:80]
+        lines.append(f"### Tag: {safe_tag}")
+        lines.append("")
+        # H3 tag-level provenance points back to the spec root
         lines.append(
             emit_source(
-                "(narrative)",
+                spec_url or "(local spec)",
                 retrieved=retrieved,
-                raw_file=f"narrative/{filename}",
+                raw_file=spec_raw_rel,
+                spec_pointer=f"/tags/{pointer_tag}",
             )
         )
+        lines.append("")
+        ops = sorted(by_tag[tag], key=lambda t: (t[0], t[1]))
+        for path, method, op in ops:
+            lines.extend(
+                _endpoint_block(
+                    path,
+                    method,
+                    op,
+                    spec_url=spec_url,
+                    retrieved=retrieved,
+                    raw_file=spec_raw_rel,
+                    probes_for_endpoint=probes.for_path(path) if merge_probes else [],
+                )
+            )
+        if merge_probes and not any(probes.has_match(p) for p, _m, _op in ops):
+            lines.append(f"<!-- TODO: no probe captured for tag {tag} -->")
+            lines.append("")
+
+    # One orphan-probe scan. There used to be two, differing only in guard and
+    # message, and they were mutually exclusive on `tags_filter`: a probe that
+    # matches nothing is either outside the requested slice or outside the spec.
+    if tags_filter:
+        orphan_msg: str | None = "references endpoint outside --tag filter"
+    elif merge_probes:
+        orphan_msg = "does not match any spec endpoint"
     else:
-        lines.append("_Not documented upstream._")
+        orphan_msg = None
+    if orphan_msg:
+        for probe, _filename in probes.unmatched(spec_paths):
+            warnings.append(
+                f"probe {probe.request.method} {probe.request.url} {orphan_msg}"
+            )
+    return lines
 
 
 def _build_docs_md(
@@ -290,175 +432,48 @@ def _build_docs_md(
         lines.append(f"- spec_url: {source_map['spec_url']}")
     lines.append("")
 
-    # Coverage status
-    lines.append("## Coverage status")
-    lines.append("")
-    lines.append("- [x] OpenAPI spec parsed" if spec else "- [ ] OpenAPI spec not loaded")
-    lines.append(
-        "- [x] Probes merged" if merge_probes and probes else "- [ ] Probes not merged"
+    _emit_section(
+        lines,
+        "Coverage status",
+        [
+            "- [x] OpenAPI spec parsed" if spec else "- [ ] OpenAPI spec not loaded",
+            "- [x] Probes merged" if merge_probes and probes else "- [ ] Probes not merged",
+        ],
     )
-    lines.append("")
-
-    # Installation
-    lines.append("## Installation")
-    lines.append("")
-    _emit_narrative_section(lines, narratives, "installation", "installation.md", retrieved)
-    lines.append("")
-
-    # Authentication
-    lines.append("## Authentication")
-    lines.append("")
-    auth_body = narratives.get("authentication")
-    spec_url_for_auth = (source_map or {}).get("spec_url")
-    if auth_body:
-        lines.append(auth_body)
-        lines.append("")
-        lines.append(
-            emit_source(
-                spec_url_for_auth or "(narrative)",
-                retrieved=retrieved,
-                raw_file="narrative/authentication.md",
-            )
-        )
-    else:
-        sec = (spec or {}).get("components", {}).get("securitySchemes", {})
-        if sec:
-            for name, scheme in sec.items():
-                if not isinstance(scheme, dict):
-                    continue
-                lines.append(f"- `{name}`: type=`{scheme.get('type')}` scheme=`{scheme.get('scheme')}`")
-            lines.append("")
-            lines.append(
-                emit_source(
-                    spec_url_for_auth or "(local spec)",
-                    retrieved=retrieved,
-                    raw_file="raw/spec.json",
-                    spec_pointer="/components/securitySchemes",
-                )
-            )
-        else:
-            lines.append("_Not documented upstream._")
-    lines.append("")
-
-    # Core concepts
-    lines.append("## Core concepts")
-    lines.append("")
-    _emit_narrative_section(lines, narratives, "core-concepts", "core-concepts.md", retrieved)
-    lines.append("")
-
-    # API reference
-    lines.append("## API reference")
-    lines.append("")
-    if spec:
-        spec_url = (source_map or {}).get("spec_url")
-        spec_raw_rel = (
-            os.path.relpath(spec_path, os.path.dirname(os.path.dirname(spec_path)))
-            if spec_path
-            else "raw/spec.json"
-        )
-        by_tag = _group_ops_by_tag(spec)
-        by_tag = _filter_tags(by_tag, tags_filter)
-
-        spec_paths = [path for ops in by_tag.values() for path, _m, _op in ops]
-
-        if not by_tag:
-            lines.append("_No endpoints match the filter._")
-            lines.append("")
-        for tag in sorted(by_tag.keys()):
-            # H8: sanitize tag name before emitting as a heading AND as part
-            # of the spec pointer in the provenance comment. A `\n` in the tag
-            # name would otherwise split the comment across lines.
-            safe_tag = sanitize_text_for_markdown(
-                tag, source_pointer=f"tags/{tag}"
-            )
-            # For pointer use: keep alphanumerics + dash/underscore; replace
-            # anything else with `_`. This keeps the pointer renderable in
-            # a single HTML comment.
-            pointer_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", safe_tag)[:80]
-            lines.append(f"### Tag: {safe_tag}")
-            lines.append("")
-            # H3 tag-level provenance points back to the spec root
-            lines.append(
-                emit_source(
-                    spec_url or "(local spec)",
-                    retrieved=retrieved,
-                    raw_file=spec_raw_rel,
-                    spec_pointer=f"/tags/{pointer_tag}",
-                )
-            )
-            lines.append("")
-            ops = sorted(by_tag[tag], key=lambda t: (t[0], t[1]))
-            for path, method, op in ops:
-                lines.extend(
-                    _endpoint_block(
-                        path,
-                        method,
-                        op,
-                        spec_url=spec_url,
-                        retrieved=retrieved,
-                        raw_file=spec_raw_rel,
-                        probes_for_endpoint=probes.for_path(path) if merge_probes else [],
-                    )
-                )
-            if merge_probes and not any(probes.has_match(p) for p, _m, _op in ops):
-                lines.append(f"<!-- TODO: no probe captured for tag {tag} -->")
-                lines.append("")
-        # One orphan-probe scan. There used to be two, differing only in guard
-        # and message, and they were mutually exclusive on `tags_filter`: a
-        # probe that matches nothing is either outside the requested slice or
-        # outside the spec. The first also used a counter as a boolean and
-        # never broke out of its inner loop.
-        if tags_filter:
-            orphan_msg: str | None = "references endpoint outside --tag filter"
-        elif merge_probes:
-            orphan_msg = "does not match any spec endpoint"
-        else:
-            orphan_msg = None
-        if orphan_msg:
-            for probe, _filename in probes.unmatched(spec_paths):
-                warnings.append(
-                    f"probe {probe.request.method} {probe.request.url} {orphan_msg}"
-                )
-    else:
-        lines.append("_No spec available._")
-        lines.append("")
-
-    # Minimal working example
-    lines.append("## Minimal working example")
-    lines.append("")
-    if "example" in narratives:
-        lines.append(narratives["example"])
-        lines.append("")
-        lines.append(
-            emit_source(
-                "(narrative)",
-                retrieved=retrieved,
-                raw_file="narrative/example.md",
-            )
-        )
-    else:
-        lines.append("_Not documented upstream._")
-        lines.append("")
-        lines.append("<!-- TODO: provide a minimal working example -->")
-    lines.append("")
-
-    # Errors
-    lines.append("## Errors")
-    lines.append("")
-    _emit_narrative_section(lines, narratives, "errors", "errors.md", retrieved)
-    lines.append("")
-
-    # Rate limits
-    lines.append("## Rate limits, quotas, versioning")
-    lines.append("")
-    _emit_narrative_section(lines, narratives, "rate-limits", "rate-limits.md", retrieved)
-    lines.append("")
-
-    # Gotchas
-    lines.append("## Gotchas")
-    lines.append("")
-    _emit_narrative_section(lines, narratives, "gotchas", "gotchas.md", retrieved)
-    lines.append("")
+    _emit_narrative_section(lines, "Installation", narratives, "installation", retrieved)
+    _emit_section(
+        lines,
+        "Authentication",
+        _authentication_body(spec, source_map, narratives, retrieved),
+    )
+    _emit_narrative_section(lines, "Core concepts", narratives, "core-concepts", retrieved)
+    _emit_section(
+        lines,
+        "API reference",
+        _api_reference_body(
+            spec,
+            source_map,
+            spec_path,
+            probes,
+            tags_filter=tags_filter,
+            merge_probes=merge_probes,
+            retrieved=retrieved,
+            warnings=warnings,
+        ),
+    )
+    _emit_narrative_section(
+        lines,
+        "Minimal working example",
+        narratives,
+        "example",
+        retrieved,
+        missing_todo="<!-- TODO: provide a minimal working example -->",
+    )
+    _emit_narrative_section(lines, "Errors", narratives, "errors", retrieved)
+    _emit_narrative_section(
+        lines, "Rate limits, quotas, versioning", narratives, "rate-limits", retrieved
+    )
+    _emit_narrative_section(lines, "Gotchas", narratives, "gotchas", retrieved)
 
     return "\n".join(lines).rstrip() + "\n"
 
