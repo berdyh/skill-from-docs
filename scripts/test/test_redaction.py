@@ -8,6 +8,7 @@ from urllib.parse import parse_qsl, urlparse
 from skill_from_docs._redaction import (
     DEFAULT_BODY_KEYS,
     REDACTED,
+    SENSITIVE_HEADER_NAMES,
     SENSITIVE_QUERY_KEYS,
     compile_patterns,
     redact_body,
@@ -248,3 +249,118 @@ def test_redact_text_is_idempotent():
     once = redact_text("failed for https://h/p?token=abc")
     assert once == redact_text(once)
     assert once.count(REDACTED) == 1
+
+
+# --- A7: fallback when urlparse raises --------------------------------------
+
+
+def test_redact_url_malformed_url_no_longer_fail_open():
+    """Verified failure: a malformed IPv6 literal makes urlparse raise, and
+    the old `except Exception: return url` handed the credential straight
+    through unchanged. This is the exact repro from DEFERRED.md A7."""
+    out = redact_url("https://[::1/p?token=1")
+    assert out != "https://[::1/p?token=1"
+    assert "token=1" not in out
+    assert REDACTED in out
+
+
+def test_redact_url_fallback_redacts_userinfo():
+    """The fallback must not be a hole around the userinfo redaction that
+    the parseable path already does."""
+    out = redact_url("https://user:s3cr3t@[::1/p?x=1")
+    assert "s3cr3t" not in out
+    assert "user:" not in out
+    assert out.startswith(f"https://{REDACTED}@")
+
+
+def test_redact_url_fallback_redacts_bare_userinfo_token():
+    out = redact_url("https://t0k3n@[::1/p")
+    assert "t0k3n" not in out
+    assert out.startswith(f"https://{REDACTED}@")
+
+
+def test_redact_url_fallback_preserves_benign_malformed_url():
+    """Failing closed (a placeholder) was rejected because it destroys the
+    audit trail for the common case: a malformed URL with no credential in
+    it at all. The fallback must leave a credential-free malformed URL
+    otherwise intact, not replace it wholesale."""
+    src = "https://[::1/p?filter=a/b,c"
+    out = redact_url(src)
+    assert out == src
+
+
+def test_redact_url_fallback_handles_form_encoded_style_query():
+    out = redact_url(
+        "https://[::1/p?client_secret=REAL1&refresh_token=REAL2&page=2"
+    )
+    assert "REAL1" not in out
+    assert "REAL2" not in out
+    assert "page=2" in out
+
+
+def test_redact_url_fallback_is_idempotent():
+    """The parseable path already had this bug once (`token=<redacted>` grew
+    a second sentinel because the regex stopped at `<`). The fallback path
+    must not reintroduce it."""
+    for src in (
+        "https://[::1/p?token=1",
+        "https://user:pass@[::1/p?api_key=abc&page=2",
+        "https://t0k3n@[::1/p?x=1",
+    ):
+        once = redact_url(src)
+        twice = redact_url(once)
+        assert once == twice, (src, once, twice)
+
+
+def test_redact_url_fallback_encoded_key_still_recognised():
+    """Mirrors the parseable path's `?%74oken=x` behaviour."""
+    out = redact_url("https://[::1/p?%74oken=secret")
+    assert "secret" not in out
+    assert REDACTED in out
+
+
+# --- Query-key set reconciliation with SENSITIVE_HEADER_RE ------------------
+
+
+def test_query_keys_cover_header_spellings():
+    """A credential is no less sensitive for arriving in a query string
+    instead of a header (`?Authorization=Bearer+x` instead of the header) —
+    SENSITIVE_QUERY_KEYS must recognise every spelling SENSITIVE_HEADER_RE
+    does, normalized the same way."""
+    for name in SENSITIVE_HEADER_NAMES:
+        assert name.lower().replace("-", "_") in SENSITIVE_QUERY_KEYS, name
+
+
+def test_query_keys_cover_previously_missing_spellings():
+    """Verified gaps from the last review: these all used to survive
+    redact_url unredacted."""
+    cases = {
+        "https://api.x/p?api-key=REAL": "REAL",
+        "https://api.x/p?x-api-key=REAL": "REAL",
+        "https://api.x/p?sessionid=REAL": "REAL",
+        "https://api.x/p?pwd=REAL": "REAL",
+        "https://api.x/p?passwd=REAL": "REAL",
+        "https://api.x/p?Authorization=Bearer%20REAL": "REAL",
+    }
+    for url, secret in cases.items():
+        out = redact_url(url)
+        assert secret not in out, (url, out)
+        assert REDACTED in out, (url, out)
+
+
+def test_query_key_bare_key_untouched_by_reconciliation():
+    """A8 is a separate, deliberately-contested decision (see DEFERRED.md) —
+    this reconciliation must not have removed or added behaviour around the
+    bare `key` spelling."""
+    assert "key" in SENSITIVE_QUERY_KEYS
+    assert redact_url("https://api.x/p?key=petstore") == (
+        f"https://api.x/p?key={REDACTED}"
+    )
+
+
+def test_redact_body_key_comparison_is_normalized():
+    """Body keys go through the same normalization as query keys now, so a
+    hyphenated key spelling is not a miss."""
+    out = redact_body({"client-secret": "REAL", "fine": "ok"})
+    assert out["client-secret"] == REDACTED
+    assert out["fine"] == "ok"
