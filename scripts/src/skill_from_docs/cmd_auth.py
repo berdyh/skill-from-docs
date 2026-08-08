@@ -329,9 +329,17 @@ def _filter_cascade_by_spec(
 
     if declared.any_header and include_query_auth:
         warnings.append(
+            # Do not name an escape-hatch flag here without adding one. This
+            # sentence used to end "Pass --no-prefer-header-automatically if you
+            # really need both", and that flag has never existed — a documented
+            # control that does not exist, emitted straight at the user
+            # (DEFERRED.md failure mode 1). The policy is deliberate: probing
+            # query-string auth when the spec declares a header scheme puts a
+            # credential in a URL that reaches logs, proxies and CDN caches.
             "Spec declares header-based authentication; query-string patterns excluded "
             "from probe cascade despite --include-query-auth (prefer-header-automatically "
-            "policy). Pass --no-prefer-header-automatically if you really need both."
+            "policy). Drop --spec to probe the full cascade, or name the query parameter "
+            "in the spec's securitySchemes if the API really takes one."
         )
 
     filtered = [pattern for pattern in cascade if pattern.keep_when(declared, pattern)]
