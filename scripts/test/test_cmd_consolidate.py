@@ -528,3 +528,26 @@ def test_canonical_section_headings_are_the_ones_rendered(tmp_path: Path, fixtur
         assert f"## {section.heading}" in docs, section.heading
         assert section.name in names, section.name
     assert "## Rate limits, quotas, versioning" in docs
+
+
+def test_suggested_test_cases_skip_non_operation_path_keys(tmp_path: Path):
+    """`_derive_test_cases` hand-rolled its own spec walk and took the first
+    dict-valued key under each path item — a path-level `parameters` object was
+    reported as endpoint `PARAMETERS /x`. It now reads the shared walk."""
+    (tmp_path / "raw").mkdir()
+    spec = {
+        "openapi": "3.0.3",
+        "info": {"title": "Test", "version": "1"},
+        "paths": {
+            "/x": {
+                "parameters": {"name": "id", "in": "path"},
+                "get": {"summary": "Fetch x", "responses": {"200": {"description": "ok"}}},
+            }
+        },
+    }
+    (tmp_path / "raw" / "spec.json").write_text(json.dumps(spec))
+    assert cmd_consolidate.run(_args(str(tmp_path))) == 0
+    handoff = json.loads((tmp_path / "handoff.json").read_text())
+    endpoints = [c["endpoint"] for c in handoff["suggested_test_cases"]]
+    assert "PARAMETERS /x" not in endpoints
+    assert "GET /x" in endpoints

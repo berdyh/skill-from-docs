@@ -126,7 +126,7 @@ def build_handoff(
     coverage_checklist = _derive_coverage_checklist(docs_md_text, spec_url)
 
     # H9: derive 3-5 suggested test cases from spec tags + endpoint summaries.
-    suggested_test_cases = _derive_test_cases(spec, title)
+    suggested_test_cases = _derive_test_cases(walked, title)
 
     # H9: pull user_declared_scope from manifest if a prior probe run recorded
     # a --scope. Otherwise leave empty (harvest agent fills it in).
@@ -225,35 +225,32 @@ def _derive_coverage_checklist(
     return out
 
 
-def _derive_test_cases(
-    spec: dict[str, Any] | None, title: str
-) -> list[dict[str, Any]]:
+def _derive_test_cases(walked: WalkedSpec, title: str) -> list[dict[str, Any]]:
     """H9: derive 3-5 trigger-phrase test cases from the spec. We surface the
     first three endpoint summaries as natural-language phrases plus two
     catch-all phrases (`use {title}`, `integrate with {title}`).
+
+    Reads `walked.operations` rather than re-walking `spec.paths`: the old
+    hand-rolled walk took the first dict-valued key under each path item, which
+    is not necessarily an HTTP method — a path-level `parameters` object was
+    happily reported as endpoint `PARAMETERS /x`.
     """
     cases: list[dict[str, Any]] = []
-    if spec:
-        paths = spec.get("paths") or {}
-        seen = 0
-        for path, methods in paths.items():
-            if seen >= 3:
-                break
-            if not isinstance(methods, dict):
-                continue
-            for method, op in methods.items():
-                if not isinstance(op, dict):
-                    continue
-                summary = op.get("summary") or f"{method.upper()} {path}"
-                cases.append(
-                    {
-                        "trigger_phrase": f"{summary} via {title}",
-                        "endpoint": f"{method.upper()} {path}",
-                        "status": "suggestion",
-                    }
-                )
-                seen += 1
-                break
+    seen_paths: set[str] = set()
+    for path, method, op in walked.operations:
+        if len(cases) >= 3:
+            break
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        summary = op.get("summary") or f"{method.upper()} {path}"
+        cases.append(
+            {
+                "trigger_phrase": f"{summary} via {title}",
+                "endpoint": f"{method.upper()} {path}",
+                "status": "suggestion",
+            }
+        )
     # Always pad with two catch-all phrases so the list is in the 3-5 range.
     cases.append(
         {
