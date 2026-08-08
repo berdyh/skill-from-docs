@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import __version__
+from ._io import write_json
 from ._redaction import redact_url
 
 
@@ -66,11 +67,16 @@ def load_manifest(workspace: str) -> dict[str, Any]:
 
 
 def write_manifest(workspace: str, data: dict[str, Any]) -> None:
+    """Replace `manifest.json` atomically.
+
+    `record_run` reads-modifies-writes this file on every subcommand, so it is
+    the one artifact an interrupt could truncate into a state `verify_hashes`
+    reports as a corrupt workspace. `_io.write_text` swaps it in with
+    `os.replace`, so a reader sees either the previous run's manifest or this
+    one.
+    """
     os.makedirs(workspace, exist_ok=True)
-    path = manifest_path(workspace)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=False)
-        f.write("\n")
+    write_json(manifest_path(workspace), data)
 
 
 def record_run(

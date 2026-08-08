@@ -19,6 +19,7 @@ from typing import Any, Iterable, Iterator
 from urllib.parse import urlparse
 
 from ._handoff import CANONICAL_SECTIONS, build_handoff
+from ._io import write_json, write_text
 from ._manifest import file_entry, now_iso, record_run
 from ._provenance import emit_probe, emit_source
 from ._sanitize import sanitize_spec_descriptions, sanitize_text, sanitize_text_for_markdown
@@ -610,8 +611,12 @@ def run(args) -> int:
         return 0
 
     docs_path = os.path.join(workspace, "docs.md")
-    with open(docs_path, "w", encoding="utf-8") as f:
-        f.write(docs_md)
+    # Atomic for the same reason manifest.json is, even though this one is not
+    # read-modify-write: the manifest entry attesting docs.md's sha256 is
+    # written *after* it, so an interrupt part-way through leaves a truncated
+    # docs.md carrying the previous run's digest, and `validate` calls the
+    # workspace corrupt. It is also the deliverable skill-creator reads.
+    write_text(docs_path, docs_md)
 
     outputs = [file_entry(workspace, docs_path)]
 
@@ -620,9 +625,7 @@ def run(args) -> int:
             workspace, spec, source_map, probes, retrieved, docs_md, walked=walked
         )
         handoff_path = os.path.join(workspace, "handoff.json")
-        with open(handoff_path, "w", encoding="utf-8") as f:
-            json.dump(handoff, f, indent=2)
-            f.write("\n")
+        write_json(handoff_path, handoff)
         outputs.append(file_entry(workspace, handoff_path))
 
     for w in warnings:

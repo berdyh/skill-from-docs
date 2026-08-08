@@ -19,6 +19,7 @@ from ._http import (
     request_with_retry,
     require_allowlist,
 )
+from ._io import write_text
 from ._manifest import file_entry, now_iso, record_run, sha256_bytes
 from ._redaction import redact_url
 from ._schema import FETCH_URL_KEY, write_source_map
@@ -813,11 +814,13 @@ def run(args, *, log=None, transport=None) -> int:
     sha = sha256_bytes(spec_text.encode("utf-8"))
     source_map = _build_source_map(spec, spec_url=spec_url, sha256=sha)
 
-    with open(out_spec, "w", encoding="utf-8") as f:
-        f.write(spec_text)
-    # Not a plain `open(...,"w")`: the source map now carries `fetch_url`, so
-    # this is the one workspace file that can hold a live credential and it is
-    # created 0o600. See `_schema.write_source_map`.
+    # `write_text`, not `write_json`: `spec_text` is the exact string that was
+    # just hashed, and re-serializing here would reintroduce failure mode 5 —
+    # two layers disagreeing about which bytes the digest covers.
+    write_text(out_spec, spec_text)
+    # Not a plain write: the source map now carries `fetch_url`, so this is the
+    # one workspace file that can hold a live credential and it is created
+    # 0o600. See `_schema.write_source_map`.
     write_source_map(out_map, source_map)
 
     finished = now_iso()

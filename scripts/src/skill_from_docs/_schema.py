@@ -17,6 +17,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._io import write_json
 from ._redaction import REDACTED, redact_url
 
 
@@ -176,21 +177,16 @@ def write_source_map(path: str, data: dict[str, Any]) -> None:
     """Write `raw/source-map.json` with mode `0o600`.
 
     The permissions are the point, not housekeeping: `fetch_url` can be a live
-    credential, and before A8 nothing in the workspace was. The mode is set on
-    the descriptor *before* any content is written, so a pre-existing
-    world-readable file (where `O_CREAT`'s mode argument is ignored) never
-    holds the credential at the old permissions, not even between two syscalls.
+    credential, and before A8 nothing in the workspace was. `mode` is passed
+    explicitly because `_io.write_json` writes through a temp file and renames
+    it into place: a fresh temp gets umask permissions, so omitting `mode` here
+    would quietly hand this file out at `0o644`. `_io` applies it to the temp
+    descriptor before the content is written and before the replace, so the
+    credential is never on disk at looser permissions — not even for the window
+    between two syscalls, and not even when a world-readable `source-map.json`
+    is already sitting there.
     """
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, SOURCE_MAP_MODE)
-    fchmod = getattr(os, "fchmod", None)
-    if fchmod is not None:  # not available on Windows
-        fchmod(fd, SOURCE_MAP_MODE)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    write_json(path, data, mode=SOURCE_MAP_MODE)
 
 
 def read_source_map(workspace: str) -> dict[str, Any]:

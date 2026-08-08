@@ -18,6 +18,7 @@ from ._http import (
     request_with_retry,
     require_allowlist,
 )
+from ._io import write_json
 from ._manifest import now_iso, record_run, sha256_file
 from ._redaction import (
     compile_patterns,
@@ -315,10 +316,7 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
     out_path = args.output or os.path.join(
         workspace, "probes", f"{_fixture_slug(args.url, args.method)}.json"
     )
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(fixture.to_dict(), f, indent=2)
-        f.write("\n")
+    write_json(out_path, fixture.to_dict())
 
     finished = now_iso()
     record_run(

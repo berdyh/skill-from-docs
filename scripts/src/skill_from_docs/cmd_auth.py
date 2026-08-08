@@ -18,6 +18,7 @@ from ._http import (
     request_with_retry,
     require_allowlist,
 )
+from ._io import write_json
 from ._manifest import file_entry, now_iso, record_run
 from ._provenance import emit_probe
 from ._redaction import redact_body, redact_headers, redact_text, redact_url
@@ -658,9 +659,7 @@ def run(args, *, transport=None) -> int:
             attempts=attempts,
         ),
     ).to_dict()
-    with open(fixture_path, "w", encoding="utf-8") as f:
-        json.dump(fixture_payload, f, indent=2)
-        f.write("\n")
+    write_json(fixture_path, fixture_payload)
     fixture_rel = os.path.relpath(fixture_path, workspace)
 
     report = {
