@@ -11,6 +11,48 @@ maintainability specialists, adversarial pass) and a four-angle `/simplify` swee
 Effort tags are the reviewers' estimates: **S** ≈ under an hour, **M** ≈ half a day,
 **L** ≈ more.
 
+**Status:** §B8 (dead code) is **done** — see `2fcb700`. Everything else is open.
+
+---
+
+## Recurring failure modes
+
+Read this before adding a security control or a doc. Every item below bit this
+codebase at least twice, and each was found only by execution, never by reading.
+
+**1. A documented control that does not exist.** Six separate cases so far: the
+`manifest.json` `allowed_hosts` array, `--network` "re-fetches every source URL and
+verifies content-type", the `allowed_hosts` enforcement in the case study, a `validate`
+`warn` verdict that cannot occur, a documented offline sequence that exits 3, and a
+"community mirror fallback" discovery step. A doc-lint would have caught none of them
+(§D3) because the drift is always semantic. What works: run the documented commands in a
+test (`test_documented_offline_smoke.py`), and treat a claim about behaviour as unverified
+until something executes it.
+
+**2. Redaction that silently does nothing.** `redact_body` only redacts by key while
+walking a **dict**. Any body left as a string skips key-based redaction entirely — that
+was the JSON request-body leak, then the form-encoded leak, then a padded-base64 blob
+becoming a dict *key* where the pattern pass never looked. Whenever data reaches
+`redact_body`, ask what type it actually is at that point.
+
+**3. Credentials travel further than the call that produced them.** `spec_url` was
+redacted at exactly one of seven read sites. Redact at the point a value enters the
+workspace, not at each place it leaves — one source-level fix closed six leak paths.
+
+**4. `--allow-host ""` is truthy.** argparse `append` turns an unset shell variable into
+`[""]`, and `HostAllowlist` drops empty strings, so a gate testing the raw arg list
+admits an allow-everything allowlist. Always test the constructed object
+(`_http.require_allowlist`). This shipped in three subcommands.
+
+**5. Two hashes of "the same" artifact.** `fetch` hashed the fetched bytes while
+`quick-diff` re-hashed the re-serialised file, so the drift detector cried wolf on every
+run. If two layers compare a digest, they must agree on which bytes.
+
+**6. A fix can be worse than the bug.** Adding `--follow-redirects` to give a no-op flag
+a counterpart introduced a credential-forwarding hole that httpx's own follower did not
+have. Removing the capability was the right fix. Ask what a new option obliges you to
+maintain before adding it.
+
 ---
 
 ## A. Defects — these are bugs, not cleanups
@@ -194,19 +236,22 @@ becomes a membership test and `_classify_winner` a dict lookup.
   realised: `--allow-host` is security-critical and required by four subcommands, but
   only `validate --help` explains it. Parent parsers would propagate the help text.
 
-### B8. Dead code — S
+### B8. Dead code — DONE in `2fcb700`
 
-`cmd_consolidate._section_or_default` (unreferenced), `CANONICAL_H2` (unreferenced; the
-nine names are hardcoded twice more, with different spellings), `_schema.NormalizedSpec`
-(unreferenced), `cmd_quick_diff.PLACEHOLDER_VALUES` (unreferenced; the values are
-inlined), `cmd_auth._try`'s unread `timeout` parameter, `cmd_auth:303`'s `host` silenced
-with `# noqa: F841`, `cmd_validate._section_has_provenance`'s unread `text` parameter,
-`cmd_quick_diff.py:66`'s unreachable `or spec_path == target_path`.
+Removed after verifying zero references for each: `_section_or_default`, `CANONICAL_H2`,
+`NormalizedSpec`, `PLACEHOLDER_VALUES`, `_try`'s `timeout` parameter, `cmd_auth`'s
+`# noqa: F841` local, `_section_has_provenance`'s `text` parameter, `_spec_pointer`'s
+no-op branch, and `quick_diff`'s redundant `or spec_path == target_path`.
 
-`test/conftest.py` is 61 lines of which 45 are dead: `tmp_workspace`, `hcloud_workspace`,
-`make_mock_transport`, `mock_transport` have **zero** references, while
-`test_cmd_fetch._transport` and `test_staleness._make_client` hand-roll the same
-routes-dict → `MockTransport` that `make_mock_transport` already implements.
+`test/conftest.py` had 45 unreferenced lines while two test modules hand-rolled the
+transport helper it already provided. `hcloud_workspace` was wired up rather than deleted
+— its fixture corpus backs the offline sequence `probing-tools.md` documents, which is
+now executed by `test_documented_offline_smoke.py`.
+
+**Still open from this area:** `CANONICAL_H2`'s deletion removed the third copy of the
+section-name list, but two copies remain (`_build_docs_md` and
+`_derive_coverage_checklist`, which spell "Rate limits, quotas, versioning" differently).
+Unifying them is part of **B3**.
 
 ---
 
