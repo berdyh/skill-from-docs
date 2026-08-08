@@ -11,8 +11,9 @@ maintainability specialists, adversarial pass) and a four-angle `/simplify` swee
 Effort tags are the reviewers' estimates: **S** ≈ under an hour, **M** ≈ half a day,
 **L** ≈ more.
 
-**Status:** §A (all six defects), §B1 (the duplicated spec walk) and §B8 (dead code) are
-**done** — see §F. §B2–B7, §C, §E are open. §D is decided, not pending.
+**Status:** §A1–A6, §B1 (the duplicated spec walk) and §B8 (dead code) are **done** — see
+§F. §A7–A12 (raised reviewing the A1–A6 fixes), §B2–B7, §C and §E are open. §D is
+decided, not pending.
 
 ---
 
@@ -56,13 +57,86 @@ maintain before adding it.
 
 ---
 
-## A. Defects — all six closed
+## A. Defects
 
 A1 through A6 were the observable bugs on this list. All six are fixed; the record of
 what each one was and how it was resolved moved to **§F**, so this section stays a
 pointer rather than a second copy that can drift from it.
 
-Nothing in §A is outstanding. A new defect goes here as A7.
+A7 through A12 are new, raised by the review of the §A fixes and **not fixed** — each
+says why. Six other findings from that same review were fixed on the spot; those are in
+§F too.
+
+### A7. `redact_url` returns the URL verbatim when `urlparse` raises — S
+
+`_redaction.py:81`'s `except Exception: return url` is fail-open. Verified:
+`redact_url("https://[::1/p?token=1")` returns the input unchanged, because a malformed
+IPv6 literal makes `urlparse` raise.
+
+Pre-existing, but `redact_text` widened the blast radius: it now feeds arbitrary
+regex-matched substrings of exception text into `redact_url`, and exception text is
+exactly where malformed URLs live.
+
+Fix wants a decision, which is why it is not done here: failing closed means returning a
+placeholder and losing the URL entirely, which damages the audit trail for the common
+case (a genuinely malformed URL with no credential in it) to protect the rare one. A
+regex `key=value` pass over the raw string is the middle option.
+
+### A8. `key` in `SENSITIVE_QUERY_KEYS` destroys benign provenance URLs — S, contested
+
+`redact_url("https://api.example.com/spec.json?key=petstore")` yields `key=<redacted>`.
+That string is what lands in `raw/source-map.json`, every `<!-- source: -->` comment, and
+`handoff.json` — so the audit trail records a URL that cannot be re-fetched, and
+`validate --network` will try to GET it and report a failure.
+
+Left as-is deliberately: `?key=<apikey>` is at least as common as `?key=<resource-name>`,
+and the failure mode of the other choice is a leaked credential in a file that leaves the
+machine. Recorded because the cost is real and someone will hit it. The principled fix is
+to record the fetchable URL separately from the display URL, which is a schema change.
+
+### A9. `verify_hashes` can be satisfied by appending a run — S
+
+Newest-hash-per-path (the A4 fix) means tamper detection is now "the file matches the
+newest claim", not "the file matches every claim ever made". Editing `docs.md` and
+appending a run entry recording the new digest passes; before A4, the superseded entry
+still mismatched and `validate` flagged it.
+
+Both attacks require write access to `manifest.json`, which sits in the directory it
+attests to, so the delta is small. But `validate` is the documented handoff gate and the
+`_manifest` docstring's "complete append-only audit trail" is now true of the file
+without being enforced by any check. Cheapest real fix: keep newest-wins for the verdict,
+and additionally report superseded-digest mismatches as a `warn`.
+
+### A10. `--timeout 0` (or negative) silently skips every discovery probe — S
+
+`min(args.timeout, DISCOVERY_PROBE_TIMEOUT)` forwards the degenerate value straight to
+httpx, which raises `ValueError: Timeout value out of range` — and `_discover`'s
+`except Exception: continue` swallows it. All seven common-path probes are skipped and
+`fetch` reports "could not discover an OpenAPI spec" instead of a config error.
+`--timeout 0` behaves the same way via an immediate `ConnectError`.
+
+Fix: reject non-positive `--timeout` at the parser, and let the probe loop tell "this
+candidate 404'd" apart from "the request could not be issued at all" (that second half
+is **B5**).
+
+### A11. `spec_sha256` no longer identifies the upstream document — S, doc-only
+
+PR #4 changed `fetch` to hash the bytes it writes rather than the bytes it fetched, which
+is what stopped `quick-diff` crying wolf on every run. Correct fix, but the recorded
+digest changed meaning: it now differs between `--no-resolve` and the default for the
+same download, and every workspace fetched with an older version carries a body-hash that
+will report false spec drift until re-fetched.
+
+`references/probing-tools.md:28` and `case-study-hetzner-openapi.md:330` still describe it
+as "the spec sha256 at capture time". Either record both digests or fix the prose.
+
+### A12. Three audit/contract behaviours have no test — S
+
+Deleting each of these leaves the suite green: the `record_run` call on
+`validate --network`; the per-run `allow_host` audit record in `cmd_fetch` and `cmd_auth`
+(only `cmd_probe`'s is tested); and the `summary` string's shape, which `README.md`
+documents as a stable v1 contract CI consumers assert on — renaming `Pass: ` to `PASSED: `
+breaks nothing.
 
 ---
 
@@ -328,7 +402,32 @@ needed the architecture change §D had rejected.
 | A5 | `fetch` took 210s to fail against a host that blackholes: 7 speculative spec paths × the full `--timeout` | `DISCOVERY_PROBE_TIMEOUT = 5.0` caps the guesses via a new per-request `timeout` on `request_with_retry`; the URL the user actually named keeps the full budget. ~35s worst case. Concurrency stayed rejected |
 | A6 | `HostAllowlist.check` and `__contains__` read "empty" oppositely, and `host in allowlist` looked like `check` while meaning the reverse | `__contains__` became `lists_host()`, with the asymmetry and the reason for each half written into the class docstring. Deliberately not spelled `in` any more — that was the whole trap |
 
-Two things were fixed alongside, because A3 made them reachable rather than theoretical:
+### Defects the A1–A6 fixes introduced or exposed — all six fixed in the same PR
+
+A security / testing / adversarial review of the A1–A6 commits. Listed because two of
+them were regressions the fixes themselves caused, which is the pattern §Recurring #6
+warns about, and one was a test that pinned nothing.
+
+| Finding | Resolution |
+|---|---|
+| **A2's verdict rework flipped every local-file harvest from `pass` to `warn`.** `archetype4_warn_spec_url` fires whenever `spec_url` is absent, which is always for `fetch ./spec.json`, and the rework let the `warnings` array move the non-strict verdict. Verified: a clean workspace reported `Pass: 14/14, warn: 2, fail: 0 → warn`, while README's own smoke example prints `verdict: pass` | The `warnings` array is display-and-`--strict` only again; the verdict comes from `checks` severity. `warn` is still reachable via the orphan-capture check, which is the point of A2. Pinned by `test_local_file_harvest_still_verdicts_pass` |
+| **`validate --network` healed the thing it was checking.** `record_run` writes through `write_manifest`, which `os.makedirs` the workspace. A first run failed `manifest_exists` and created a manifest, so a bare retry of a red CI step went green with nothing fixed; `validate --network /typo` also created `/typo` | Recording is guarded on the manifest already existing. `validate` reports on a workspace, it does not build one |
+| **`test_rerunning_consolidate_still_validates` passed with A4 reverted.** consolidate is byte-deterministic, so two runs over an unchanged spec record the *same* digest twice and the pre-fix code never sees a superseded hash | The test now edits the spec between runs. Confirmed failing against reverted source before re-landing |
+| **`redact_url` never touched userinfo.** `https://user:pass@host/spec.json` passes the allowlist — `urlparse().hostname` strips userinfo — and the credential reached `source-map.json`, every `<!-- source: -->` comment, `handoff.json`, and every fixture's `spec_url_at_capture`. Failure mode #3, one layer further out than the `spec_url` query-string fix | `redact_url` rewrites the netloc as `<redacted>@host[:port]` |
+| **`iter_operations` crashed on a non-string path key.** YAML mapping keys need not be strings, so `paths: {1: {get: ...}}` reached `json_pointer`'s `path.replace(...)` and raised AttributeError — replacing the numeric exit-code contract with a traceback. The new module's own docstring promised callers "only well-formed operations" | Guarded alongside the existing method check |
+| **`file_entry` double-joined a relative workspace.** `consolidate myws` looked for `myws/myws/docs.md` and died with FileNotFoundError *after* docs.md was written. Pre-existing; the README rewrite had been working around it with an absolute path | Both sides resolve against the cwd first |
+
+Two smaller ones, same review: `redact_text` was not idempotent (`token=<redacted>` grew a
+second sentinel, because the regex stopped at `<`), and `redact_url` percent-encoded every
+non-sensitive value, so `?filter=a/b,c` was recorded as `?filter=a%2Fb%2Cc` — a provenance
+URL byte-different from the one actually fetched. Both fixed; the escape set now covers
+only the characters that could split one parameter into two.
+
+Six further findings from the same review were **not** fixed — they are §A7–A12.
+
+---
+
+Two things were fixed alongside A3, because it made them reachable rather than theoretical:
 
 - A failed `--include-query-auth` attempt recorded its exception message, which can quote
   the URL the token was in. `_redaction.redact_text` now redacts URLs found inside free
