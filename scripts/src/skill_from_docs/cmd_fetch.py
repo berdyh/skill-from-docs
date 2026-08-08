@@ -18,7 +18,10 @@ from ._http import (
     build_client,
     request_with_retry,
     require_allowlist,
+    require_positive_timeout,
 )
+from . import _cli
+from ._io import write_text
 from ._manifest import file_entry, now_iso, record_run, sha256_bytes
 from ._redaction import redact_url
 from ._schema import FETCH_URL_KEY, write_source_map
@@ -114,13 +117,18 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "fetch",
         help="discover + parse an OpenAPI spec",
         description="Fetch an OpenAPI spec from a URL, local path, or stdin (@-).",
+        parents=[
+            _cli.allow_host(),
+            _cli.timeout(default=30.0),
+            _cli.workspace_flag(),
+            _cli.quiet(),
+        ],
     )
     p.add_argument("source")
     p.add_argument("-o", "--output-spec")
     p.add_argument("--output-source-map")
     p.add_argument("--no-resolve", action="store_true")
     p.add_argument("--user-agent")
-    p.add_argument("--timeout", type=float, default=30.0)
     p.add_argument("--staleness-days", type=int, default=90)
     p.add_argument(
         "--staleness-api-host",
@@ -135,9 +143,6 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "gitea = /api/v1/repos/.../commits; bitbucket = /2.0/repositories/.../commits.",
     )
     p.add_argument("--count-endpoints", action="store_true")
-    p.add_argument("--allow-host", action="append", default=[])
-    p.add_argument("--workspace")
-    p.add_argument("-q", "--quiet", action="store_true")
     p.set_defaults(func=run)
 
 
@@ -680,16 +685,9 @@ def run(args, *, log=None, transport=None) -> int:
         )
         return 1
 
-    # A10: a non-positive --timeout is a config mistake, and it used to present
-    # as a network one. httpx rejects the value ("Timeout value out of range")
-    # or connects instantly and fails, `_discover` swallowed that per candidate,
-    # and `fetch` reported "could not discover an OpenAPI spec" having issued
-    # nothing. Reject it here where the cause is still visible.
-    if args.timeout <= 0:
-        print(
-            f"ERROR: --timeout must be positive (got {args.timeout}).",
-            file=sys.stderr,
-        )
+    # A10. See `_http.require_positive_timeout` for why this is here rather than
+    # an argparse `type=`.
+    if not require_positive_timeout(args.timeout, subcommand="fetch"):
         return 1
 
     workspace = args.workspace or default_workspace(args.source)
@@ -813,11 +811,13 @@ def run(args, *, log=None, transport=None) -> int:
     sha = sha256_bytes(spec_text.encode("utf-8"))
     source_map = _build_source_map(spec, spec_url=spec_url, sha256=sha)
 
-    with open(out_spec, "w", encoding="utf-8") as f:
-        f.write(spec_text)
-    # Not a plain `open(...,"w")`: the source map now carries `fetch_url`, so
-    # this is the one workspace file that can hold a live credential and it is
-    # created 0o600. See `_schema.write_source_map`.
+    # `write_text`, not `write_json`: `spec_text` is the exact string that was
+    # just hashed, and re-serializing here would reintroduce failure mode 5 —
+    # two layers disagreeing about which bytes the digest covers.
+    write_text(out_spec, spec_text)
+    # Not a plain write: the source map now carries `fetch_url`, so this is the
+    # one workspace file that can hold a live credential and it is created
+    # 0o600. See `_schema.write_source_map`.
     write_source_map(out_map, source_map)
 
     finished = now_iso()

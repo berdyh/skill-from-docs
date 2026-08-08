@@ -327,6 +327,36 @@ def require_allowlist(hosts, *, subcommand: str, context: str | None = None) -> 
     return None
 
 
+def require_positive_timeout(timeout, *, subcommand: str) -> bool:
+    """False (having explained why) if `--timeout` is zero or negative.
+
+    A non-positive timeout is a configuration mistake, but every subcommand
+    presented it as something else. In `fetch` (A10) httpx raised "Timeout value
+    out of range", `_discover`'s per-candidate `except` swallowed it, and the
+    user was told no OpenAPI spec could be discovered — after zero requests were
+    issued. `auth`, `probe` and `validate --network` are less severe only
+    because they surface it as a network error (exit 2); the cause is equally
+    invisible and the fix is the same.
+
+    Callers return **1**, not 2: nothing was attempted, so this is user error.
+
+    Deliberately not an argparse `type=`. That exits 2 — colliding with the
+    network exit code this exists to stop being confused with — and it would
+    only run for arguments that came through the parser. Tests and the sequences
+    in SKILL.md call `run()` with a hand-built `Namespace`, which never touches
+    argparse, so a `type=` guard would leave exactly the entry point the
+    documented workflows use unprotected.
+    """
+    if timeout is None or timeout <= 0:
+        print(
+            f"ERROR: --timeout must be positive (got {timeout}); "
+            f"{subcommand} issues no requests at all with a non-positive timeout.",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def _parse_retry_after(value: str) -> float:
     try:
         return max(0.0, float(value))

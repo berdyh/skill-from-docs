@@ -11,13 +11,15 @@ from collections.abc import Callable
 from typing import Any, NamedTuple
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
-from . import __version__
+from . import __version__, _cli
 from ._http import (
     AllowlistViolation,
     build_client,
     request_with_retry,
     require_allowlist,
+    require_positive_timeout,
 )
+from ._io import write_json
 from ._manifest import file_entry, now_iso, record_run
 from ._provenance import emit_probe
 from ._redaction import redact_body, redact_headers, redact_text, redact_url
@@ -33,6 +35,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "auth",
         help="confirm working auth pattern",
         description="Probe an endpoint with a cascade of auth patterns to find one that returns 200.",
+        parents=[
+            _cli.allow_host(),
+            _cli.no_follow_redirects(),
+            _cli.timeout(default=10.0),
+            _cli.workspace_flag(),
+            _cli.quiet(),
+        ],
     )
     p.add_argument("endpoint")
     p.add_argument("--token", required=True)
@@ -51,19 +60,6 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "the spec's declared securitySchemes (header-based preferred automatically).",
     )
     p.add_argument("--bad-token-pattern", default=FIXED_BAD_TOKEN)
-    p.add_argument("--allow-host", action="append", default=[])
-    # Redirects are never followed; see cmd_probe for the reasoning. Accepted
-    # for compatibility, states the guarantee rather than toggling it.
-    p.add_argument(
-        "--no-follow-redirects",
-        dest="follow_redirects",
-        action="store_false",
-        default=False,
-        help="accepted for compatibility; redirects are never followed",
-    )
-    p.add_argument("--timeout", type=float, default=10.0)
-    p.add_argument("--workspace")
-    p.add_argument("-q", "--quiet", action="store_true")
     p.set_defaults(func=run)
 
 
@@ -514,6 +510,9 @@ def run(args, *, transport=None) -> int:
     if allowlist is None:
         return 1
 
+    if not require_positive_timeout(args.timeout, subcommand="auth"):
+        return 1
+
     try:
         allowlist.check(args.endpoint)
     except AllowlistViolation as exc:
@@ -658,9 +657,7 @@ def run(args, *, transport=None) -> int:
             attempts=attempts,
         ),
     ).to_dict()
-    with open(fixture_path, "w", encoding="utf-8") as f:
-        json.dump(fixture_payload, f, indent=2)
-        f.write("\n")
+    write_json(fixture_path, fixture_payload)
     fixture_rel = os.path.relpath(fixture_path, workspace)
 
     report = {

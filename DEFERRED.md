@@ -11,9 +11,9 @@ maintainability specialists, adversarial pass) and a four-angle `/simplify` swee
 Effort tags are the reviewers' estimates: **S** ≈ under an hour, **M** ≈ half a day,
 **L** ≈ more.
 
-**Status:** §A1–A6, §A8, §B1 (the duplicated spec walk) and §B8 (dead code) are **done** —
-see §F. §A7 and §A9–A12 (raised reviewing the A1–A6 fixes), §B2–B7, §C and §E are open.
-§D is decided, not pending.
+**Status:** §A1–A6, §A8, §A10, §B1 (the duplicated spec walk) and §B8 (dead code) are
+**done** — see §F. §B7 is done except for its two `cmd_consolidate` bullets. §A7,
+§A9, §A11–A12, §B2–B6, §C and §E are open. §D is decided, not pending.
 
 ---
 
@@ -103,17 +103,27 @@ attests to, so the delta is small. But `validate` is the documented handoff gate
 without being enforced by any check. Cheapest real fix: keep newest-wins for the verdict,
 and additionally report superseded-digest mismatches as a `warn`.
 
-### A10. `--timeout 0` (or negative) silently skips every discovery probe — S
+### A10. `--timeout 0` (or negative) silently skips every discovery probe — DONE
 
-`min(args.timeout, DISCOVERY_PROBE_TIMEOUT)` forwards the degenerate value straight to
+`min(args.timeout, DISCOVERY_PROBE_TIMEOUT)` forwarded the degenerate value straight to
 httpx, which raises `ValueError: Timeout value out of range` — and `_discover`'s
-`except Exception: continue` swallows it. All seven common-path probes are skipped and
-`fetch` reports "could not discover an OpenAPI spec" instead of a config error.
-`--timeout 0` behaves the same way via an immediate `ConnectError`.
+`except Exception: continue` swallowed it. All seven common-path probes were skipped and
+`fetch` reported "could not discover an OpenAPI spec" instead of a config error.
 
-Fix: reject non-positive `--timeout` at the parser, and let the probe loop tell "this
-candidate 404'd" apart from "the request could not be issued at all" (that second half
-is **B5**).
+Closed in two steps. `5cefc79` fixed `fetch`; the entry above then sat stale, which is
+why this note exists. The second step made the guard shared
+(`_http.require_positive_timeout`) and applied it to `auth` and `probe`, which had the
+same bug at exit **2** — the retry-me code — after burning the full 1s/2s/4s backoff on
+a request that could never be issued. `quick-diff` was listed here as a third affected
+subcommand; it has no `--timeout` and is offline. `validate --network` hardcodes 10.0.
+
+Two things the original write-up got wrong. "Reject it at the parser" is the wrong
+place: an argparse `type=` exits 2 — colliding with the network code this exists to
+disambiguate — and it only fires for arguments that came through argparse, while the
+tests and the SKILL.md sequences call `run()` with a hand-built `Namespace`. The guard
+lives in `run()` and returns 1. And the split from **B5** ("tell a 404 apart from a
+request that was never issued") landed separately in `617ecff`; the two halves are
+independent.
 
 ### A11. `spec_sha256` no longer identifies the upstream document — S, doc-only
 
@@ -226,16 +236,26 @@ becomes a membership test and `_classify_winner` a dict lookup.
 - **Nine section emitters** (`cmd_consolidate.py:282-455`) with ~100 lines of identical
   `## Title` / body / blank scaffolding. "Minimal working example" is 17 lines that
   differ from the shared helper by one appended TODO comment.
-- **`cmd_auth` reimplements `emit_probe`** as an f-string reproducing its output
-  byte-for-byte (`cmd_auth.py:309-313`).
-- **No `write_json` helper, and no atomic write anywhere** — the same three-line
-  `open/json.dump/write("\n")` appears six times. `manifest.json` is read-modify-write,
-  so an interrupt mid-write truncates the audit trail and `verify_hashes` then reports
-  the workspace corrupt. A `tmp + os.replace` helper buys crash-safety for free.
-- **Argparse boilerplate** — `--allow-host`, `--workspace`, `-q`, `--timeout`,
-  `--no-follow-redirects` repeated across six parsers. The user-visible cost is already
-  realised: `--allow-host` is security-critical and required by four subcommands, but
-  only `validate --help` explains it. Parent parsers would propagate the help text.
+- **`cmd_auth` reimplements `emit_probe`** — DONE. `_format_markdown` calls
+  `_provenance.emit_probe`, and the test asserts the two produce the same line rather
+  than asserting a literal.
+- **No `write_json` helper, and no atomic write anywhere** — DONE. `_io.write_text` /
+  `_io.write_json` do `tmp + os.replace`, and all six JSON writes plus `docs.md` route
+  through them. Two things the write-up did not anticipate, both now enforced by tests:
+  `raw/source-map.json` is `0o600` and a naive tmp+replace **widens it to `0o644`**
+  (`assert 420 == 384`), so the mode has to be applied to the temp descriptor before the
+  rename; and `raw/spec.json` must go through `write_text` on the already-serialised
+  string, because `write_json` would re-serialise bytes that `quick-diff` re-hashes
+  (failure mode 5). `docs.md` was added for the same reason `manifest.json` qualified —
+  the manifest entry attesting its digest is written *after* it.
+- **Argparse boilerplate** — DONE. `_cli` declares each shared flag once and every
+  subcommand takes it via `parents=`. Two corrections to the write-up: the flags span
+  four parsers at most, not six (`--timeout` three, `--no-follow-redirects` two), and
+  `quick-diff` takes none of them. `_cli` hands out a **fresh** parser per call because
+  `parents=` copies actions by reference — one shared instance would fuse `auth`'s
+  10s `--timeout` default with `fetch`'s 30s. `test_cli_parsers.py` transcribes the
+  accepted-option set of all six subcommands so the next edit here cannot quietly add or
+  drop a flag.
 
 ### B8. Dead code — DONE in `2fcb700`
 

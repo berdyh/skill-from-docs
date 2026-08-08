@@ -11,13 +11,15 @@ import time
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
-from . import __version__
+from . import __version__, _cli
 from ._http import (
     AllowlistViolation,
     build_client,
     request_with_retry,
     require_allowlist,
+    require_positive_timeout,
 )
+from ._io import write_json
 from ._manifest import now_iso, record_run, sha256_file
 from ._redaction import (
     compile_patterns,
@@ -43,6 +45,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "probe",
         help="capture one live response",
         description="Capture a single HTTP request/response pair as a redacted JSON fixture.",
+        parents=[
+            _cli.allow_host(),
+            _cli.no_follow_redirects(),
+            _cli.timeout(default=30.0),
+            _cli.workspace_flag(),
+            _cli.quiet(),
+        ],
     )
     p.add_argument("url")
     p.add_argument("-X", "--method", default="GET")
@@ -53,26 +62,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--no-redact", action="store_true")
     p.add_argument("--redact-body-key", action="append", default=[])
     p.add_argument("--redact-body-pattern", action="append", default=[])
-    p.add_argument("--allow-host", action="append", default=[])
     p.add_argument("--max-retries", type=int, default=3)
-    # Redirects are never followed. A 30x to an attacker host is the canonical
-    # token-leak path, and following one safely means reproducing httpx's
-    # cross-origin credential stripping on top of the allowlist check — two
-    # subtle guards to maintain for a capability nothing here needs. The
-    # `Location` header is captured (redacted) instead. `--no-follow-redirects`
-    # stays accepted so existing invocations keep working; it states the
-    # guarantee rather than toggling anything.
-    p.add_argument(
-        "--no-follow-redirects",
-        dest="follow_redirects",
-        action="store_false",
-        default=False,
-        help="accepted for compatibility; redirects are never followed",
-    )
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--timeout", type=float, default=30.0)
-    p.add_argument("--workspace")
-    p.add_argument("-q", "--quiet", action="store_true")
     p.set_defaults(func=run)
 
 
@@ -180,6 +171,9 @@ def _load_spec_meta(workspace: str) -> tuple[str | None, str | None]:
 def run(args, *, transport=None, sleeper=time.sleep) -> int:
     allowlist = require_allowlist(args.allow_host, subcommand="probe")
     if allowlist is None:
+        return 1
+
+    if not require_positive_timeout(args.timeout, subcommand="probe"):
         return 1
 
     try:
@@ -315,10 +309,7 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
     out_path = args.output or os.path.join(
         workspace, "probes", f"{_fixture_slug(args.url, args.method)}.json"
     )
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(fixture.to_dict(), f, indent=2)
-        f.write("\n")
+    write_json(out_path, fixture.to_dict())
 
     finished = now_iso()
     record_run(
