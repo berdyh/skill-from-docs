@@ -156,12 +156,24 @@ def _check_coverage_checklist_sources(
         if source.get("url")
     }
     for item in checklist:
-        if isinstance(item, dict) and item.get("source") and item["source"] not in provenance_urls:
-            _warn(
-                warnings,
-                "coverage_checklist_unknown_source",
-                f"coverage_checklist references unknown source: {item['source']}",
-            )
+        if not isinstance(item, dict):
+            continue
+        # `consolidate` writes `sources` (a list of URL strings). This read said
+        # `source`, singular, so the check never fired on any workspace this tool
+        # has ever produced — the same shape of defect as the unreachable `warn`
+        # verdict (§A2). Tolerate the singular spelling too rather than assume no
+        # hand-written handoff.json uses it.
+        raw = item.get("sources")
+        sources = raw if isinstance(raw, list) else [raw] if raw else []
+        if not sources and item.get("source"):
+            sources = [item["source"]]
+        for source in sources:
+            if isinstance(source, str) and source not in provenance_urls:
+                _warn(
+                    warnings,
+                    "coverage_checklist_unknown_source",
+                    f"coverage_checklist references unknown source: {source}",
+                )
 
 
 def _check_network(

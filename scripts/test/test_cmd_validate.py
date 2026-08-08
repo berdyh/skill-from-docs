@@ -711,3 +711,36 @@ def test_network_skips_when_the_two_recorded_urls_disagree(
     skipped = [c for c in payload["checks"] if c["id"].startswith("network_skipped_")]
     assert len(skipped) == 1 and skipped[0]["passed"] is True
     assert "does not describe" in skipped[0]["message"]
+
+
+def test_coverage_checklist_unknown_source_actually_fires(
+    tmp_path: Path, fixtures_dir: Path, capsys
+):
+    """Check 10 read `item["source"]`; `consolidate` writes `sources`, a list.
+
+    So the check never fired on any workspace this tool has produced — a claim
+    of coverage nothing backs was exactly what it existed to catch, and it was
+    inert. Same shape as the unreachable `warn` verdict (A2): a documented check
+    that cannot fire. Pin both spellings so the plural cannot silently rot back.
+    """
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    handoff = json.loads((ws / "handoff.json").read_text())
+    handoff["coverage_checklist"] = [
+        {"name": "Plural", "status": "covered", "sources": ["https://nobody.example/a"]},
+        {"name": "Singular", "status": "covered", "source": "https://nobody.example/b"},
+    ]
+    (ws / "handoff.json").write_text(json.dumps(handoff))
+
+    args = _validate_args(str(ws), json_out=True)
+    cmd_validate.run(args)
+    payload = json.loads(capsys.readouterr().out)
+
+    unknown = [w for w in payload["warnings"] if w["id"] == "coverage_checklist_unknown_source"]
+    assert len(unknown) == 2, payload["warnings"]
+    assert any("nobody.example/a" in w["message"] for w in unknown)
+    assert any("nobody.example/b" in w["message"] for w in unknown)
+
+    # Advisory only: it lives in `warnings`, never in `checks`, so it cannot
+    # move the non-strict verdict. (The `fail` this workspace does report comes
+    # from the manifest digest, because the test rewrote handoff.json.)
+    assert not [c for c in payload["checks"] if c["id"] == "coverage_checklist_unknown_source"]
