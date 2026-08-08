@@ -34,6 +34,28 @@ Requires Python 3.10+.
 | `consolidate` | walk a workspace and emit `docs.md` (canonical H2s, per-tag H3s) and `handoff.json` | last step before handoff to `skill-creator` |
 | `validate` | local-by-default completion check (hashes, provenance, archetype-4 signals); supports `--strict` and `--json` for CI | gate the handoff |
 
+An **endpoint** is one operation: a path item keyed by one of the eight HTTP
+methods OpenAPI defines, `trace` included. `fetch --count-endpoints`,
+`raw/source-map.json`, `docs.md` and `handoff.json`'s `endpoint_count` all count
+the same set — one workspace, one number.
+
+`auth` writes its cascade into the fixture manifest at
+`probes/auth-<host>-<status>.json`: `winner_pattern` (the pattern that returned
+200), `bad_token_status` (what a deliberately invalid token returned), and
+`attempts` (every pattern tried, with its status). Consumers should read these
+through `_schema.ProbeFixture.from_dict` rather than off the raw JSON.
+
+Re-running a subcommand over an existing workspace is safe. `manifest.json` is
+append-only, and `validate` hash-checks each path against the most recent run
+that wrote it.
+
+## Timeouts
+
+`--timeout` (default 30s) governs the URL you actually name. When that URL turns
+out not to be a spec, `fetch` guesses seven common spec paths against the origin;
+those guesses are capped at 5s each, so a host that blackholes packets fails
+discovery in about 35s rather than 210s.
+
 ## Error contract
 
 | Exit | Meaning | Example |

@@ -11,7 +11,8 @@ maintainability specialists, adversarial pass) and a four-angle `/simplify` swee
 Effort tags are the reviewers' estimates: **S** ≈ under an hour, **M** ≈ half a day,
 **L** ≈ more.
 
-**Status:** §B8 (dead code) is **done** — see `2fcb700`. Everything else is open.
+**Status:** §A (all six defects), §B1 (the duplicated spec walk) and §B8 (dead code) are
+**done** — see §F. §B2–B7, §C, §E are open. §D is decided, not pending.
 
 ---
 
@@ -55,96 +56,26 @@ maintain before adding it.
 
 ---
 
-## A. Defects — these are bugs, not cleanups
+## A. Defects — all six closed
 
-Listed first because they change behaviour a user can observe. None is fixed. All were
-confirmed by reading code; the two marked *(measured)* were reproduced by execution.
+A1 through A6 were the observable bugs on this list. All six are fixed; the record of
+what each one was and how it was resolved moved to **§F**, so this section stays a
+pointer rather than a second copy that can drift from it.
 
-### A1. `trace` operations produce two contradictory endpoint counts — S
-
-`cmd_fetch._build_source_map:265` and `cmd_fetch._count_endpoints:303` include `trace`
-in the HTTP-method whitelist. `cmd_consolidate._group_ops_by_tag:110` and
-`_build_handoff:503` omit it.
-
-For a spec containing a TRACE operation, `openapi-harvest fetch --count-endpoints`
-prints N while `handoff.json → content_shape_signals.endpoint_count` reports N−1, the
-operation appears in `raw/source-map.json` but gets no section in `docs.md`. One
-workspace, two answers. Any future method addition has to be made in four places.
-
-Fix travels with **B1** (a shared `iter_operations`), which is why it is deferred rather
-than patched in place.
-
-### A2. `validate`'s `warn` verdict is unreachable, and it is a documented contract — S
-
-`cmd_validate._add_check` defaults `severity="error"` and **no call site overrides it**
-(17 sites checked). So in the non-strict branch every entry in `failed` has
-`severity == "error"`, making `not any(...)` always false: the `warn` verdict at
-`cmd_validate.py:317` cannot be produced. `if verdict == "warn" and args.strict` is
-doubly dead — `warn` requires *not* strict.
-
-`scripts/README.md` documents `"verdict": "pass | warn | fail"` as a **stable v1 schema
-that CI consumers may assert on**. Consumers are coding against a state the tool cannot
-emit.
-
-Pick one: delete `severity` and the warn branch (verdict becomes binary, update the
-README), or make the genuinely non-fatal checks pass `severity="warn"` — the
-orphan-capture check and the archetype-4 optional-signal checks are the candidates.
-Today it is half of each.
-
-### A3. `cmd_auth` writes three fixture fields that nothing can read — S/M
-
-`cmd_auth.py:505-535` hand-builds the fixture dict instead of using
-`ProbeFixture.to_dict()`, and adds `winner_pattern`, `bad_token_status`, `attempts`.
-`ProbeFixture.from_dict` does not know those keys, and `cmd_consolidate._load_probes` —
-the only reader — goes through `from_dict`. **The entire auth-cascade record is written
-to disk and silently dropped on read.**
-
-That is genuinely useful signal for the generated skill (which patterns were tried, what
-each returned). Decide: promote the three into `ProbeManifest`, or give auth its own
-`AuthFixture` type in `_schema`, or drop them deliberately. The status quo — written,
-unreadable — is the one option that is not defensible.
-
-### A4. Re-running `consolidate` makes `validate` fail — S *(measured)*
-
-`_manifest.record_run` appends a new run with a fresh hash for the same path each time.
-`verify_hashes` walks **every** recorded run, so after a second `consolidate` the first
-run's now-superseded `docs.md` hash mismatches and `validate` reports
-`hash mismatch: docs.md` — once per superseded run.
-
-Re-running consolidate is a normal thing to do. Verify against the newest recorded hash
-per path, not every historical one.
-
-### A5. `fetch` has a 210-second worst case on an unresponsive host — S
-
-`cmd_fetch.py:354-367` tries seven candidate spec paths sequentially, each with the full
-`--timeout` (default 30 s). Against a host that blackholes rather than refuses, discovery
-takes 7 × 30 s before reporting failure. Speculative probes should not inherit the
-spec-download timeout: `min(args.timeout, 5.0)` bounds the tail at 35 s.
-
-Concurrency was considered and **rejected** — it fires seven requests at a stranger's
-origin to save under a second on a command whose next act is downloading a multi-MB spec.
-
-### A6. `HostAllowlist` has opposite empty-set semantics on two methods — S
-
-`check()` on an empty allowlist permits everything; `__contains__` rejects everything
-(`_http.py:44-54`). `_collect_external_ref_violations` uses `__contains__`, so
-`fetch ./local-spec.json` with an `$ref: https://example.com/x` is a violation even
-though no allowlist was requested. That is fail-closed and probably intended — but two
-opposite readings of "empty" on one class is the shape of a future bug. At minimum a
-comment; better, name the methods so the asymmetry is visible.
+Nothing in §A is outstanding. A new defect goes here as A7.
 
 ---
 
 ## B. Simplification opportunities
 
-### B1. The spec-operation walk is duplicated four times and has already drifted — M
+### B1. The spec-operation walk is duplicated four times — DONE
 
-`cmd_fetch.py:265`, `cmd_fetch.py:303`, `cmd_consolidate.py:110`, `cmd_consolidate.py:503`
-are the same nested `paths → {path: {method: op}}` walk with the same
-skip-non-dict / filter-by-method-tuple logic. The tuple has already forked (**A1**).
+Was: the same nested `paths → {path: {method: op}}` walk in `cmd_fetch` (×2) and
+`cmd_consolidate` (×2), with the method tuple already forked — see **A1** in §F.
 
-Add `_spec.py` with `iter_operations(spec) -> Iterator[tuple[str, str, dict]]` owning the
-method whitelist; rewrite all four on it. Decide `trace` once.
+Now `_spec.iter_operations` owns the walk and the whitelist, and all four call sites go
+through it. `trace` is included. Both JSON-Pointer builders collapsed into
+`_spec.json_pointer` at the same time.
 
 ### B2. `cmd_probe._retry_with_policy` is a strictly worse fork of `_http.request_with_retry` — S
 
@@ -169,10 +100,11 @@ treats docs.md as opaque — `_derive_coverage_checklist` re-parses the markdown
 just handed. A real boundary.
 
 But moving 280 of 840 lines to `_handoff.py` is just moving lines. What makes it pay is
-what the split forces you to notice: the spec is walked three times per run
-(`:338`, `:516`, and a third hand-rolled walk at `:496-509`). Build a `WalkedSpec` value
-once in `run()`, pass it to both builders; then `_handoff.py` imports one thing and
-`cmd_consolidate` drops to ~450 lines with a single traversal.
+what the split forces you to notice: the spec is still walked three times per run — twice
+via `_group_ops_by_tag` and once for the endpoint/tag counts in `_build_handoff`. **B1**
+made those three walks share one implementation; it did not make them one walk. Build a
+`WalkedSpec` value once in `run()`, pass it to both builders; then `_handoff.py` imports
+one thing and `cmd_consolidate` drops to ~450 lines with a single traversal.
 
 **Do the split only as part of that.**
 
@@ -355,11 +287,12 @@ writes `probes/auth-<host>-<status>.json`. Docs name probe fixtures
 **Documented sequences that fail.** `probing-tools.md:5` says every subcommand takes an
 optional positional `WORKSPACE`; only `consolidate` and `validate` do, and they default to
 `os.getcwd()`, so the bare `consolidate` / `validate` in composition examples 1, 2 and 4
-exit 1 or 3 after a `fetch`. `probing-tools.md:197`'s
-`cp scripts/test/fixtures/hcloud-offline/* <ws>/` exits 3 — the fixtures are flat and
-`_load_spec` reads `raw/spec.json`. The next line claims "CI exercises this sequence on
-every PR"; CI runs pytest, whose conftest builds the workspace correctly. **The documented
-sequence is not the tested sequence.**
+exit 1 or 3 after a `fetch`. **Still open.**
+
+*(Resolved: the flat `cp scripts/test/fixtures/hcloud-offline/* <ws>/` that exited 3, and
+the neighbouring "CI exercises this sequence on every PR" claim that nothing backed.
+`test_documented_offline_smoke.py` and the `cli-contract` CI job now run the sequence as
+written, so it fails loudly if it rots again.)*
 
 **Wrong behaviour descriptions.** `--network` is documented as re-fetching *every*
 `<!-- source: -->` URL and verifying content-type; it fetches exactly one URL and checks
@@ -379,6 +312,32 @@ exits **2**, which the same table maps to "network error". The case study says
 ---
 
 ## F. Resolved — history
+
+### §A defects — all six closed
+
+Filed as "documented but unfixed" during the PR #4 sweep, then fixed in the same PR once
+the two that needed a product decision got one. Effort tags held: five were S, none
+needed the architecture change §D had rejected.
+
+| ID | Defect | Resolution |
+|---|---|---|
+| A1 | `trace` operations produced two contradictory endpoint counts — the op reached `raw/source-map.json` but got no `docs.md` section | Fixed with **B1**: `_spec.iter_operations` owns the walk and the method whitelist, `trace` included. The four call sites cannot disagree because there is one list. `test_spec_walk.py` pins fetch's count against `handoff.json`'s rather than against a literal |
+| A2 | `validate`'s `warn` verdict was unreachable while `scripts/README.md` documented `pass \| warn \| fail` as a stable contract | Kept the contract, made `warn` reachable: the orphan-capture check now carries `severity="warn"`, and the advisory `warnings` list feeds the verdict instead of being ignored outside `--strict`. `warn` exits 0; `--strict` promotes it to `fail` and exits 1. The doubly-dead `verdict == "warn" and args.strict` branch is gone |
+| A3 | `cmd_auth` wrote `winner_pattern`, `bad_token_status`, `attempts` into a hand-built fixture dict that `ProbeFixture.from_dict` — the only reader's only entry point — could not read | Promoted all three into `ProbeManifest`, and `cmd_auth` now builds through `ProbeFixture(...).to_dict()` so a field it invents cannot again be a field nothing reads. The test asserts through `from_dict`, not against the raw JSON |
+| A4 | Re-running `consolidate` made `validate` fail: `verify_hashes` walked every recorded run, so the first run's superseded `docs.md` digest mismatched | `verify_hashes` checks each path against the **newest** run that wrote it. `manifest.json` stays append-only — this was only ever about which entry claims to describe the file on disk |
+| A5 | `fetch` took 210s to fail against a host that blackholes: 7 speculative spec paths × the full `--timeout` | `DISCOVERY_PROBE_TIMEOUT = 5.0` caps the guesses via a new per-request `timeout` on `request_with_retry`; the URL the user actually named keeps the full budget. ~35s worst case. Concurrency stayed rejected |
+| A6 | `HostAllowlist.check` and `__contains__` read "empty" oppositely, and `host in allowlist` looked like `check` while meaning the reverse | `__contains__` became `lists_host()`, with the asymmetry and the reason for each half written into the class docstring. Deliberately not spelled `in` any more — that was the whole trap |
+
+Two things were fixed alongside, because A3 made them reachable rather than theoretical:
+
+- A failed `--include-query-auth` attempt recorded its exception message, which can quote
+  the URL the token was in. `_redaction.redact_text` now redacts URLs found inside free
+  text — failure mode #3 again, one step further out.
+- CI gained a `cli-contract` job: it installs the package, runs the README's documented
+  `consolidate` + `validate --json` sequence through the real binary, and asserts the
+  documented keys and verdict from outside the package. The `warn` verdict shipped
+  documented-but-impossible for a release; pytest could not have caught that, because
+  pytest asserts what the code does.
 
 Kept so a future scan does not re-report these as new, and so the "already fixed before
 the report landed" cases are not re-investigated.
