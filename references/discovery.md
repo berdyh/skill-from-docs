@@ -84,11 +84,12 @@ When the docs page is a JS-based viewer that renders an OpenAPI spec, the render
 
 Regex priority matters. **Scalar's `data-url` is checked before any generic `spec-url` lookup** — Scalar's tag uses a different attribute, and a permissive `spec-url` regex over view-source would otherwise miss it. **RapiDoc and ReDoc both use `spec-url`**, so try them after the unambiguous matches (Stoplight's `apiDescriptionUrl`, Scalar's `data-url`, Swagger UI's `url:` inside a bundle call). Without that ordering, a permissive regex picks the wrong renderer's URL on pages that embed more than one viewer or that have inert sample markup elsewhere on the page.
 
-The cascade `openapi-harvest fetch` runs:
-1. Direct fetch of the SOURCE URL.
-2. Common spec paths (`/openapi.json`, `/openapi.yaml`, `/swagger.json`, `/v3/api-docs`, `/api-docs`, `/api/v1/openapi.json`, `/spec.json`).
-3. Renderer-config regex over view-source for the entry URL, in the priority order above.
-4. Community mirror lookup (manual; the tool surfaces the failure mode and the user supplies the mirror URL).
+The cascade `openapi-harvest fetch` runs, in this order:
+1. **Direct fetch of the SOURCE URL.** If it answers with JSON or YAML, that is the spec and the cascade stops.
+2. **Renderer-config regex over that same response's view-source**, in the priority order above, followed by a GET of whatever URL it names. This is step 2, not step 3: the renderer attempt is part of handling the page the user actually pointed at, so it runs before any guessing.
+3. **Common spec paths against the origin** (`/openapi.json`, `/openapi.yaml`, `/swagger.json`, `/v3/api-docs`, `/api-docs`, `/api/v1/openapi.json`, `/spec.json`) — guesses at paths nobody named, so they are tried last, one at a time, capped at 5s each and locked to the origin host.
+
+There is no fourth step. If all three fail, `fetch` exits 1 with `could not discover an OpenAPI spec from <url>`, and finding a community mirror is a judgement call *you* make and then re-run `fetch` against — the tool does not search for one.
 
 Once a spec URL is identified, parse the spec — never the rendered viewer.
 
