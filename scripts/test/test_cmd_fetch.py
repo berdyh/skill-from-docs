@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import stat
 from pathlib import Path
 
 import httpx
@@ -424,16 +425,64 @@ def test_source_map_json_pointers_correct(tmp_path: Path):
 def test_spec_url_credentials_are_redacted_at_the_source(tmp_path: Path):
     """The spec URL is copied into source-map.json, every `<!-- source: -->`
     comment in docs.md, handoff.json, and every probe fixture. Redacting it
-    once here closes all of those paths at the same time."""
-    source_map = cmd_fetch._build_source_map(
-        {"paths": {}},
-        spec_url="https://specs.example.com/openapi.json?api_key=SUPERSECRET&page=2",
-        sha256="abc",
-    )
-    assert "SUPERSECRET" not in json.dumps(source_map)
+    once here closes all of those paths at the same time.
+
+    A8 added a second spelling, `fetch_url`, holding the URL verbatim so the
+    audit trail names something re-fetchable. This asserts the boundary rather
+    than "the credential is absent": `fetch_url` is the *only* key that may
+    carry it.
+    """
+    raw = "https://specs.example.com/openapi.json?api_key=SUPERSECRET&page=2"
+    source_map = cmd_fetch._build_source_map({"paths": {}}, spec_url=raw, sha256="abc")
+
     assert source_map["spec_url"] == (
         "https://specs.example.com/openapi.json?api_key=<redacted>&page=2"
     )
+    assert source_map["fetch_url"] == raw
+
+    others = {k: v for k, v in source_map.items() if k != "fetch_url"}
+    assert "SUPERSECRET" not in json.dumps(others)
+
+
+def test_local_file_harvest_records_no_fetch_url(tmp_path: Path, fixtures_dir: Path):
+    """There is no URL to re-fetch for `fetch ./spec.json`, so the credential-
+    bearing key must simply be absent rather than present-and-null."""
+    spec_path = tmp_path / "in.json"
+    spec_path.write_text((fixtures_dir / "tiny-openapi-3.json").read_text())
+    ws = tmp_path / "ws"
+    assert cmd_fetch.run(_make_args(source=str(spec_path), workspace=str(ws))) == 0
+
+    source_map = json.loads((ws / "raw" / "source-map.json").read_text())
+    assert "fetch_url" not in source_map
+    assert source_map["spec_url"] is None
+
+
+def test_source_map_is_written_owner_readable_only(tmp_path: Path):
+    """A8 put a live credential in a file that never held one before, so the
+    file is created 0o600 — and stays 0o600 when `fetch` overwrites a
+    world-readable source map left by an older run, where `O_CREAT`'s mode
+    argument is ignored."""
+    spec = {"openapi": "3.0.0", "info": {"title": "t"}, "paths": {}}
+    fetch_source = "https://api.example.com/openapi.json?key=petstore"
+    transport = _transport(
+        {
+            fetch_source: httpx.Response(
+                200,
+                content=json.dumps(spec).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+        }
+    )
+    ws = tmp_path / "ws"
+    args = _make_args(source=fetch_source, workspace=str(ws), allow_host=["api.example.com"])
+    assert cmd_fetch.run(args, transport=transport) == 0
+
+    map_path = ws / "raw" / "source-map.json"
+    assert stat.S_IMODE(map_path.stat().st_mode) == 0o600
+
+    map_path.chmod(0o644)
+    assert cmd_fetch.run(args, transport=transport) == 0
+    assert stat.S_IMODE(map_path.stat().st_mode) == 0o600
 
 
 def test_recorded_spec_hash_matches_the_written_file(tmp_path: Path, fixtures_dir: Path):

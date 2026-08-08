@@ -21,6 +21,7 @@ from ._http import (
 )
 from ._manifest import file_entry, now_iso, record_run, sha256_bytes
 from ._redaction import redact_url
+from ._schema import FETCH_URL_KEY, write_source_map
 from ._slug import default_workspace
 from ._spec import count_operations, iter_operations, json_pointer
 
@@ -268,7 +269,7 @@ def _build_source_map(spec: dict[str, Any], *, spec_url: str | None, sha256: str
             "original_pointer": json_pointer(path, method),
             "tags": op.get("tags", []),
         }
-    return {
+    out: dict[str, Any] = {
         # Redact HERE, not at each reader. This value is copied into
         # source-map.json, every `<!-- source: -->` comment in docs.md,
         # handoff.json's spec_url / provenance_index / coverage_checklist, and
@@ -276,11 +277,22 @@ def _build_source_map(spec: dict[str, Any], *, spec_url: str | None, sha256: str
         # `?api_key=` reached all of them; only cmd_quick_diff happened to
         # redact on read. One redaction at the source closes every path.
         "spec_url": redact_url(spec_url) if spec_url else spec_url,
-        "spec_sha256": sha256,
-        "fetched_at": now_iso(),
-        "format": _detect_format(spec),
-        "operations": operations,
     }
+    if spec_url:
+        # A8: the display URL above is not always re-fetchable. `key` is a
+        # sensitive query key, so a benign `?key=petstore` is recorded as
+        # `?key=<redacted>` — an audit trail naming a URL nobody can GET, and a
+        # `validate --network` failure that is not real. Record the verbatim URL
+        # alongside it. This is the one field in the workspace that can hold a
+        # live credential; `_schema` owns the file for that reason, keeps this
+        # key out of `read_source_map`, and writes 0o600. Absent for a
+        # local-file harvest, where there is no URL to record.
+        out[FETCH_URL_KEY] = spec_url
+    out["spec_sha256"] = sha256
+    out["fetched_at"] = now_iso()
+    out["format"] = _detect_format(spec)
+    out["operations"] = operations
+    return out
 
 
 def _detect_format(spec: dict[str, Any]) -> str:
@@ -803,9 +815,10 @@ def run(args, *, log=None, transport=None) -> int:
 
     with open(out_spec, "w", encoding="utf-8") as f:
         f.write(spec_text)
-    with open(out_map, "w", encoding="utf-8") as f:
-        json.dump(source_map, f, indent=2)
-        f.write("\n")
+    # Not a plain `open(...,"w")`: the source map now carries `fetch_url`, so
+    # this is the one workspace file that can hold a live credential and it is
+    # created 0o600. See `_schema.write_source_map`.
+    write_source_map(out_map, source_map)
 
     finished = now_iso()
     record_run(
