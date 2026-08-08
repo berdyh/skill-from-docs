@@ -375,3 +375,55 @@ exits **2**, which the same table maps to "network error". The case study says
 
 **Undocumented surface.** 26 flags have zero mentions in any doc, including
 `--output-spec`, `--user-agent`, `--workspace`, `--redact-body-key`, `--short-circuit`.
+
+---
+
+## F. Resolved — history
+
+Kept so a future scan does not re-report these as new, and so the "already fixed before
+the report landed" cases are not re-investigated.
+
+### `ISSUES-2026-05-16.md` scan report — all 9 closed
+
+The report was written against `feat-archetype-4-openapi@adbbb6b`; by the time it was
+worked, `origin/main` had moved to `127ed8f` and three findings were already fixed. That
+gap is the reason every finding below was re-verified against the current tree before any
+code was touched — worth repeating for the next scan.
+
+| ID | Finding | Outcome |
+|---|---|---|
+| HIGH-1 | `--no-resolve` skipped `$ref` validation | Fixed, PR #3 — validator split into collect-all so the caller picks severity; fatal on the resolve path, warning under `--no-resolve` |
+| HIGH-2 | Dead `last_exc` capture in the retry loop | Fixed, PR #3 — removed; retry accounting verified correct, no latent bug behind it |
+| MEDIUM-1 | 19 ruff findings | Fixed, PR #3 (17 by then) — plus a pinned `ruff` CI job so it stays fixed |
+| MEDIUM-2 | CI matrix stopped at 3.12 | Fixed, PR #3 — 3.10 through 3.14 |
+| MEDIUM-3 | `__pycache__` not ignored | Already resolved before the report was worked |
+| LOW-1 | `ad-hoc` probe scope undocumented | Already resolved — documented in `probing-tools.md` |
+| LOW-2 | No `sys.version_info` gate | Already resolved — `openapi_harvest.main` exits 5 |
+| LOW-3 | README install drift | Fixed, PR #3 — the archetype-4 `pip install -e` step is spelled out |
+| LOW-4 | `handoff.json` shape not machine-checkable | Fixed, PR #3 — as `_schema.lint_handoff`, **not** the proposed dataclass; a `from_dict` in the house style defaults every missing key and raises on nothing, so it would have checked less than the `.get()` chains it replaced |
+
+### Defects the scan report missed, found while fixing it
+
+All fixed in PR #3 or #4. Listed because they outnumber the report's own findings, and
+the most severe one outranked both of its HIGHs.
+
+- Probe request bodies bypassed key-based redaction entirely — JSON, then form-encoded,
+  then padded base64 landing in a dict key. Secrets written verbatim to fixtures under the
+  **default** policy.
+- `spec_url` carrying `?api_key=` reached `docs.md` and `handoff.json` — the two artifacts
+  that leave the machine.
+- `SENSITIVE_QUERY_KEYS` had drifted from `DEFAULT_BODY_KEYS`, missing `client_secret`,
+  `refresh_token`, `client_assertion`, `private_key`, `session`.
+- `redact_url` corrupted the URLs it recorded (`?q=one%26two` → `?q=one&two`, one
+  parameter becoming two), and the damage compounded across `probe` → `quick-diff`.
+- `--allow-host` gates tested the raw argparse list, so `--allow-host ""` admitted an
+  allow-everything allowlist. Three subcommands.
+- `validate --network` fetched a URL read from `handoff.json` with no allowlist at all.
+- An off-allowlist renderer URL was swallowed by a broad `except Exception`, making the
+  exit-1 path unreachable and the error message misleading.
+- `quick-diff` reported phantom `spec_revision` drift on every run.
+- `--no-follow-redirects` was a no-op; the counterpart added to fix that introduced a
+  credential-forwarding hole, and the capability was removed instead.
+- `Proxy-Authorization` was missing from the sensitive-header set.
+- The CI case-study guard protected a `references/` file but only triggered on
+  `scripts/**`.
