@@ -39,6 +39,44 @@ jobs:
       - run: pip install ruff==0.15.13
       - run: ruff check scripts/src scripts/test
 
+  # scripts/README.md calls `validate --json` a stable v1 contract that CI
+  # consumers may assert on. This job IS such a consumer: it runs the documented
+  # commands through the installed CLI and asserts the contract from outside the
+  # package, which is what the pytest suite cannot do. The `warn` verdict was
+  # documented for a release while no input could produce it; the point of
+  # running the real binary is that a claim about behaviour stays unverified
+  # until something executes it.
+  cli-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install -e ./scripts
+      - name: Seed the workspace the README documents
+        run: |
+          mkdir -p ws/raw ws/probes
+          cp scripts/test/fixtures/hcloud-offline/spec.json \
+             scripts/test/fixtures/hcloud-offline/source-map.json ws/raw/
+          cp scripts/test/fixtures/hcloud-offline/*-200.json ws/probes/
+      - name: consolidate + validate --json, then assert the contract
+        run: |
+          openapi-harvest consolidate ws --merge-probes
+          openapi-harvest validate ws --json > verdict.json
+          python - <<'PY'
+          import json, sys
+          from skill_from_docs.cmd_validate import VERDICTS
+          payload = json.load(open("verdict.json"))
+          missing = {"workspace", "verdict", "checks", "warnings", "summary", "checked_at"} - set(payload)
+          assert not missing, f"validate --json dropped documented keys: {sorted(missing)}"
+          assert payload["verdict"] in VERDICTS, payload["verdict"]
+          assert payload["verdict"] == "pass", payload["summary"]
+          PY
+      - name: re-running consolidate must not invalidate the workspace
+        run: |
+          openapi-harvest consolidate ws --merge-probes
+          openapi-harvest validate ws --strict
+
   docs-guard:
     runs-on: ubuntu-latest
     steps:

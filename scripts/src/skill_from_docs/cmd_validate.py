@@ -13,6 +13,12 @@ from ._provenance import find_all_provenance
 from ._schema import lint_handoff
 
 
+# The `verdict` values `validate --json` can emit. scripts/README.md documents
+# this as a stable v1 contract CI consumers may assert on, so the two must not
+# drift — `test_cmd_validate.py` asserts the README lists exactly these.
+VERDICTS: tuple[str, ...] = ("pass", "warn", "fail")
+
+
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "validate",
@@ -165,11 +171,16 @@ def run(args) -> int:
                 # source-map.json + manifest-y files don't need provenance refs
                 if name in ("source-map.json",):
                     continue
+                # Non-fatal: an unreferenced capture means the harvest left a
+                # file behind, not that the workspace is unusable. It is the
+                # canonical `warn` — worth surfacing, worth failing under
+                # --strict, not worth blocking a handoff over.
                 _add_check(
                     checks,
                     f"orphan_capture_{rel.replace('/', '_')}",
                     False,
                     f"file {rel} is not referenced by any provenance comment",
+                    severity="warn",
                 )
 
     # 6. Provenance comments' local file paths resolve
@@ -307,19 +318,23 @@ def run(args) -> int:
         except RuntimeError:
             pass
 
-    # Compute verdict
-    failed = [c for c in checks if not c["passed"]]
+    # Compute verdict. Two channels feed it: failing `checks`, which carry a
+    # severity, and `warnings`, which are advisory by construction.
+    errors = [c for c in checks if not c["passed"] and c["severity"] == "error"]
+    soft = [c for c in checks if not c["passed"] and c["severity"] != "error"] + warnings
     if args.strict:
-        # Promote warnings to errors
-        for w in warnings:
-            failed.append(w)
-    verdict = "pass" if not failed else "fail"
-    if failed and not args.strict and not any(c["severity"] == "error" for c in failed):
+        # --strict promotes every advisory finding to a blocking one.
+        verdict = "fail" if (errors or soft) else "pass"
+    elif errors:
+        verdict = "fail"
+    elif soft:
         verdict = "warn"
+    else:
+        verdict = "pass"
 
     summary = (
         f"Pass: {sum(1 for c in checks if c['passed'])}/{len(checks)}, "
-        f"warn: {len(warnings)}, fail: {sum(1 for c in checks if not c['passed'])}"
+        f"warn: {len(soft)}, fail: {len(errors)}"
     )
 
     # Only --network touches the network, and it is the one subcommand whose
@@ -357,14 +372,15 @@ def run(args) -> int:
         print(f"verdict:   {verdict}")
         print(summary)
         for c in checks:
-            mark = "OK  " if c["passed"] else "FAIL"
+            if c["passed"]:
+                mark = "OK  "
+            else:
+                mark = "FAIL" if c["severity"] == "error" else "WARN"
             extra = f" — {c['message']}" if c.get("message") else ""
             print(f"  {mark} {c['id']}{extra}")
         for w in warnings:
             print(f"  WARN {w['id']} — {w.get('message')}")
 
-    if verdict == "fail":
-        return 1
-    if verdict == "warn" and args.strict:
-        return 1
-    return 0
+    # `warn` is advisory: exit 0 so a pipeline keeps going. `--strict` is how
+    # you make it blocking, and it does that by producing `fail` above.
+    return 1 if verdict == "fail" else 0

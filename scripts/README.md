@@ -105,6 +105,16 @@ state. Document only — no lock implementation in v1.
 
 Stable v1. CI consumers may assert on `verdict` and `summary`.
 
+**Verdicts.** `fail` means a check with `severity: "error"` did not pass — the
+workspace is not ready to hand off, exit 1. `warn` means only advisory findings
+turned up (an unreferenced capture, a missing optional archetype-4 signal); exit
+is still 0 so a pipeline keeps going. `pass` means neither. `--strict` promotes
+every advisory finding to a blocking one, so under `--strict` the same workspace
+reports `fail` and exits 1 — that is how you make warnings gate a pipeline.
+
+`scripts/test/test_cmd_validate.py` reads this file and asserts the three values
+above are exactly the ones the code can emit, so the list cannot drift again.
+
 ## Smoke test (offline)
 
 ```bash

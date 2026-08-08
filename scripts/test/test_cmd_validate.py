@@ -86,12 +86,43 @@ def test_orphan_TODO_in_docs(tmp_path: Path, fixtures_dir: Path):
     assert rc == 1
 
 
-def test_orphan_raw_file_fails(tmp_path: Path, fixtures_dir: Path):
+def test_orphan_raw_file_warns(tmp_path: Path, fixtures_dir: Path, capsys):
+    """An unreferenced capture is advisory: verdict `warn`, exit 0.
+
+    This is the check that makes `warn` reachable at all — before it carried a
+    severity, every check was `error` and the documented `warn` verdict could
+    not be produced by any input.
+    """
     ws = _seed_workspace(tmp_path, fixtures_dir)
     # Drop an extra raw file that isn't referenced by any provenance comment.
     (ws / "raw" / "extra.json").write_text("{}")
-    rc = cmd_validate.run(_validate_args(str(ws)))
+    rc = cmd_validate.run(_validate_args(str(ws), json_out=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verdict"] == "warn"
+    assert any(c["id"].startswith("orphan_capture") for c in payload["checks"])
+
+
+def test_orphan_raw_file_fails_under_strict(tmp_path: Path, fixtures_dir: Path, capsys):
+    """--strict is how you make an advisory finding blocking."""
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    (ws / "raw" / "extra.json").write_text("{}")
+    rc = cmd_validate.run(_validate_args(str(ws), strict=True, json_out=True))
     assert rc == 1
+    assert json.loads(capsys.readouterr().out)["verdict"] == "fail"
+
+
+def test_readme_documents_exactly_the_emittable_verdicts():
+    """scripts/README.md calls `verdict` a stable v1 contract CI consumers may
+    assert on. It documented `pass | warn | fail` while the code could only ever
+    emit two of the three. Read both sides so they cannot drift again.
+    """
+    readme = Path(__file__).resolve().parents[1] / "README.md"
+    line = next(
+        line for line in readme.read_text().splitlines() if '"verdict"' in line
+    )
+    documented = {v.strip().strip('",') for v in line.split(":", 1)[1].split("|")}
+    assert documented == set(cmd_validate.VERDICTS)
 
 
 def test_json_output_schema(tmp_path: Path, fixtures_dir: Path, capsys):
