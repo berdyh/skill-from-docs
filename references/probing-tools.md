@@ -219,7 +219,9 @@ The Phase 0 answers (`user_declared_scope` in its intended sense, `user_declared
 
 *Advisory* (verdict `warn`, exit 0): every file in `raw/` and `probes/` is referenced by some provenance comment (orphan-capture detection).
 
-*Reported but not verdict-moving* (the `warnings` array): recommended-but-optional archetype-4 signals — `spec_url`, `spec_format`, `tag_count` — plus `provenance_index` and `coverage_checklist` coverage, plus **superseded manifest digests**. `spec_url` is legitimately absent for a local-file harvest, which is why these never fail a default run.
+*Reported but not verdict-moving* (the `warnings` array): recommended-but-optional archetype-4 signals — `spec_url`, `spec_format`, `tag_count` — plus `provenance_index` coverage of each H3 section, plus **superseded manifest digests**. `spec_url` is legitimately absent for a local-file harvest, which is why these never fail a default run.
+
+There is a fourth advisory check, `coverage_checklist_unknown_source`, that **cannot fire on a workspace this tool produced**: it looks for a singular `source` key on each checklist entry, and `consolidate` writes `sources` (a list). It only triggers on a hand-written `handoff.json` using the singular spelling. Do not rely on it to catch a coverage claim nothing backs.
 
 Superseded digests deserve their own note. `validate` verifies only the *newest* recorded digest per path, so re-running `consolidate` over changed input leaves an older `docs.md` digest in `manifest.json` that no longer describes the file. That is the expected outcome of a legitimate re-run, so it is advisory: it names the earlier runs and says so in the message. Under `--strict` it blocks, which is the trade — a CI gate that wants tamper-evidence gets it, and an ordinary second `consolidate` does not turn the verdict yellow.
 
