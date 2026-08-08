@@ -28,10 +28,10 @@ def _normalize_key(k: str) -> str:
     return k.lower().replace("-", "_")
 
 
-# Header names (case-insensitive, exact match) that always get redacted. Kept
-# as an explicit tuple, not just baked into the regex, so SENSITIVE_QUERY_KEYS
-# below can fold the same spellings in without re-typing them.
-SENSITIVE_HEADER_NAMES = (
+# Header names whose sensitivity is a property of the *name*: the same spelling
+# means "credential" wherever it appears, so SENSITIVE_QUERY_KEYS folds these in
+# rather than re-typing them.
+CREDENTIAL_HEADER_NAMES = (
     "authorization",
     "proxy-authorization",
     "x-api-key",
@@ -41,8 +41,20 @@ SENSITIVE_HEADER_NAMES = (
     "cookie",
     "x-csrf-token",
     "set-cookie",
-    "location",
 )
+
+# Headers redacted for a reason specific to being a header, where sensitivity is
+# positional rather than lexical. These must NOT fold into the query-key set.
+# `Location` is redacted because a redirect target can embed credentials — but
+# `?location=eu-central` is an ordinary query parameter, and this repo's own
+# case study harvests `/v1/locations`. Folding it in redacted benign provenance
+# URLs, which is the A8 damage pattern rather than a leak fix.
+HEADER_ONLY_SENSITIVE = ("location",)
+
+# Header names (case-insensitive, exact match) that always get redacted. Kept
+# as an explicit tuple, not just baked into the regex, so SENSITIVE_QUERY_KEYS
+# below can fold the credential spellings in without re-typing them.
+SENSITIVE_HEADER_NAMES = CREDENTIAL_HEADER_NAMES + HEADER_ONLY_SENSITIVE
 SENSITIVE_HEADER_RE = re.compile(
     r"^(" + "|".join(re.escape(name) for name in SENSITIVE_HEADER_NAMES) + r")$",
     re.IGNORECASE,
@@ -67,11 +79,13 @@ DEFAULT_BODY_KEYS = (
 #   - DEFAULT_BODY_KEYS — a credential is no less sensitive for arriving in a
 #     query string than in a body, and query strings additionally reach logs,
 #     proxies, and CDN caches;
-#   - SENSITIVE_HEADER_NAMES — the same reasoning in the other direction: a
+#   - CREDENTIAL_HEADER_NAMES — the same reasoning in the other direction: a
 #     tool can pass the same credential as `?Authorization=Bearer+x` instead
 #     of a header, and `SENSITIVE_HEADER_RE` already knows every one of these
 #     spellings, so re-deriving them here rather than re-typing them is what
-#     keeps the two sets from drifting apart again;
+#     keeps the two sets from drifting apart again. Note this is deliberately
+#     *not* SENSITIVE_HEADER_NAMES: HEADER_ONLY_SENSITIVE is excluded because
+#     those are sensitive by position, not by name;
 #   - spellings that are common in query strings / cookies but do not match
 #     any body-key or header-name spelling above: `key` (contested — see
 #     DEFERRED.md A8, a resource-name `?key=` is at least as common as a
@@ -84,7 +98,7 @@ DEFAULT_BODY_KEYS = (
 # query set, which was a live leak.
 SENSITIVE_QUERY_KEYS = (
     {_normalize_key(k) for k in DEFAULT_BODY_KEYS}
-    | {_normalize_key(name) for name in SENSITIVE_HEADER_NAMES}
+    | {_normalize_key(name) for name in CREDENTIAL_HEADER_NAMES}
     | {"key", "auth", "sig", "signature", "pwd", "passwd", "sessionid"}
 )
 

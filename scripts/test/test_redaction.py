@@ -6,10 +6,13 @@ from __future__ import annotations
 from urllib.parse import parse_qsl, urlparse
 
 from skill_from_docs._redaction import (
+    CREDENTIAL_HEADER_NAMES,
     DEFAULT_BODY_KEYS,
     REDACTED,
     SENSITIVE_HEADER_NAMES,
+    SENSITIVE_HEADER_RE,
     SENSITIVE_QUERY_KEYS,
+    _normalize_key,
     compile_patterns,
     redact_body,
     redact_headers,
@@ -325,9 +328,14 @@ def test_redact_url_fallback_encoded_key_still_recognised():
 def test_query_keys_cover_header_spellings():
     """A credential is no less sensitive for arriving in a query string
     instead of a header (`?Authorization=Bearer+x` instead of the header) —
-    SENSITIVE_QUERY_KEYS must recognise every spelling SENSITIVE_HEADER_RE
-    does, normalized the same way."""
-    for name in SENSITIVE_HEADER_NAMES:
+    SENSITIVE_QUERY_KEYS must recognise every spelling that denotes a
+    credential *by name*, normalized the same way.
+
+    Scoped to CREDENTIAL_HEADER_NAMES, not the whole header set: see
+    `test_header_only_sensitivity_does_not_leak_into_query_keys` for why
+    `Location` is redacted as a header but must not be as a query key.
+    """
+    for name in CREDENTIAL_HEADER_NAMES:
         assert name.lower().replace("-", "_") in SENSITIVE_QUERY_KEYS, name
 
 
@@ -364,3 +372,28 @@ def test_redact_body_key_comparison_is_normalized():
     out = redact_body({"client-secret": "REAL", "fine": "ok"})
     assert out["client-secret"] == REDACTED
     assert out["fine"] == "ok"
+
+
+def test_header_only_sensitivity_does_not_leak_into_query_keys():
+    """`Location` is a sensitive *header* — a redirect target can embed
+    credentials — but `?location=eu-central` is an ordinary query parameter.
+
+    SENSITIVE_QUERY_KEYS is derived from the header set so the two cannot drift
+    apart again, and deriving it from the whole set silently redacted benign
+    provenance: this repo's own case study harvests `/v1/locations`, and a
+    provenance URL that reads `?location=<redacted>` cannot be re-fetched, so
+    `validate --network` reports a failure that is not real. That is the A8
+    damage pattern, not a leak fix, so the fold must skip positionally-sensitive
+    headers.
+    """
+    assert "location" in {_normalize_key(h) for h in SENSITIVE_HEADER_NAMES}
+    assert "location" not in SENSITIVE_QUERY_KEYS
+    assert SENSITIVE_HEADER_RE.match("Location")
+
+    url = "https://api.example.com/v1/servers?location=eu-central&sort=name"
+    assert redact_url(url) == url
+
+    # The lexically-sensitive header spellings must still fold in, or the
+    # reconciliation this guard sits on top of is gone.
+    for spelling in ("authorization", "x-api-key", "api-key", "x-auth-token"):
+        assert _normalize_key(spelling) in SENSITIVE_QUERY_KEYS
