@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 
 from skill_from_docs import cmd_consolidate, cmd_validate
+from skill_from_docs._manifest import file_entry, now_iso, record_run
 
 
 def _validate_args(workspace: str, **overrides):
@@ -205,6 +206,65 @@ def test_rerunning_consolidate_still_validates(tmp_path: Path, fixtures_dir: Pat
     assert cmd_consolidate.run(_consolidate_args(str(ws))) == 0
     assert cmd_validate.run(_validate_args(str(ws))) == 0
     assert "hash mismatch" not in capsys.readouterr().out
+
+
+def test_appending_a_run_cannot_hide_an_edit_from_the_report(
+    tmp_path: Path, fixtures_dir: Path, capsys
+):
+    """A9: re-attesting a hand-edited file satisfies the hash check.
+
+    `verify_hashes` compares against the newest recorded digest, so editing
+    `docs.md` and appending a run that records the new digest verifies clean —
+    `manifest_hash_verify` passes and nothing in `checks` says otherwise. The
+    superseded entry is the only remaining trace, so `validate` has to report
+    it or the "complete append-only audit trail" is a claim nothing checks.
+    """
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    (ws / "docs.md").write_text("# hand-edited\n")
+    record_run(
+        str(ws), subcommand="consolidate", args={}, started_at=now_iso(),
+        finished_at=now_iso(), outputs=[file_entry(str(ws), "docs.md")],
+    )
+
+    rc = cmd_validate.run(_validate_args(str(ws), json_out=True))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert not [
+        c for c in payload["checks"] if "hash mismatch" in (c["message"] or "")
+    ], "the appended run really does satisfy verify_hashes — that is the premise"
+    assert any(w["id"] == "superseded_digest_docs.md" for w in payload["warnings"])
+
+
+def test_a_legitimate_consolidate_rerun_warns_without_moving_the_verdict(
+    tmp_path: Path, fixtures_dir: Path, capsys
+):
+    """The superseded-digest report must not read as an accusation.
+
+    Two `consolidate` runs over a changed spec legitimately record two different
+    `docs.md` digests — the common case, not an attack. So the finding lives in
+    the advisory `warnings` channel: visible, never verdict-moving, and worded
+    as the expected outcome of a re-run. Putting it in `checks` would make
+    `warn` the verdict of the ordinary re-run, which is the defect the advisory
+    channel exists to avoid.
+    """
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    spec_path = ws / "raw" / "spec.json"
+    spec = json.loads(spec_path.read_text())
+    spec["info"]["version"] = "2.0.0"
+    spec_path.write_text(json.dumps(spec, indent=2))
+    assert cmd_consolidate.run(_consolidate_args(str(ws))) == 0
+
+    rc = cmd_validate.run(_validate_args(str(ws), json_out=True))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["verdict"] == "pass"
+    warning = next(
+        w for w in payload["warnings"] if w["id"] == "superseded_digest_docs.md"
+    )
+    assert "normal result of re-running" in warning["message"]
+    assert "hash mismatch" not in warning["message"]
 
 
 def test_local_file_harvest_still_verdicts_pass(tmp_path: Path, fixtures_dir: Path, capsys):

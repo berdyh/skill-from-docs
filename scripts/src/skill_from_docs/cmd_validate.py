@@ -7,7 +7,7 @@ import json
 import os
 from typing import Any
 
-from ._manifest import now_iso, record_run, verify_hashes
+from ._manifest import now_iso, record_run, superseded_mismatches, verify_hashes
 from ._http import require_allowlist
 from ._provenance import find_all_provenance
 from ._schema import lint_handoff
@@ -206,6 +206,23 @@ def run(args) -> int:
                 _add_check(checks, f"manifest_hash_{hash(f) & 0xffff:x}", False, f)
         else:
             _add_check(checks, "manifest_hash_verify", True, None)
+        # `verify_hashes` deliberately checks only the newest digest per path,
+        # so a file can be edited and re-attested by appending a run. Surfacing
+        # the superseded entries restores the visibility without restoring the
+        # false positive — but it goes in `warnings`, not `checks`, because a
+        # second `consolidate` over a changed spec produces a superseded digest
+        # every time. In `checks` it would make `warn` the verdict of the
+        # ordinary re-run, which is the exact defect the advisory channel exists
+        # to avoid.
+        for rel, message in superseded_mismatches(workspace):
+            warnings.append(
+                {
+                    "id": f"superseded_digest_{rel.replace('/', '_')}",
+                    "passed": False,
+                    "message": message,
+                    "severity": "warn",
+                }
+            )
     else:
         _add_check(checks, "manifest_exists", False, "manifest.json missing")
 
