@@ -95,14 +95,6 @@ class ProbeFixture:
         )
 
 
-@dataclass
-class NormalizedSpec:
-    """Wraps a parsed OpenAPI spec with its source-map."""
-
-    spec: dict[str, Any]
-    source_map: dict[str, Any]
-    sha256: str
-    url: str | None = None
 
 
 # --- handoff.json contract -------------------------------------------------

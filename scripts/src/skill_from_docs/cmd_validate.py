@@ -47,7 +47,7 @@ def _extract_sections(text: str) -> list[tuple[int, str, str]]:
     return out
 
 
-def _section_has_provenance(text: str, line_idx: int, lines: list[str]) -> bool:
+def _section_has_provenance(line_idx: int, lines: list[str]) -> bool:
     """Look forward from `line_idx` (1-indexed) until the next heading or EOF;
     return True if any provenance comment OR `_Not documented upstream._` is found.
     """
@@ -125,7 +125,7 @@ def run(args) -> int:
     for line_no, level, title in sections:
         if level == "h2" and title in canonical_empty_h2:
             continue
-        ok = _section_has_provenance(docs_text, line_no, lines)
+        ok = _section_has_provenance(line_no, lines)
         cid = f"{level}_provenance_{title.lower().replace(' ', '_').replace('/', '_').replace(',', '')[:60]}"
         if not ok:
             _add_check(

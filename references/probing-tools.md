@@ -194,12 +194,22 @@ Prints the operation count. Exits 0. No workspace required, no token, no narrati
 
 ```bash
 # Seed workspace from bundled fixtures (see case-study-hetzner-openapi.md).
-cp scripts/test/fixtures/hcloud-offline/* ~/.claude/skill-from-docs/<slug>/
-openapi-harvest consolidate --merge-probes
-openapi-harvest validate
+# The raw/ and probes/ split matters — consolidate reads raw/spec.json, so a
+# flat copy of the fixture directory exits 3.
+WS=~/.claude/skill-from-docs/api.hetzner.cloud
+mkdir -p "$WS"/{raw,probes}
+cp scripts/test/fixtures/hcloud-offline/{spec,source-map}.json "$WS/raw/"
+cp scripts/test/fixtures/hcloud-offline/*-200.json "$WS/probes/"
+
+# Both subcommands take the workspace positionally; without it they default to
+# the current directory, not the slug path.
+openapi-harvest consolidate "$WS" --merge-probes
+openapi-harvest validate "$WS"
+# → verdict: pass
 ```
 
-Use this as the default contributor path. CI exercises this sequence on every PR.
+Use this as the default contributor path. CI exercises this sequence on every PR
+via `scripts/test/test_documented_offline_smoke.py`, so it cannot rot silently.
 
 ---
 

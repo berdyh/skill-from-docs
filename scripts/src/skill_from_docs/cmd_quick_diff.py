@@ -30,7 +30,6 @@ DRIFT_HEADERS = (
     "warning",
 )
 
-PLACEHOLDER_VALUES = ("string", "STRING", 0, [], {})
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -63,7 +62,7 @@ def _find_operation(spec: dict[str, Any], url: str, method: str) -> tuple[str | 
     for spec_path, methods in paths.items():
         if not isinstance(methods, dict):
             continue
-        if target_path.endswith(spec_path) or spec_path == target_path:
+        if target_path.endswith(spec_path):  # equality is a special case of this
             op = methods.get(method)
             if op:
                 return spec_path, op

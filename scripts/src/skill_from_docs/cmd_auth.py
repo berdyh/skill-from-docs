@@ -277,7 +277,6 @@ def _try(
     headers: dict[str, str],
     *,
     allowlist: HostAllowlist,
-    timeout: float,
 ) -> tuple[int, dict[str, str], Any]:
     resp = request_with_retry(
         client, "GET", url, allowlist=allowlist, max_retries=0, headers=headers
@@ -300,7 +299,6 @@ def _format_markdown(report: dict[str, Any]) -> str:
     # H5: probe provenance comment so `validate` can index this as a source.
     fixture_rel = report.get("fixture_relpath")
     if fixture_rel:
-        host = urlparse(report["endpoint"]).hostname or "unknown"  # noqa: F841
         winner_status = (
             report["winner"]["status"]
             if report.get("winner") and "status" in report["winner"]
@@ -406,7 +404,7 @@ def run(args, *, transport=None) -> int:
         # Unauthenticated baseline.
         try:
             base_status, base_headers, base_body = _try(
-                client, args.endpoint, {}, allowlist=allowlist, timeout=args.timeout
+                client, args.endpoint, {}, allowlist=allowlist
             )
         except AllowlistViolation as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -428,7 +426,6 @@ def run(args, *, transport=None) -> int:
                 args.endpoint,
                 {"Authorization": f"Bearer {args.bad_token_pattern}"},
                 allowlist=allowlist,
-                timeout=args.timeout,
             )
         except Exception as e:
             print(f"ERROR: network error: {e}", file=sys.stderr)
@@ -461,7 +458,7 @@ def run(args, *, transport=None) -> int:
         for name, headers, url in cascade:
             try:
                 status, resp_headers, _body = _try(
-                    client, url, headers, allowlist=allowlist, timeout=args.timeout
+                    client, url, headers, allowlist=allowlist
                 )
             except AllowlistViolation as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)

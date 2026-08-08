@@ -18,16 +18,13 @@ def fixtures_dir() -> Path:
 
 
 @pytest.fixture
-def tmp_workspace(tmp_path: Path) -> Path:
-    """Create an empty workspace with raw/ and probes/ subdirs."""
-    (tmp_path / "raw").mkdir()
-    (tmp_path / "probes").mkdir()
-    return tmp_path
-
-
-@pytest.fixture
 def hcloud_workspace(tmp_path: Path) -> Path:
-    """Workspace pre-populated from the hcloud-offline fixtures."""
+    """Workspace pre-populated from the hcloud-offline fixtures.
+
+    This is the layout the documented offline smoke test produces — note the
+    `raw/` and `probes/` subdirectories, which a flat `cp` of the fixture
+    directory does not create.
+    """
     raw = tmp_path / "raw"
     raw.mkdir()
     probes = tmp_path / "probes"
@@ -48,14 +45,6 @@ def make_mock_transport(routes: dict[str, httpx.Response]) -> httpx.MockTranspor
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        if url in routes:
-            return routes[url]
-        return httpx.Response(404, text="not found")
+        return routes.get(str(request.url), httpx.Response(404, text=""))
 
     return httpx.MockTransport(handler)
-
-
-@pytest.fixture
-def mock_transport():
-    return make_mock_transport

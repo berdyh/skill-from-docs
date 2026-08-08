@@ -17,18 +17,6 @@ from ._sanitize import sanitize_spec_descriptions, sanitize_text, sanitize_text_
 from ._schema import HANDOFF_VERSION, ProbeFixture, lint_handoff
 
 
-CANONICAL_H2 = [
-    "Coverage status",
-    "Installation",
-    "Authentication",
-    "Core concepts",
-    "API reference",
-    "Minimal working example",
-    "Errors",
-    "Rate limits, quotas, versioning",
-    "Gotchas",
-]
-
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
@@ -126,9 +114,10 @@ def _filter_tags(by_tag: dict, allowed: list[str]) -> dict:
 
 
 def _spec_pointer(path: str, method: str) -> str:
+    # RFC 6901: `~` -> `~0` first, then `/` -> `~1`. There used to be a
+    # `path.startswith("/")` fixup here; it was a no-op (prefixing `~1` to
+    # `escaped[2:]` reconstructs `escaped`) left over from a double-escape bug.
     escaped = path.replace("~", "~0").replace("/", "~1")
-    if path.startswith("/"):
-        escaped = f"~1{escaped[2:]}" if escaped.startswith("~1") else escaped
     return f"/paths/{escaped}/{method.lower()}"
 
 
@@ -217,8 +206,6 @@ def _match_probe(probe: ProbeFixture, path: str) -> bool:
     return pp == path or pp.endswith(path)
 
 
-def _section_or_default(narratives: dict[str, str], key: str, default: str) -> str:
-    return narratives.get(key, default)
 
 
 def _emit_narrative_section(

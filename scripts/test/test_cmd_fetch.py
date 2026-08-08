@@ -10,6 +10,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from conftest import make_mock_transport as _transport
+
 from skill_from_docs import cmd_fetch
 
 
@@ -33,12 +35,6 @@ def _make_args(**overrides):
     return argparse.Namespace(**base)
 
 
-def _transport(routes):
-    def h(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        return routes.get(url, httpx.Response(404, text=""))
-
-    return httpx.MockTransport(h)
 
 
 def test_fetch_url_direct(tmp_path: Path, fixtures_dir: Path):

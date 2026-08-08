@@ -11,18 +11,14 @@ import argparse
 from pathlib import Path
 
 import httpx
+from conftest import make_mock_transport
 
 from skill_from_docs import cmd_fetch
 from skill_from_docs._http import build_client
 
 
 def _make_client(routes):
-    def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        return routes.get(url, httpx.Response(404, text=""))
-
-    transport = httpx.MockTransport(handler)
-    return build_client(transport=transport, timeout=5.0)
+    return build_client(transport=make_mock_transport(routes), timeout=5.0)
 
 
 # ---------------------------------------------------------------------------
