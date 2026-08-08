@@ -361,13 +361,6 @@ def _build_docs_md(
 
         spec_paths = [path for ops in by_tag.values() for path, _m, _op in ops]
 
-        # Detect probes outside the filter
-        if tags_filter:
-            for probe, _filename in probes.unmatched(spec_paths):
-                warnings.append(
-                    f"probe {probe.request.method} {probe.request.url} references endpoint outside --tag filter"
-                )
-
         if not by_tag:
             lines.append("_No endpoints match the filter._")
             lines.append("")
@@ -410,11 +403,21 @@ def _build_docs_md(
             if merge_probes and not any(probes.has_match(p) for p, _m, _op in ops):
                 lines.append(f"<!-- TODO: no probe captured for tag {tag} -->")
                 lines.append("")
-        # Detect probes for endpoints not in spec at all
-        if merge_probes and not tags_filter:
+        # One orphan-probe scan. There used to be two, differing only in guard
+        # and message, and they were mutually exclusive on `tags_filter`: a
+        # probe that matches nothing is either outside the requested slice or
+        # outside the spec. The first also used a counter as a boolean and
+        # never broke out of its inner loop.
+        if tags_filter:
+            orphan_msg: str | None = "references endpoint outside --tag filter"
+        elif merge_probes:
+            orphan_msg = "does not match any spec endpoint"
+        else:
+            orphan_msg = None
+        if orphan_msg:
             for probe, _filename in probes.unmatched(spec_paths):
                 warnings.append(
-                    f"probe {probe.request.method} {probe.request.url} does not match any spec endpoint"
+                    f"probe {probe.request.method} {probe.request.url} {orphan_msg}"
                 )
     else:
         lines.append("_No spec available._")

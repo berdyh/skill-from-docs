@@ -443,3 +443,36 @@ def test_two_probes_for_one_endpoint_both_reach_docs_and_handoff(tmp_path: Path,
         "probes/locations-a.json",
         "probes/locations-b.json",
     ]
+
+
+def test_orphan_probe_scan_emits_one_message_per_probe(tmp_path: Path, fixtures_dir: Path, capsys):
+    """Two probe-orphan scans were collapsed into one. They were mutually
+    exclusive on `--tag`, so a probe that matches nothing must still produce
+    exactly one warning, with the message the guard selects."""
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "probes").mkdir()
+    shutil.copy(fixtures_dir / "tiny-openapi-3.json", tmp_path / "raw" / "spec.json")
+    unknown = {
+        "scope": "ad-hoc",
+        "request": {"method": "GET", "url": "https://api.example.com/unknown", "headers": {}, "body": None},
+        "response": {"status": 200, "headers": {}, "body": {}, "timing_ms": 0},
+        "manifest": {
+            "tool_version": "",
+            "captured_at": "",
+            "spec_url_at_capture": None,
+            "spec_sha256_at_capture": None,
+        },
+    }
+    (tmp_path / "probes" / "unknown.json").write_text(json.dumps(unknown))
+
+    cmd_consolidate.run(_args(str(tmp_path), merge_probes=True, quiet=False))
+    warns = [ln for ln in capsys.readouterr().err.splitlines() if ln.startswith("WARN:")]
+    assert warns == [
+        "WARN: probe GET https://api.example.com/unknown does not match any spec endpoint"
+    ]
+
+    cmd_consolidate.run(_args(str(tmp_path), merge_probes=True, tag=["Locations"], quiet=False))
+    warns = [ln for ln in capsys.readouterr().err.splitlines() if ln.startswith("WARN:")]
+    assert warns == [
+        "WARN: probe GET https://api.example.com/unknown references endpoint outside --tag filter"
+    ]
