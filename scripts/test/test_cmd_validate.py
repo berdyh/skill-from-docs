@@ -150,3 +150,17 @@ def test_network_rejects_empty_allow_host_string(tmp_path: Path, capsys):
     rc = cmd_validate.run(_validate_args(str(tmp_path), network=True, allow_host=[""]))
     assert rc == 1
     assert "--allow-host" in capsys.readouterr().err
+
+
+def test_rerunning_consolidate_still_validates(tmp_path: Path, fixtures_dir: Path, capsys):
+    """Re-running consolidate is a normal thing to do.
+
+    It used to make `validate` fail: every run appends a fresh digest for
+    docs.md, and hash verification walked every historical entry, so the first
+    run's superseded hash mismatched.
+    """
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    assert cmd_consolidate.run(_consolidate_args(str(ws))) == 0
+    assert cmd_consolidate.run(_consolidate_args(str(ws))) == 0
+    assert cmd_validate.run(_validate_args(str(ws))) == 0
+    assert "hash mismatch" not in capsys.readouterr().out

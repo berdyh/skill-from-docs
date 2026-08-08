@@ -112,3 +112,34 @@ def test_allowed_hosts_is_never_read_back_as_an_allowlist(tmp_path):
     )
     rc = cmd_probe.run(args, transport=httpx.MockTransport(lambda r: httpx.Response(200)))
     assert rc == 1  # blocked by --allow-host, not widened by the manifest
+
+
+def test_verify_hashes_uses_the_newest_entry_per_path(tmp_path: Path):
+    """Re-running a subcommand must not make `validate` fail.
+
+    `record_run` appends, so a second run leaves the first run's now-superseded
+    digest for the same path in the manifest. Verifying every historical entry
+    reported `hash mismatch` for a workspace whose only sin was being
+    regenerated — once per superseded run.
+    """
+    ws = tmp_path
+    target = ws / "docs.md"
+
+    target.write_text("first\n")
+    record_run(
+        str(ws), subcommand="consolidate", args={}, started_at=now_iso(),
+        finished_at=now_iso(), outputs=[file_entry(str(ws), "docs.md")],
+    )
+    target.write_text("second\n")
+    record_run(
+        str(ws), subcommand="consolidate", args={}, started_at=now_iso(),
+        finished_at=now_iso(), outputs=[file_entry(str(ws), "docs.md")],
+    )
+
+    assert verify_hashes(str(ws)) == []
+    # Both runs are still on record — this is about which one describes disk,
+    # not about pruning the audit trail.
+    assert len(load_manifest(str(ws))["runs"]) == 2
+
+    target.write_text("tampered\n")
+    assert [f for f in verify_hashes(str(ws)) if "docs.md" in f]
