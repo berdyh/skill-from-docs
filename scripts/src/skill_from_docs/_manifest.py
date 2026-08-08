@@ -127,6 +127,61 @@ def verify_hashes(workspace: str) -> list[str]:
     return failures
 
 
+def superseded_mismatches(workspace: str) -> list[tuple[str, str]]:
+    """Return `(path, message)` for every recorded path whose *older* digests no
+    longer describe the file on disk. Empty list = nothing superseded.
+
+    `verify_hashes` checks only the newest entry per path, which is what stops a
+    second `consolidate` from failing `validate`. The cost is that tamper
+    detection became "the file matches the newest claim" rather than "the file
+    matches every claim ever made" — editing a file and appending a run entry
+    recording the new digest now verifies clean. This function re-exposes the
+    difference the newest-wins rule hides, so the `_manifest` docstring's
+    "complete append-only audit trail" is checkable rather than merely asserted.
+
+    It is deliberately advisory: two runs of `consolidate` over a changed spec
+    legitimately record two different `docs.md` digests, and that is the common
+    case, not an attack. Callers must not let it move a verdict.
+
+    Silent in the two cases another check already owns: the path is missing, or
+    the *newest* digest itself mismatches (both are `verify_hashes` failures).
+    """
+    data = load_manifest(workspace)
+    history: dict[str, list[tuple[str, str]]] = {}
+    for run in data.get("runs", []):
+        subcommand = run.get("subcommand") or "an earlier run"
+        for kind in ("inputs", "outputs"):
+            for entry in run.get(kind, []):
+                rel = entry.get("path")
+                want = entry.get("sha256")
+                if rel and want:
+                    history.setdefault(rel, []).append((want, subcommand))
+
+    findings: list[tuple[str, str]] = []
+    for rel, entries in history.items():
+        full = rel if os.path.isabs(rel) else os.path.join(workspace, rel)
+        if not os.path.exists(full):
+            continue
+        got = sha256_file(full)
+        if got != entries[-1][0]:
+            continue
+        stale = [(sha, sub) for sha, sub in entries[:-1] if sha != got]
+        if not stale:
+            continue
+        subs = ", ".join(sorted({sub for _sha, sub in stale}))
+        plural = "run" if len(stale) == 1 else "runs"
+        findings.append(
+            (
+                rel,
+                f"superseded digest: {rel} — {len(stale)} earlier {plural} ({subs}) "
+                f"recorded a different digest. This is the normal result of "
+                f"re-running {subs} over changed input; it is worth investigating "
+                f"only if no such re-run happened.",
+            )
+        )
+    return findings
+
+
 def file_entry(workspace: str, path: str) -> dict[str, Any]:
     """Build an `{path, sha256}` entry for a file inside the workspace.
 

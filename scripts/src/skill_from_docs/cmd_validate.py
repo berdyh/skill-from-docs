@@ -7,7 +7,7 @@ import json
 import os
 from typing import Any
 
-from ._manifest import now_iso, record_run, verify_hashes
+from ._manifest import now_iso, record_run, superseded_mismatches, verify_hashes
 from ._http import require_allowlist
 from ._provenance import find_all_provenance
 from ._schema import lint_handoff
@@ -70,6 +70,89 @@ def _section_has_provenance(line_idx: int, lines: list[str]) -> bool:
             found = True
         i += 1
     return found
+
+
+def _warn(warnings: list[dict[str, Any]], wid: str, message: str) -> None:
+    """Append to the advisory channel. Unlike `checks`, this never moves the
+    non-strict verdict — see the verdict block in `run`."""
+    warnings.append({"id": wid, "passed": False, "message": message, "severity": "warn"})
+
+
+def _check_archetype4_signals(
+    handoff: dict[str, Any], checks: list[dict[str, Any]], warnings: list[dict[str, Any]]
+) -> None:
+    """Check 8. An archetype-4 workspace must carry a spec with endpoints; the
+    remaining signals are recommended, so their absence is advisory only."""
+    signals = handoff.get("content_shape_signals") or {}
+    if handoff.get("archetype_primary") != 4:
+        return
+    has_spec = bool(signals.get("has_openapi_spec"))
+    endpoint_count = signals.get("endpoint_count") or 0
+    _add_check(
+        checks,
+        "archetype4_has_spec",
+        has_spec and endpoint_count >= 1,
+        None
+        if has_spec and endpoint_count >= 1
+        else "archetype-4 requires has_openapi_spec=true and endpoint_count>=1",
+    )
+    # spec_url is a recommended optional field; absent emits a warning
+    for opt_key in ("spec_url", "spec_format", "tag_count"):
+        if not signals.get(opt_key):
+            _warn(
+                warnings,
+                f"archetype4_warn_{opt_key}",
+                f"optional archetype-4 signal absent: {opt_key}",
+            )
+
+
+def _check_provenance_index_coverage(
+    handoff: dict[str, Any],
+    sections: list[tuple[int, str, str]],
+    checks: list[dict[str, Any]],
+    warnings: list[dict[str, Any]],
+) -> None:
+    """Check 9. Every H3 section (the API-reference entries) should appear in
+    `provenance_index`, which is what makes skill-creator's downstream
+    anti-hallucination check mechanical."""
+    provenance_index = handoff.get("provenance_index", {})
+    missing = [
+        title
+        for _line_no, level, title in sections
+        if level == "h3" and not any(title in key for key in provenance_index)
+    ]
+    if not missing:
+        _add_check(checks, "provenance_index_coverage", True, None)
+        return
+    for title in missing:
+        _warn(
+            warnings,
+            f"provenance_index_missing_{title}",
+            f"provenance_index missing section '{title}'",
+        )
+
+
+def _check_coverage_checklist_sources(
+    handoff: dict[str, Any], warnings: list[dict[str, Any]]
+) -> None:
+    """Check 10. A coverage_checklist entry naming a source no provenance entry
+    records is a claim of coverage nothing backs."""
+    checklist = handoff.get("coverage_checklist") or []
+    if not isinstance(checklist, list):
+        return
+    provenance_urls = {
+        source["url"]
+        for entry in (handoff.get("provenance_index") or {}).values()
+        for source in entry.get("sources", [])
+        if source.get("url")
+    }
+    for item in checklist:
+        if isinstance(item, dict) and item.get("source") and item["source"] not in provenance_urls:
+            _warn(
+                warnings,
+                "coverage_checklist_unknown_source",
+                f"coverage_checklist references unknown source: {item['source']}",
+            )
 
 
 def run(args) -> int:
@@ -154,12 +237,21 @@ def run(args) -> int:
         None if todos_ok else f"{todos_in_docs} TODOs in docs.md but only {gap_count} gap_list entries",
     )
 
-    # 5. Every file in raw/ and probes/ is referenced
+    # 5+6. Every file in raw/ and probes/ is referenced, and every local file a
+    # provenance comment references exists. Two questions, one walk: both read
+    # the same two fields of the same entries, so the second
+    # `find_all_provenance(docs_text)` re-parsed the whole document to ask a
+    # different question about an identical list.
     referenced_files: set[str] = set()
+    missing_targets: list[str] = []
     for entry in find_all_provenance(docs_text):
         for field_name in ("raw_file", "fixture"):
-            if field_name in entry.fields:
-                referenced_files.add(entry.fields[field_name])
+            if field_name not in entry.fields:
+                continue
+            ref = entry.fields[field_name]
+            referenced_files.add(ref)
+            if not os.path.exists(os.path.join(workspace, ref)):
+                missing_targets.append(ref)
 
     for sub in ("raw", "probes"):
         d = os.path.join(workspace, sub)
@@ -183,19 +275,16 @@ def run(args) -> int:
                     severity="warn",
                 )
 
-    # 6. Provenance comments' local file paths resolve
-    for entry in find_all_provenance(docs_text):
-        for field_name in ("raw_file", "fixture"):
-            if field_name in entry.fields:
-                rel = entry.fields[field_name]
-                full = os.path.join(workspace, rel)
-                if not os.path.exists(full):
-                    _add_check(
-                        checks,
-                        f"missing_provenance_target_{rel.replace('/', '_')}",
-                        False,
-                        f"provenance references missing file: {rel}",
-                    )
+    # Emitted after the orphan-capture checks, and once per reference rather
+    # than once per file, so merging the two walks left the `checks` list
+    # byte-identical to what the two separate loops produced.
+    for ref in missing_targets:
+        _add_check(
+            checks,
+            f"missing_provenance_target_{ref.replace('/', '_')}",
+            False,
+            f"provenance references missing file: {ref}",
+        )
 
     # 7. manifest.json hash verify
     manifest_path = os.path.join(workspace, "manifest.json")
@@ -206,87 +295,27 @@ def run(args) -> int:
                 _add_check(checks, f"manifest_hash_{hash(f) & 0xffff:x}", False, f)
         else:
             _add_check(checks, "manifest_hash_verify", True, None)
+        # `verify_hashes` deliberately checks only the newest digest per path,
+        # so a file can be edited and re-attested by appending a run. Surfacing
+        # the superseded entries restores the visibility without restoring the
+        # false positive — but it goes in `warnings`, not `checks`, because a
+        # second `consolidate` over a changed spec produces a superseded digest
+        # every time. In `checks` it would make `warn` the verdict of the
+        # ordinary re-run, which is the exact defect the advisory channel exists
+        # to avoid.
+        for rel, message in superseded_mismatches(workspace):
+            _warn(warnings, f"superseded_digest_{rel.replace('/', '_')}", message)
     else:
         _add_check(checks, "manifest_exists", False, "manifest.json missing")
 
-    # 8. archetype-4 signals
+    # 8, 9, 10. The handoff-content checks. Each one is meaningless without a
+    # parsed, shape-valid handoff, so the guard is hoisted here instead of being
+    # written out three times; the bodies are functions only so that hoisting
+    # does not produce one 60-line `if`.
     if handoff_ok:
-        signals = handoff.get("content_shape_signals") or {}
-        archetype = handoff.get("archetype_primary")
-        if archetype == 4:
-            has_spec = bool(signals.get("has_openapi_spec"))
-            endpoint_count = signals.get("endpoint_count") or 0
-            _add_check(
-                checks,
-                "archetype4_has_spec",
-                has_spec and endpoint_count >= 1,
-                None
-                if has_spec and endpoint_count >= 1
-                else "archetype-4 requires has_openapi_spec=true and endpoint_count>=1",
-            )
-            # spec_url is a recommended optional field; absent emits a warning
-            if not signals.get("spec_url"):
-                warnings.append(
-                    {
-                        "id": "archetype4_warn_spec_url",
-                        "passed": False,
-                        "message": "optional archetype-4 signal absent: spec_url",
-                        "severity": "warn",
-                    }
-                )
-            for opt_key in ("spec_format", "tag_count"):
-                if not signals.get(opt_key):
-                    warnings.append(
-                        {
-                            "id": f"archetype4_warn_{opt_key}",
-                            "passed": False,
-                            "message": f"optional archetype-4 signal absent: {opt_key}",
-                            "severity": "warn",
-                        }
-                    )
-
-    # 9. provenance_index covers every section
-    if handoff_ok:
-        provenance_index = handoff.get("provenance_index", {})
-        # For H3 sections under API reference, check that provenance_index has them
-        missing_index_sections: list[str] = []
-        for _l, lvl, t in sections:
-            if lvl != "h3":
-                continue
-            if not any(t in key for key in provenance_index.keys()):
-                missing_index_sections.append(t)
-        if missing_index_sections:
-            for s in missing_index_sections:
-                warnings.append(
-                    {
-                        "id": f"provenance_index_missing_{s}",
-                        "passed": False,
-                        "message": f"provenance_index missing section '{s}'",
-                        "severity": "warn",
-                    }
-                )
-        else:
-            _add_check(checks, "provenance_index_coverage", True, None)
-
-    # 10. coverage_checklist URLs exist in provenance_index
-    if handoff_ok:
-        cc = handoff.get("coverage_checklist") or []
-        provenance_urls = set()
-        for v in (handoff.get("provenance_index") or {}).values():
-            for s in v.get("sources", []):
-                if s.get("url"):
-                    provenance_urls.add(s["url"])
-        if isinstance(cc, list):
-            for item in cc:
-                if isinstance(item, dict) and item.get("source") and item["source"] not in provenance_urls:
-                    warnings.append(
-                        {
-                            "id": "coverage_checklist_unknown_source",
-                            "passed": False,
-                            "message": f"coverage_checklist references unknown source: {item['source']}",
-                            "severity": "warn",
-                        }
-                    )
+        _check_archetype4_signals(handoff, checks, warnings)
+        _check_provenance_index_coverage(handoff, sections, checks, warnings)
+        _check_coverage_checklist_sources(handoff, warnings)
 
     # Optional network check
     if args.network and handoff_ok:

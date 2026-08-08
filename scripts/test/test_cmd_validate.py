@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 from pathlib import Path
 
 from skill_from_docs import cmd_consolidate, cmd_validate
+from skill_from_docs._manifest import file_entry, now_iso, record_run
 
 
 def _validate_args(workspace: str, **overrides):
@@ -125,6 +127,44 @@ def test_readme_documents_exactly_the_emittable_verdicts():
     assert documented == set(cmd_validate.VERDICTS)
 
 
+SUMMARY_RE = re.compile(r"Pass: (\d+)/(\d+), warn: (\d+), fail: (\d+)")
+
+
+def test_summary_string_is_the_shape_the_readme_documents(
+    tmp_path: Path, fixtures_dir: Path, capsys
+):
+    """`summary` is documented alongside `verdict` as a stable v1 contract CI
+    consumers may assert on, and nothing checked it: renaming `Pass: ` to
+    `PASSED: ` broke no test. Read both sides, as the `verdict` test does, so
+    neither the code nor the README can drift alone — and pin what the four
+    numbers count, since a summary whose arithmetic changes is as breaking to a
+    consumer as one whose wording does.
+    """
+    readme = Path(__file__).resolve().parents[1] / "README.md"
+    documented = re.search(r'"summary":\s*"([^"]+)"', readme.read_text())
+    assert documented and SUMMARY_RE.fullmatch(documented.group(1))
+
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    # An unreferenced capture, so the advisory counts are not trivially zero.
+    (ws / "raw" / "extra.json").write_text("{}")
+    cmd_validate.run(_validate_args(str(ws), json_out=True))
+    payload = json.loads(capsys.readouterr().out)
+
+    match = SUMMARY_RE.fullmatch(payload["summary"])
+    assert match, payload["summary"]
+    passed, total, warned, failed = (int(g) for g in match.groups())
+    checks = payload["checks"]
+    soft = [c for c in checks if not c["passed"] and c["severity"] != "error"]
+
+    assert passed == sum(1 for c in checks if c["passed"])
+    assert total == len(checks)
+    assert failed == sum(1 for c in checks if not c["passed"] and c["severity"] == "error")
+    # Both advisory channels are counted together — `checks` entries carrying a
+    # non-error severity, plus every entry of the `warnings` array.
+    assert warned == len(soft) + len(payload["warnings"])
+    assert soft and payload["warnings"], "neither channel should be empty here"
+
+
 def test_json_output_schema(tmp_path: Path, fixtures_dir: Path, capsys):
     ws = _seed_workspace(tmp_path, fixtures_dir)
     cmd_validate.run(_validate_args(str(ws), json_out=True))
@@ -207,6 +247,93 @@ def test_rerunning_consolidate_still_validates(tmp_path: Path, fixtures_dir: Pat
     assert "hash mismatch" not in capsys.readouterr().out
 
 
+def test_orphan_and_missing_target_checks_keep_their_order_and_multiplicity(
+    tmp_path: Path, fixtures_dir: Path, capsys
+):
+    """Checks 5 and 6 read the same provenance fields, so they run as one walk.
+
+    Their emitted output is a stable contract, and the two easy ways to break it
+    while merging are both pinned here: the orphan-capture checks still come
+    first, and a file referenced twice still produces two `missing_provenance_
+    target` entries rather than being collapsed by the `referenced_files` set.
+    """
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    (ws / "raw" / "extra.json").write_text("{}")
+    (ws / "docs.md").write_text(
+        (ws / "docs.md").read_text()
+        + "\n## Extra\n"
+        + "<!-- source: https://a raw_file: raw/gone.json retrieved: 2026-01-01 -->\n"
+        + "<!-- source: https://b raw_file: raw/gone.json retrieved: 2026-01-01 -->\n"
+    )
+
+    cmd_validate.run(_validate_args(str(ws), json_out=True))
+    ids = [c["id"] for c in json.loads(capsys.readouterr().out)["checks"]]
+
+    assert ids.count("missing_provenance_target_raw_gone.json") == 2
+    assert ids.index("orphan_capture_raw_extra.json") < ids.index(
+        "missing_provenance_target_raw_gone.json"
+    )
+
+
+def test_appending_a_run_cannot_hide_an_edit_from_the_report(
+    tmp_path: Path, fixtures_dir: Path, capsys
+):
+    """A9: re-attesting a hand-edited file satisfies the hash check.
+
+    `verify_hashes` compares against the newest recorded digest, so editing
+    `docs.md` and appending a run that records the new digest verifies clean —
+    `manifest_hash_verify` passes and nothing in `checks` says otherwise. The
+    superseded entry is the only remaining trace, so `validate` has to report
+    it or the "complete append-only audit trail" is a claim nothing checks.
+    """
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    (ws / "docs.md").write_text("# hand-edited\n")
+    record_run(
+        str(ws), subcommand="consolidate", args={}, started_at=now_iso(),
+        finished_at=now_iso(), outputs=[file_entry(str(ws), "docs.md")],
+    )
+
+    rc = cmd_validate.run(_validate_args(str(ws), json_out=True))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert not [
+        c for c in payload["checks"] if "hash mismatch" in (c["message"] or "")
+    ], "the appended run really does satisfy verify_hashes — that is the premise"
+    assert any(w["id"] == "superseded_digest_docs.md" for w in payload["warnings"])
+
+
+def test_a_legitimate_consolidate_rerun_warns_without_moving_the_verdict(
+    tmp_path: Path, fixtures_dir: Path, capsys
+):
+    """The superseded-digest report must not read as an accusation.
+
+    Two `consolidate` runs over a changed spec legitimately record two different
+    `docs.md` digests — the common case, not an attack. So the finding lives in
+    the advisory `warnings` channel: visible, never verdict-moving, and worded
+    as the expected outcome of a re-run. Putting it in `checks` would make
+    `warn` the verdict of the ordinary re-run, which is the defect the advisory
+    channel exists to avoid.
+    """
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    spec_path = ws / "raw" / "spec.json"
+    spec = json.loads(spec_path.read_text())
+    spec["info"]["version"] = "2.0.0"
+    spec_path.write_text(json.dumps(spec, indent=2))
+    assert cmd_consolidate.run(_consolidate_args(str(ws))) == 0
+
+    rc = cmd_validate.run(_validate_args(str(ws), json_out=True))
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["verdict"] == "pass"
+    warning = next(
+        w for w in payload["warnings"] if w["id"] == "superseded_digest_docs.md"
+    )
+    assert "normal result of re-running" in warning["message"]
+    assert "hash mismatch" not in warning["message"]
+
+
 def test_local_file_harvest_still_verdicts_pass(tmp_path: Path, fixtures_dir: Path, capsys):
     """A local-file harvest has no spec_url, and that is not a problem.
 
@@ -247,3 +374,22 @@ def test_validate_never_creates_the_workspace_it_reports_on(tmp_path: Path, caps
     assert not missing.exists()
     assert cmd_validate.run(args) == 1, "a bare retry must not go green"
     assert "manifest.json missing" in capsys.readouterr().out
+
+
+def test_validate_never_creates_the_manifest_it_reports_missing(tmp_path: Path, capsys):
+    """The same guard, on the case the workspace already exists.
+
+    `os.path.exists(manifest_path)` is the predicate, not `exists(workspace)` —
+    a real workspace with no `manifest.json` is the likelier way to hit this
+    than a mistyped path, and it is the one where the self-heal is invisible:
+    the directory was already there, so the only evidence is that the retry
+    stops saying `manifest.json missing`.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    args = _validate_args(str(ws), network=True, allow_host=["example.com"])
+
+    assert cmd_validate.run(args) == 1
+    assert not (ws / "manifest.json").exists()
+    assert cmd_validate.run(args) == 1, "a bare retry must not go green"
+    assert capsys.readouterr().out.count("manifest.json missing") == 2
