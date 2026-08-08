@@ -51,27 +51,34 @@ Walk the four required answers. Three are clear from the prompt; one needs expli
 
 One thing to flag back to the user: `GET /images` was *not* included in scope. Hetzner's `/images` endpoint returns a tenant's private snapshots alongside the public image catalog; capturing it under any probe risks leaking private snapshot IDs and labels into a fixture file. Drop it from the worked example. If the user later wants `/images` coverage, they can extend the workspace themselves and review the captured fixture before committing it.
 
-The intake answers go into `~/.claude/skill-from-docs/api.hetzner.cloud/manifest.json` so every subsequent `openapi-harvest` subcommand sees the same declared scope:
+The intake answers are yours to carry into `docs.md` and `handoff.json`; `manifest.json` is not where they live. What the workspace's `manifest.json` records is one append-only entry per `openapi-harvest` run — the arguments it was given, its start and finish times, and the sha256 of each file it wrote:
 
 ```json
 {
+  "tool_version": "0.1.0",
   "runs": [
     {
       "subcommand": "fetch",
+      "args": {
+        "source": "https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json",
+        "no_resolve": false,
+        "allow_host": ["raw.githubusercontent.com"]
+      },
       "started_at": "2026-05-14T09:12:03Z",
       "finished_at": "2026-05-14T09:12:07Z",
-      "args": {
-        "source": "https://api.hetzner.cloud/v1/openapi.json",
-        "no_resolve": false,
-        "allow_host": ["api.hetzner.cloud", "docs.hetzner.com"]
-      },
-      "outputs": [{"path": "raw/spec.json", "sha256": "…"}]
+      "inputs": [],
+      "outputs": [
+        {"path": "raw/spec.json", "sha256": "…"},
+        {"path": "raw/source-map.json", "sha256": "…"}
+      ]
     }
   ]
 }
 ```
 
-Each run records the `--allow-host` set it was given. That is an **audit trail**, not a policy input: nothing reads `allow_host` back out of the manifest, and passing `--allow-host` on every subsequent subcommand is required. The manifest lives inside the workspace, so a tampered workspace that could widen its own allowlist would defeat the check it is supposed to document. A poisoned spec pointing `/locations` at an attacker-controlled host is blocked by the allowlist you pass on the call, and the manifest is how you later prove which hosts each step was permitted to reach.
+Every string in `args`, `inputs` and `outputs` that looks like an http(s) URL is `redact_url`'d on the way in, so a credential-bearing source URL never lands here. (That is why the *fetchable* URL lives in `raw/source-map.json` instead — this file is read-modify-written on every run and has no exemption from that walk.) The file is replaced atomically, so an interrupted run leaves the previous complete manifest rather than a truncation `validate` would report as a corrupt workspace.
+
+Each run records the `--allow-host` set it was given. That is an **audit trail**, not a policy input: nothing reads `allow_host` back out of the manifest, and passing `--allow-host` on every subsequent subcommand is required. The manifest lives inside the workspace, so a tampered workspace that could widen its own allowlist would defeat the check it is supposed to document. A poisoned spec pointing `/locations` at an attacker-controlled host is blocked by the allowlist bound to the client issuing the call, and the manifest is how you later prove which hosts each step was permitted to reach.
 
 ---
 
@@ -79,36 +86,41 @@ Each run records the `--allow-host` set it was given. That is an **audit trail**
 
 Archetype 4 changes the order of operations: the spec is the doc; everything else is supplementary. The cascade lives in `openapi-harvest fetch` so you don't run it by hand, but knowing it matters because each fallback labels its provenance differently.
 
-**Try 1: docs.hetzner.com siblings.**
+**Step 1: direct fetch of the URL you named.**
+
+`openapi-harvest fetch https://docs.hetzner.com/cloud/api/` GETs that URL first. It answers with HTML, not JSON or YAML, so the direct step yields nothing and the cascade moves on to the renderer step *on that same response*.
+
+**Step 2: renderer-config regex over the docs page HTML.**
+
+That HTML contains a Swagger UI bundle, but the `url:` parameter in `SwaggerUIBundle({...})` points at a same-origin path that 401s without a Hetzner session cookie. The regex cascade in `references/discovery.md` ("OpenAPI renderers") finds the bundle; the URL it extracts isn't fetchable from outside, so the GET of it fails and the cascade moves on.
+
+**Step 3: common spec paths against the origin.**
 
 ```
-https://docs.hetzner.com/cloud/openapi.json     → 404
-https://docs.hetzner.com/cloud/api/openapi.json → 404
-https://docs.hetzner.com/cloud/api/spec.json    → 404
-https://docs.hetzner.com/api-docs               → 404
+https://docs.hetzner.com/openapi.json  → 404
+https://docs.hetzner.com/openapi.yaml  → 404
+https://docs.hetzner.com/swagger.json  → 404
+https://docs.hetzner.com/v3/api-docs   → 404
+https://docs.hetzner.com/api-docs      → 404
+… and two more
 ```
 
-Hetzner doesn't publish a first-party spec URL anywhere obvious. The Swagger UI on docs.hetzner.com is loaded from internal Hetzner systems and the spec path isn't externally addressable.
+Hetzner doesn't publish a first-party spec URL anywhere obvious. The Swagger UI on docs.hetzner.com is loaded from internal Hetzner systems and the spec path isn't externally addressable. All seven guesses miss, so `fetch` exits 1 with `could not discover an OpenAPI spec from https://docs.hetzner.com/cloud/api/`.
 
-**Try 2: renderer-config regex over the docs page HTML.**
+**Then: find a community mirror — by hand.**
 
-`openapi-harvest fetch https://docs.hetzner.com/cloud/api/` view-source contains a Swagger UI bundle, but the `url:` parameter in `SwaggerUIBundle({...})` points at a same-origin path that 401s without a Hetzner session cookie. The regex cascade in `references/discovery.md` ("OpenAPI renderers") finds the bundle but the URL it extracts isn't fetchable from outside.
-
-**Try 3: community mirror.**
-
-Fall through to a known maintained mirror. Search confirms `MaximilianKoestler/hcloud-openapi` on GitHub is the de-facto source — referenced by `hcloud-python`, `hcloud-go`, and several community SDKs. The mirror scrapes Hetzner's internal API definitions and republishes a normalized OpenAPI 3.0 document.
+This is where the tool stops and you start. There is no fourth cascade step; nothing in `openapi-harvest` searches for a mirror. The exit-1 message is the signal to go looking, and what you find you feed back to `fetch` as a new SOURCE URL. Search confirms `MaximilianKoestler/hcloud-openapi` on GitHub is the de-facto source — referenced by `hcloud-python`, `hcloud-go`, and several community SDKs. The mirror scrapes Hetzner's internal API definitions and republishes a normalized OpenAPI 3.0 document.
 
 ```
 https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json
 ```
 
-This is the spec the harvest uses. Mark it as `mirror: unofficial` in every provenance comment downstream — `skill-creator`'s verifier applies stricter trust to first-party spec sources than to community mirrors, and the label is what drives that decision.
+This is the spec the harvest uses. Mark it as `mirror: unofficial` in every provenance comment downstream — `skill-creator`'s verifier applies stricter trust to first-party spec sources than to community mirrors, and the label is what drives that decision. **That marking is yours to do.** `mirror` is a field the provenance parser and emitter both support, but `consolidate` does not set it from a spec harvest: it has no way to know the source is a mirror. If the distinction matters for a workspace, add the field to the emitted comments deliberately.
 
 The mirror staleness check runs automatically. `openapi-harvest fetch` recognizes the `raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>` shape, calls the GitHub commits API for the file path on `main`, and warns on stderr if the most recent commit is older than `--staleness-days` (default 90):
 
 ```
-WARN: mirror staleness: hcloud.json last committed 2026-01-08 (118 days ago).
-      Threshold: 90 days. Consider checking upstream for breaking changes.
+WARNING: mirror is 118 days old (threshold: 90 days, source: github)
 ```
 
 For Hetzner, the mirror is usually fresh enough to ignore the warning; surface it to the user if it fires.
@@ -125,8 +137,12 @@ The spec parse is one command:
 openapi-harvest fetch \
   https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json \
   --allow-host raw.githubusercontent.com \
-  --allow-host api.github.com
+  --workspace ~/.claude/skill-from-docs/api.hetzner.cloud
 ```
+
+`--workspace` is not optional bookkeeping here. Left off, `fetch` derives the workspace from the *source* host and writes to `~/.claude/skill-from-docs/raw.githubusercontent.com/`, while every later `probe` against `api.hetzner.cloud` derives `~/.claude/skill-from-docs/api.hetzner.cloud/` — two workspaces, and a `consolidate` on either one missing half the harvest. Pin it once and pass the same value everywhere.
+
+`--allow-host api.github.com` is *not* needed and would not help: the staleness check runs on its own client bound to the commits-API host, and the fetch allowlist neither widens nor restricts it.
 
 What it writes:
 
@@ -162,7 +178,9 @@ A glimpse of `source-map.json`:
 
 Note the JSON Pointer escaping: `/` in a path becomes `~1` (and a literal `~` would be `~0`). The `consolidate` step renders these pointers verbatim in provenance comments; getting the escapes right is what makes the pointers actually resolvable against the original raw file.
 
-`spec_url` and `fetch_url` are identical here because this URL carries no query string. They diverge whenever redaction has something to do — `?key=petstore` becomes `?key=<redacted>` in `spec_url`, and only `fetch_url` still names a URL you can GET. Everything downstream reads `spec_url`; `fetch_url` never leaves `raw/`.
+`spec_url` and `fetch_url` are identical here because this URL carries no query string. They diverge whenever redaction has something to do — `?key=petstore` becomes `?key=<redacted>` in `spec_url`, and only `fetch_url` still names a URL you can GET. Everything downstream reads `spec_url`; `fetch_url` never leaves `raw/`, because the reader every other subcommand goes through strips it before handing the file over.
+
+`spec_sha256` is the digest of `raw/spec.json` **as written** — `indent=2`, trailing newline, `$ref`s resolved — not of the bytes that came back from the mirror. `quick-diff` re-hashes that same file, so the two agree by construction; hashing the download instead is what used to make every `spec_revision` finding a false positive. Two consequences: the same download yields a different `spec_sha256` under `--no-resolve`, and a workspace fetched by an older version of the tool carries a body-hash that will never match, so its probes report drift that is not real until you re-run `fetch`.
 
 The spec covers endpoints but not narrative context — what the tool is for, how to get a token, what the rate-limit policy is. Enumerate sibling narrative pages on docs.hetzner.com:
 
@@ -203,56 +221,47 @@ One command merges spec, narrative, and (later) probes into `docs.md` and emits 
 openapi-harvest consolidate ~/.claude/skill-from-docs/api.hetzner.cloud/
 ```
 
-The emitted `docs.md` uses the canonical H2s from `references/doc-template.md`, with per-tag H3s nested under `## API reference` (the archetype-4 layout note in `doc-template.md` documents this). The header:
+Pass the workspace. `consolidate` and `validate` take it as an **optional positional that defaults to `$PWD`**, not to the slug directory `fetch` wrote — a bare `openapi-harvest consolidate` here exits 3 with `no spec at ./raw/spec.json`.
+
+The emitted `docs.md` uses the canonical H2s from `references/doc-template.md`, with per-tag H3s nested under `## API reference` (the archetype-4 layout note in `doc-template.md` documents this). What `consolidate` writes at the top is deliberately thin — it only knows what the spec and source map told it:
 
 ```markdown
 # Hetzner Cloud
 
-- **version**: v1
-- **docs site**: https://docs.hetzner.com/cloud/
-- **retrieved**: 2026-05-14
-- **language**: en
-- **target SDK(s)**: python (via hcloud-python), language-agnostic REST
-- **scope**: read-only — GET /locations, GET /datacenters, GET /server_types
+- version: 1.0.0
+- retrieved: 2026-05-14T09:31:00Z
+- spec_url: https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json
 
 ## Coverage status
-- [x] Installation
-- [x] Authentication
-- [x] Core concepts
-- [x] API reference (read-only scope)
-- [x] Minimal working example
-- [x] Errors
-- [x] Rate limits, quotas, versioning
-- [x] Gotchas
+
+- [x] OpenAPI spec parsed
+- [x] Probes merged
 ```
 
-Under `## API reference`, each in-scope tag gets an H3 sub-section. Provenance lives at the H3 boundary (or per-endpoint, when probes attach):
+The richer header and full coverage checklist in `references/doc-template.md` — `docs site`, `language`, `target SDK(s)`, `scope`, one line per canonical H2 — are what the *agent* is responsible for filling in on top of what `consolidate` emits, using the Phase 0 answers. `consolidate` never had those answers, so it does not invent them.
+
+Under `## API reference`, each in-scope tag gets an H3 sub-section. Provenance lives at the H3 boundary and again per-endpoint, one comment per line:
 
 ```markdown
 ## API reference
 
 ### Tag: Locations
 
-#### GET /v1/locations
+<!-- source: https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json retrieved: 2026-05-14T09:31:00Z raw_file: raw/spec.json spec-pointer: /tags/Locations -->
 
-List all locations.
+#### `GET /v1/locations`
 
-Parameters: `name` (query, optional), `page` (query, optional, default 1),
-`per_page` (query, optional, default 25, max 50), `sort` (query, optional).
+**List all locations**
 
-Response: `{ "locations": [...], "meta": { "pagination": {...} } }`.
+**Parameters:**
+- `name` (query) — Filter by name.
+- `page` (query) — Page number.
 
-<!-- source: https://github.com/MaximilianKoestler/hcloud-openapi/blob/main/openapi/hcloud.json
-     spec-pointer: /paths/~1v1~1locations/get
-     mirror: unofficial
-     raw_file: raw/spec.json
-     retrieved: 2026-05-14 -->
+**Responses:**
+- `200` — OK
 
-<!-- probe: GET https://api.hetzner.cloud/v1/locations
-     status: 200
-     retrieved: 2026-05-14
-     scope: case-study
-     fixture: probes/locations-200.json -->
+<!-- source: https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json retrieved: 2026-05-14T09:31:00Z raw_file: raw/spec.json spec-pointer: /paths/~1v1~1locations/get -->
+<!-- probe: GET https://api.hetzner.cloud/v1/locations status: 200 retrieved: 2026-05-14T09:40:00Z scope: case-study fixture: probes/get-v1-locations.json -->
 
 ### Tag: Datacenters
 ...
@@ -260,6 +269,8 @@ Response: `{ "locations": [...], "meta": { "pagination": {...} } }`.
 ### Tag: ServerTypes
 ...
 ```
+
+Two details worth copying exactly. The endpoint heading is an H4 with the method and path in backticks. And `mirror: unofficial` is a field the provenance emitter supports but `consolidate` does not currently set from a spec harvest — if the mirror label matters for a workspace, it has to be added deliberately, not assumed.
 
 Two distinct provenance shapes, side by side. That separation matters: `skill-creator`'s downstream verifier applies different trust levels to spec-source claims (contract-shaped, audit-trail goes back to a JSON Pointer in the raw file) versus probe-source claims (reality-shaped, audit-trail goes back to a saved fixture with a captured-at timestamp). Mixing them, or stripping one, breaks the verifier.
 
@@ -302,7 +313,8 @@ Three commands, in order.
 openapi-harvest auth \
   https://api.hetzner.cloud/v1/locations \
   --token "$HCLOUD_TOKEN" \
-  --allow-host api.hetzner.cloud
+  --allow-host api.hetzner.cloud \
+  --workspace ~/.claude/skill-from-docs/api.hetzner.cloud
 ```
 
 `auth` walks the header-only cascade — `Authorization: Bearer`, `Authorization: Token`, bare `Authorization`, `X-API-Key`, `X-Auth-Token`, `Api-Key`, `Token` header — and short-circuits on the first 200. For Hetzner, `Authorization: Bearer <token>` is the first hit. The subcommand also captures, in order:
@@ -321,16 +333,17 @@ for ep in locations datacenters server_types; do
     https://api.hetzner.cloud/v1/$ep \
     --scope case-study \
     --allow-host api.hetzner.cloud \
-    -H "Authorization: Bearer $HCLOUD_TOKEN"
+    -H "Authorization: Bearer $HCLOUD_TOKEN" \
+    --workspace ~/.claude/skill-from-docs/api.hetzner.cloud
 done
 ```
 
-Each call writes a fixture to `probes/<endpoint>-200.json` with:
+Each call writes a fixture to `probes/<method>-<url-path>.json` — `probes/get-v1-locations.json`, `probes/get-v1-datacenters.json`, `probes/get-v1-server_types.json`. **The status code is not part of the name**, so a second capture of the same endpoint overwrites the first; pass `-o PATH` if you want both. Each fixture holds:
 
 - The request method, URL, redacted headers (`Authorization: <redacted>` by default), no body.
 - The response status, response headers verbatim (`Link`, `Content-Type`, `X-RateLimit-*`), and the response body. Body keys matching the default redaction list (`token`, `api_key`, `secret`, etc.) are redacted, though they don't appear in these particular responses.
 - A `scope: case-study` label that propagates into the provenance comment.
-- A manifest stanza recording the tool version, captured_at, and the spec sha256 at capture time. `quick-diff` and `validate` use the spec hash to detect "this probe was captured against an older spec revision."
+- A manifest stanza recording the tool version, `captured_at`, and `spec_sha256_at_capture` — the `spec_sha256` that was in `raw/source-map.json` at the time, i.e. the digest of `raw/spec.json` as written. `quick-diff` compares it against a fresh hash of the spec file to detect "this probe was captured against an older spec revision". `validate` does not perform this check.
 
 `--allow-host api.hetzner.cloud` is non-optional. Without it the subcommand exits 1 immediately. The hard rule: a poisoned spec or a typo could point at an attacker-controlled host; the allowlist is what prevents a token from leaking there.
 
@@ -338,7 +351,7 @@ Each call writes a fixture to `probes/<endpoint>-200.json` with:
 
 ```bash
 openapi-harvest quick-diff \
-  ~/.claude/skill-from-docs/api.hetzner.cloud/probes/locations-200.json \
+  ~/.claude/skill-from-docs/api.hetzner.cloud/probes/get-v1-locations.json \
   ~/.claude/skill-from-docs/api.hetzner.cloud/raw/spec.json
 ```
 
@@ -348,7 +361,16 @@ openapi-harvest quick-diff \
 
 - **`meta.pagination.next_page` is nullable in practice but the spec marks it required-integer.** When the current page is the last page, the live API returns `"next_page": null`; the spec types this as `integer` with no `nullable: true`. `quick-diff` flags this as a type-mismatch finding. Lands in `## Gotchas`.
 
-The `quick-diff` output is markdown, ready to paste under `## Gotchas` with a probe provenance comment. Run it for each captured endpoint; usually one or two findings per endpoint.
+The `quick-diff` output is markdown, ready to paste under `## Gotchas` with a probe provenance comment. Run it for each captured endpoint; usually one or two findings per endpoint. **Pasting is the mechanism** — `consolidate` knows nothing about `quick-diff`. `## Gotchas` renders from `narrative/gotchas.md` and nothing else, so append each report there before re-consolidating:
+
+```bash
+for ep in locations datacenters server_types; do
+  openapi-harvest quick-diff \
+    ~/.claude/skill-from-docs/api.hetzner.cloud/probes/get-v1-$ep.json \
+    ~/.claude/skill-from-docs/api.hetzner.cloud/raw/spec.json \
+    >> ~/.claude/skill-from-docs/api.hetzner.cloud/narrative/gotchas.md
+done
+```
 
 **Re-consolidate with probes folded in.**
 
@@ -358,55 +380,49 @@ openapi-harvest consolidate \
   --merge-probes
 ```
 
-This rewrites `docs.md` with each captured probe added as a sibling provenance comment under the matching endpoint's H4, and folds the `quick-diff` reports into `## Gotchas`. Sections it previously emitted `_Not documented upstream._` for (rate limits, errors) now pick up captured real-world content.
+This rewrites `docs.md` with each captured probe added as a sibling provenance comment under the matching endpoint's H4, and picks up whatever you appended to `narrative/gotchas.md` above. Sections that previously emitted `_Not documented upstream._` (rate limits, errors) pick up captured real-world content **only once the corresponding `narrative/rate-limits.md` and `narrative/errors.md` exist** — `consolidate` renders those H2s from the narrative directory, never from a probe fixture. The probes attach to endpoints under `## API reference`; they do not populate the prose sections.
 
 ---
 
 ## Phase 1, Step 5 — Handoff packet
 
-`consolidate` already emitted `handoff.json` alongside `docs.md`. The file walks the workspace and surfaces every signal `skill-creator`'s interview wants pre-filled:
+`consolidate` already emitted `handoff.json` alongside `docs.md`. The file walks the workspace and surfaces every signal `skill-creator`'s interview wants pre-filled. What `consolidate` writes, in the shapes it actually writes them:
 
 ```json
 {
   "version": 1,
-  "proposed_name": "hcloud-integration",
-  "tool_summary": "Hetzner Cloud is a public cloud provider with a REST API for managing servers, volumes, networks, load balancers, and related resources. The Cloud API is bearer-authenticated and language-agnostic; an official Python reference library (hcloud-python) wraps it.",
-  "user_declared_scope": "read-only: GET /locations, GET /datacenters, GET /server_types",
-  "user_declared_languages": ["python", "language-agnostic"],
+  "proposed_name": "hetzner-cloud-integration",
+  "tool_summary": "Hetzner Cloud is a public cloud provider with a REST API for managing servers, volumes, networks, load balancers, and related resources.",
+  "user_declared_scope": "case-study",
+  "user_declared_languages": [],
   "archetype_primary": 4,
   "content_shape_signals": {
     "has_openapi_spec": true,
     "spec_url": "https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json",
     "spec_format": "openapi-3.0",
-    "endpoint_count": "<regenerated by CI>",
-    "tag_count": "<regenerated by CI>",
-    "top_level_h2_count": 8,
-    "code_block_languages": ["bash", "json", "python"]
+    "endpoint_count": "<count from this workspace's spec>",
+    "tag_count": "<count from this workspace's spec>"
   },
-  "coverage_checklist": {
-    "Installation": {"status": "covered", "sources": ["narrative/installation.md"]},
-    "Authentication": {"status": "covered", "sources": ["narrative/authentication.md", "probes/auth-discovery.json"]},
-    "Core concepts": {"status": "covered", "sources": ["narrative/core-concepts.md"]},
-    "API reference": {"status": "partial", "note": "in-scope tags fully covered; out-of-scope tags flagged"},
-    "Errors": {"status": "covered", "sources": ["raw/spec.json", "narrative/errors.md", "probes/auth-discovery.json"]},
-    "Rate limits": {"status": "covered", "sources": ["narrative/rate-limits.md", "probes/locations-200.json"]},
-    "Gotchas": {"status": "covered", "sources": ["probes/locations-200.json#quick-diff"]}
-  },
+  "coverage_checklist": [
+    {"name": "Installation", "status": "missing", "sources": ["https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json"]},
+    {"name": "Authentication", "status": "covered", "sources": ["https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json"]},
+    {"name": "API reference", "status": "covered", "sources": ["https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json"]},
+    {"name": "Minimal working example", "status": "partial", "sources": ["https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json"]}
+  ],
   "gap_list": [
-    "Out-of-scope tags (Servers, Volumes, Networks, ...) intentionally excluded per declared scope.",
-    "GET /images explicitly excluded from probing to prevent private-snapshot leakage."
+    {"line": 72, "text": "<!-- TODO: provide a minimal working example -->"}
   ],
   "provenance_index": {
-    "API reference > Locations > GET /v1/locations": {
-      "sources": [{"type": "spec", "url": "https://github.com/MaximilianKoestler/hcloud-openapi/blob/main/openapi/hcloud.json", "pointer": "/paths/~1v1~1locations/get", "raw_file": "raw/spec.json", "mirror": "unofficial"}],
-      "probes": [{"method": "GET", "url": "https://api.hetzner.cloud/v1/locations", "status": 200, "scope": "case-study", "fixture": "probes/locations-200.json"}]
+    "API reference > Tag: Locations > GET /v1/locations": {
+      "sources": [{"type": "spec", "url": "https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json", "pointer": "/paths/~1v1~1locations/get", "raw_file": "raw/spec.json"}],
+      "probes": [{"method": "GET", "url": "https://api.hetzner.cloud/v1/locations", "status": 200, "scope": "case-study", "fixture": "probes/get-v1-locations.json"}]
     }
   },
   "image_inventory": [],
   "suggested_test_cases": [
-    "list all locations",
-    "fetch a specific datacenter by ID",
-    "enumerate available server types"
+    {"trigger_phrase": "List all locations via Hetzner Cloud", "endpoint": "GET /v1/locations", "status": "suggestion"},
+    {"trigger_phrase": "use Hetzner Cloud", "endpoint": null, "status": "suggestion"},
+    {"trigger_phrase": "integrate with Hetzner Cloud", "endpoint": null, "status": "suggestion"}
   ],
   "harvest_metadata": {
     "retrieved_date": "2026-05-14",
@@ -417,7 +433,16 @@ This rewrites `docs.md` with each captured probe added as a sibling provenance c
 }
 ```
 
-Five OpenAPI signals are populated: `has_openapi_spec`, `spec_url`, `spec_format`, `endpoint_count`, `tag_count`. The two counts are written by `consolidate` from the parsed spec; the case study avoids hardcoding them because the actual numbers shift as the upstream mirror updates. `provenance_index` carries `sources` (spec) and `probes` (reality) on separate keys so the downstream verifier can apply different trust levels.
+Five OpenAPI signals are populated: `has_openapi_spec`, `spec_url`, `spec_format`, `endpoint_count`, `tag_count`. The two counts are written by `consolidate` from the parsed spec; the case study avoids hardcoding them because the actual numbers shift as the upstream mirror updates. `provenance_index` carries `sources` (spec) and `probes` (reality) on separate keys so the downstream verifier can apply different trust levels — but `probes` stays empty unless `consolidate` was passed `--merge-probes`.
+
+Four fields are worth knowing the derivation of, because `consolidate` fills them mechanically rather than from your Phase 0 answers:
+
+- `proposed_name` is `<slugified info.title>-integration`. Punctuation in the spec title survives the slug, so check it.
+- `tool_summary` is the spec's `info.description`, truncated to 1024 characters. Nothing is written if the spec has none.
+- `user_declared_scope` is lifted from the first non-`ad-hoc` `--scope` recorded in `manifest.json` by an earlier `probe` run — so it holds a probe-scope label like `case-study`, **not** the integration scope the user described in Phase 0. `user_declared_languages` comes only from a non-standard `info.x-language` and is otherwise `[]`.
+- `gap_list` is derived from `<!-- TODO` markers in `docs.md`, one `{line, text}` entry each.
+
+The Phase 0 answers are the harvesting agent's to write into this file. `consolidate` cannot know them, and where it cannot, it leaves the field empty rather than inventing one.
 
 Stop here. The harvest is complete. What `skill-creator` does with this packet — what the resulting integration skill's name is, how its body is structured, which test cases land in the trigger description — is not this skill's call.
 
@@ -431,16 +456,29 @@ Verify the workspace passes local validation:
 openapi-harvest validate ~/.claude/skill-from-docs/api.hetzner.cloud/
 ```
 
-Expected output:
+Expected output — `verdict: pass`, followed by a `Pass: N/N, warn: 0, fail: 0` summary and one line per check:
 
 ```
-Pass: 10/10, warn: 0, fail: 0
-verdict: pass
+workspace: /home/you/.claude/skill-from-docs/api.hetzner.cloud
+verdict:   pass
+Pass: <n>/<n>, warn: 0, fail: 0
+  OK   docs_md_exists
+  OK   handoff_json_valid
+  ...
 ```
 
-If `validate` exits 1, the message names the failing check (orphan TODO, missing provenance, manifest hash mismatch, etc.) and points at the line in `docs.md` or the file in `raw/` or `probes/` that needs attention. Fix and re-run.
+The check count is not a fixed number and no doc should claim one: `validate` emits one check per `docs.md` section, so it grows with the spec's tag and endpoint count and with how much narrative got merged. Read the count off the command; do not compare it to a number written down somewhere.
 
-`validate --network` additionally re-fetches every `<!-- source: -->` URL in `docs.md` and verifies the response is still 200 with a matching content type. Run this before handing off to `skill-creator` if any time has passed since the harvest.
+If `validate` exits 1, the message names the failing check (orphan TODO, missing provenance, manifest hash mismatch, etc.) and points at the line in `docs.md` or the file in `raw/` or `probes/` that needs attention. Fix and re-run. `verdict: warn` exits 0 — the canonical cause is an unreferenced fixture in `probes/`, which is what `consolidate` without `--merge-probes` leaves behind.
+
+`validate --network` additionally re-fetches **one** URL — the spec URL out of `handoff.json` — and checks only that it returns HTTP 200. It does not walk `docs.md`'s `<!-- source: -->` comments, does not re-fetch the narrative pages, and does not check content types. It requires `--allow-host`, since the URL it GETs comes out of a workspace file rather than the command line:
+
+```bash
+openapi-harvest validate ~/.claude/skill-from-docs/api.hetzner.cloud/ \
+  --network --allow-host raw.githubusercontent.com
+```
+
+The URL it prints is the redacted `spec_url`; the URL it GETs is `raw/source-map.json`'s `fetch_url`, which is never printed. A workspace harvested before `fetch_url` existed records no fetchable URL, and the check then **skips with an explanation, as a passing check** — that is deliberate, because a skip that failed the verdict would be a false failure in a new place.
 
 ---
 
@@ -474,7 +512,7 @@ openapi-harvest validate ~/.claude/skill-from-docs/api.hetzner.cloud/
 # → exit 0, verdict: pass
 ```
 
-End state: same `docs.md` and `handoff.json` as the live walkthrough produces, minus the live-captured headers and timing data. Drift findings still appear in `## Gotchas` because the bundled fixtures were captured against a known-good Hetzner response and `quick-diff` re-runs cleanly against the offline spec.
+End state: the same `docs.md` and `handoff.json` shape the live walkthrough produces, minus the live-captured headers and timing data. Note what the seed above does *not* create: there are no files in `narrative/`, so `## Installation`, `## Core concepts`, `## Minimal working example`, `## Errors`, `## Rate limits, quotas, versioning` and `## Gotchas` all render as `_Not documented upstream._`, and `handoff.json` marks them `missing`. That is the correct output for this input — the offline fixtures are a spec plus three probes, not a docs harvest. Run `quick-diff` and append its report to `narrative/gotchas.md` if you want that section populated.
 
 The live walkthrough is for contributors who want to verify their token works against a real API and capture fresh drift data. The offline walkthrough is what unblocks every other contributor.
 
@@ -484,7 +522,7 @@ The live walkthrough is for contributors who want to verify their token works ag
 
 Three patterns transfer to any archetype-4 harvest:
 
-1. **Discovery cascade for SPA-rendered Swagger UIs.** Direct fetch → common spec paths → renderer-config regex over view-source → community mirror fallback. The mirror path requires explicit `mirror: unofficial` provenance and a staleness check. Linear, Fly.io machines, and most fintech APIs follow exactly this shape.
+1. **Discovery cascade for SPA-rendered Swagger UIs.** Direct fetch → renderer-config regex over view-source → common spec paths against the origin. Three steps; when they all miss, `fetch` exits 1 and finding a mirror is a human decision followed by a second `fetch`. The mirror path wants explicit `mirror: unofficial` provenance (which you add) and gets an automatic staleness check. Linear, Fly.io machines, and most fintech APIs follow exactly this shape.
 2. **Spec-plus-narrative merge under canonical H2s.** The spec gets you per-endpoint contract content; sibling narrative pages get you the things specs never carry — auth flow, rate-limit policy, error envelope semantics, gotchas. Both feed `consolidate`, both land under `references/doc-template.md`'s canonical H2s, both carry separate provenance.
 3. **Probing-as-evidence, scope-labeled.** A captured live response is not a doc page; it's a scoped artifact with its own provenance shape (`<!-- probe: METHOD URL status: N retrieved: DATE scope: LABEL fixture: PATH -->`). Treating it as a doc page collapses the trust distinction the downstream verifier relies on. Probes are optional and additive; the offline path is the contract.
 
