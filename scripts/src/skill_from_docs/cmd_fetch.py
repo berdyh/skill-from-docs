@@ -21,6 +21,7 @@ from ._http import (
 from ._manifest import file_entry, now_iso, record_run, sha256_bytes
 from ._redaction import redact_url
 from ._slug import default_workspace
+from ._spec import count_operations, iter_operations, json_pointer
 
 
 COMMON_SPEC_PATHS = (
@@ -250,33 +251,13 @@ def _resolve_refs(spec: dict[str, Any]) -> dict[str, Any]:
     return spec
 
 
-def _jp_escape(s: str) -> str:
-    """RFC 6901 JSON Pointer escape: `~` -> `~0`, `/` -> `~1`. (H7)"""
-    return s.replace("~", "~0").replace("/", "~1")
-
-
 def _build_source_map(spec: dict[str, Any], *, spec_url: str | None, sha256: str) -> dict[str, Any]:
     operations: dict[str, Any] = {}
-    paths = spec.get("paths") or {}
-    if isinstance(paths, dict):
-        for path, methods in paths.items():
-            if not isinstance(methods, dict):
-                continue
-            for method, op in methods.items():
-                if method.lower() not in (
-                    "get", "post", "put", "delete", "patch", "head", "options", "trace"
-                ):
-                    continue
-                if not isinstance(op, dict):
-                    continue
-                key = f"{path}:{method.lower()}"
-                # H7: build the pointer as `/paths/` + RFC-6901-encoded raw
-                # path. For `/v1/locations` this yields `/paths/~1v1~1locations/get`
-                # (single `~1` for each `/`), not `/paths/~11v1~1locations/get`.
-                operations[key] = {
-                    "original_pointer": f"/paths/{_jp_escape(path)}/{method.lower()}",
-                    "tags": op.get("tags", []),
-                }
+    for path, method, op in iter_operations(spec):
+        operations[f"{path}:{method}"] = {
+            "original_pointer": json_pointer(path, method),
+            "tags": op.get("tags", []),
+        }
     return {
         # Redact HERE, not at each reader. This value is copied into
         # source-map.json, every `<!-- source: -->` comment in docs.md,
@@ -299,19 +280,6 @@ def _detect_format(spec: dict[str, Any]) -> str:
     if "swagger" in spec:
         return f"swagger-{spec['swagger']}"
     return "unknown"
-
-
-def _count_endpoints(spec: dict[str, Any]) -> int:
-    n = 0
-    for _path, methods in (spec.get("paths") or {}).items():
-        if not isinstance(methods, dict):
-            continue
-        for m in methods:
-            if m.lower() in (
-                "get", "post", "put", "delete", "patch", "head", "options", "trace"
-            ):
-                n += 1
-    return n
 
 
 def _try_renderers(html: str, base_url: str) -> str | None:
@@ -719,7 +687,7 @@ def run(args, *, log=None, transport=None) -> int:
 
     # 4. --count-endpoints short-circuit.
     if args.count_endpoints:
-        print(_count_endpoints(spec))
+        print(count_operations(spec))
         return 0
 
     # 5. Write outputs.
