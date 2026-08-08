@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from typing import Any
@@ -40,6 +41,17 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
 
 def _add_check(checks: list[dict[str, Any]], cid: str, passed: bool, message: str | None, severity: str = "error") -> None:
     checks.append({"id": cid, "passed": passed, "message": message, "severity": severity})
+
+
+def _id_suffix(value: str) -> str:
+    """Stable short digest for per-item check ids.
+
+    Must not be Python's `hash()`: that is salted per process for str, so the
+    same file produced a different `manifest_hash_*` id on every run. Check
+    `id` is part of the documented `--json` contract, so a consumer could not
+    match on those ids at all.
+    """
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:4]
 
 
 def _extract_sections(text: str) -> list[tuple[int, str, str]]:
@@ -292,7 +304,7 @@ def run(args) -> int:
         failures = verify_hashes(workspace)
         if failures:
             for f in failures:
-                _add_check(checks, f"manifest_hash_{hash(f) & 0xffff:x}", False, f)
+                _add_check(checks, f"manifest_hash_{_id_suffix(f)}", False, f)
         else:
             _add_check(checks, "manifest_hash_verify", True, None)
         # `verify_hashes` deliberately checks only the newest digest per path,
@@ -336,7 +348,7 @@ def run(args) -> int:
                         ok = r.status_code == 200
                         _add_check(
                             checks,
-                            f"network_{hash(url) & 0xffff:x}",
+                            f"network_{_id_suffix(url)}",
                             ok,
                             None if ok else f"URL {url} returned {r.status_code}",
                         )

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 from skill_from_docs import cmd_consolidate, cmd_validate
@@ -393,3 +396,33 @@ def test_validate_never_creates_the_manifest_it_reports_missing(tmp_path: Path, 
     assert not (ws / "manifest.json").exists()
     assert cmd_validate.run(args) == 1, "a bare retry must not go green"
     assert capsys.readouterr().out.count("manifest.json missing") == 2
+
+
+def test_per_item_check_ids_are_stable_across_processes(tmp_path: Path, fixtures_dir: Path):
+    """Check `id` is part of the documented `--json` contract, so it has to mean
+    the same thing in two different runs.
+
+    Two ids are built per-item rather than from a literal: `manifest_hash_*` and
+    `network_*`. They were derived from Python's `hash()`, which is salted per
+    process for `str` under the default `PYTHONHASHSEED=random` — so the same
+    failing file produced a different id every run and no consumer could match
+    on it. Run the real CLI under three fixed, different seeds; a salted hash
+    yields three different ids.
+    """
+    ws = _seed_workspace(tmp_path, fixtures_dir)
+    (ws / "docs.md").write_text("# tampered\n")
+
+    src = str(Path(cmd_validate.__file__).resolve().parents[2])
+    seen = set()
+    for seed in ("0", "1", "4294967295"):
+        env = {**os.environ, "PYTHONHASHSEED": seed, "PYTHONPATH": src}
+        proc = subprocess.run(
+            [sys.executable, "-m", "skill_from_docs.openapi_harvest", "validate", str(ws), "--json"],
+            capture_output=True, text=True, env=env, check=False,
+        )
+        payload = json.loads(proc.stdout)
+        ids = [c["id"] for c in payload["checks"] if c["id"].startswith("manifest_hash_")]
+        assert ids, proc.stdout
+        seen.add(tuple(ids))
+
+    assert len(seen) == 1, f"check ids differ between processes: {seen}"
