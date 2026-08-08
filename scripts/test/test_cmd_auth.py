@@ -435,3 +435,54 @@ def test_empty_allow_host_string_is_rejected(tmp_path: Path, capsys):
     args = _args(allow_host=[""], workspace=str(tmp_path))
     assert cmd_auth.run(args, transport=httpx.MockTransport(lambda r: httpx.Response(200))) == 1
     assert "--allow-host" in capsys.readouterr().err
+
+
+def test_auth_cascade_record_survives_a_read(tmp_path: Path):
+    """The auth cascade must round-trip, not just reach disk.
+
+    `cmd_auth` hand-built its fixture dict and wrote `winner_pattern`,
+    `bad_token_status` and `attempts` directly. The only reader
+    (`cmd_consolidate._load_probes`) goes through `ProbeFixture.from_dict`,
+    which did not know those keys — so the whole record was written and
+    silently dropped. Assert through `from_dict`, not against the raw JSON.
+    """
+    from skill_from_docs._schema import ProbeFixture
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.headers.get("Authorization") == "Bearer real-secret-token":
+            return httpx.Response(200, json={"locations": []})
+        return httpx.Response(401, json={"error": "unauthorized"})
+
+    assert cmd_auth.run(_args(workspace=str(tmp_path)), transport=_make_transport(handler)) == 0
+
+    path = next((tmp_path / "probes").glob("auth-*.json"))
+    read_back = ProbeFixture.from_dict(json.loads(path.read_text()))
+
+    assert read_back.manifest.winner_pattern == "Bearer header"
+    assert read_back.manifest.bad_token_status == 401
+    assert [a["name"] for a in read_back.manifest.attempts] == ["Bearer header"]
+
+
+def test_attempt_errors_do_not_leak_a_query_string_token(tmp_path: Path):
+    """A failed `--include-query-auth` attempt records the exception message,
+    and that message can quote the URL the token was in."""
+    from skill_from_docs._schema import ProbeFixture
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if "api_key=" in str(req.url):
+            raise httpx.ConnectError(f"connection failed for {req.url}", request=req)
+        return httpx.Response(401, json={"error": "unauthorized"})
+
+    args = _args(
+        workspace=str(tmp_path), include_query_auth=True, short_circuit=False, token="s3cr3t"
+    )
+    cmd_auth.run(args, transport=_make_transport(handler))
+
+    path = next((tmp_path / "probes").glob("auth-*.json"))
+    raw = path.read_text()
+    read_back = ProbeFixture.from_dict(json.loads(raw))
+
+    errored = [a for a in read_back.manifest.attempts if a.get("error")]
+    assert errored, "expected at least one failed query-auth attempt"
+    assert "s3cr3t" not in raw
+    assert all("<redacted>" in a["error"] for a in errored)

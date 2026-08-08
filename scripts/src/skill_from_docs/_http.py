@@ -33,7 +33,23 @@ class AllowlistViolation(Exception):
 
 
 class HostAllowlist:
-    """Case-insensitive host-membership check."""
+    """Case-insensitive host-membership check.
+
+    The two query methods answer different questions and treat an **empty**
+    allowlist oppositely, on purpose:
+
+    - `check()` gates an outbound request the user asked for. Empty means the
+      user named no restriction, so it permits everything. Subcommands that
+      must not run unrestricted call `require_allowlist` instead of relying on
+      this.
+    - `lists_host()` asks whether the user *named* a host. Empty means they
+      named none, so it is False for every host. Callers vetting a target the
+      user never typed — an `$ref` inside a downloaded spec — need that
+      fail-closed answer.
+
+    Do not collapse them, and do not spell `lists_host` as `in`: `host in
+    allowlist` reads like `check` and silently means the opposite.
+    """
 
     def __init__(self, hosts: Iterable[str] | None):
         self._hosts: set[str] = {h.lower() for h in (hosts or []) if h}
@@ -42,6 +58,8 @@ class HostAllowlist:
         return bool(self._hosts)
 
     def check(self, url: str) -> None:
+        """Raise AllowlistViolation unless `url`'s host is allowed. An empty
+        allowlist permits every host — see the class docstring."""
         if not self._hosts:
             return
         host = urlparse(url).hostname
@@ -50,7 +68,9 @@ class HostAllowlist:
                 f"host '{host}' not in allowlist (have: {sorted(self._hosts)})"
             )
 
-    def __contains__(self, host: str) -> bool:
+    def lists_host(self, host: str) -> bool:
+        """True only if the user explicitly named `host`. An empty allowlist
+        lists nothing — see the class docstring."""
         return host.lower() in self._hosts
 
 
@@ -99,6 +119,7 @@ def request_with_retry(
     max_retries: int = 3,
     headers: dict[str, str] | None = None,
     content: bytes | None = None,
+    timeout: float | None = None,
     sleeper=time.sleep,
 ):
     """Run a request with 429-Retry-After + 5xx exponential-backoff retries.
@@ -106,15 +127,19 @@ def request_with_retry(
     Returns the final response (success OR last failing). Raises
     AllowlistViolation if the URL host isn't allowed.
 
+    `timeout` overrides the client's timeout for this request only — used for
+    speculative probes that should not inherit a long download budget.
+
     Backoff schedule: 1s, 2s, 4s, ...
     """
     if allowlist is not None:
         allowlist.check(url)
 
+    extra = {} if timeout is None else {"timeout": timeout}
     attempts = 0
     while True:
         try:
-            response = client.request(method, url, headers=headers, content=content)
+            response = client.request(method, url, headers=headers, content=content, **extra)
         except Exception:  # network errors retried up to max_retries
             if attempts >= max_retries:
                 raise

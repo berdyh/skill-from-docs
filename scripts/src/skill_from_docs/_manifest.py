@@ -94,30 +94,52 @@ def record_run(
 
 
 def verify_hashes(workspace: str) -> list[str]:
-    """Re-hash every recorded input/output path and return a list of
-    mismatches as human-readable strings. Empty list = all OK.
+    """Re-hash each recorded path against its **most recent** recorded digest
+    and return mismatches as human-readable strings. Empty list = all OK.
+
+    Only the newest entry per path is checked. `record_run` appends, so a
+    second `consolidate` leaves the first run's now-superseded `docs.md` digest
+    in the manifest; verifying every historical entry made `validate` report
+    `hash mismatch: docs.md` for a workspace whose only sin was being
+    regenerated — once per superseded run. The manifest is still a complete
+    append-only audit trail; this is only about which entry claims to describe
+    the file currently on disk.
     """
     data = load_manifest(workspace)
-    failures: list[str] = []
+    latest: dict[str, str] = {}
     for run in data.get("runs", []):
         for kind in ("inputs", "outputs"):
             for entry in run.get(kind, []):
                 rel = entry.get("path")
                 want = entry.get("sha256")
-                if not rel or not want:
-                    continue
-                full = rel if os.path.isabs(rel) else os.path.join(workspace, rel)
-                if not os.path.exists(full):
-                    failures.append(f"missing: {rel}")
-                    continue
-                got = sha256_file(full)
-                if got != want:
-                    failures.append(f"hash mismatch: {rel} (want {want[:8]}, got {got[:8]})")
+                if rel and want:
+                    latest[rel] = want
+
+    failures: list[str] = []
+    for rel, want in latest.items():
+        full = rel if os.path.isabs(rel) else os.path.join(workspace, rel)
+        if not os.path.exists(full):
+            failures.append(f"missing: {rel}")
+            continue
+        got = sha256_file(full)
+        if got != want:
+            failures.append(f"hash mismatch: {rel} (want {want[:8]}, got {got[:8]})")
     return failures
 
 
 def file_entry(workspace: str, path: str) -> dict[str, Any]:
-    """Build an `{path, sha256}` entry for a file inside the workspace."""
-    full = path if os.path.isabs(path) else os.path.join(workspace, path)
-    rel = os.path.relpath(full, workspace) if os.path.isabs(path) else path
-    return {"path": rel, "sha256": sha256_file(full)}
+    """Build an `{path, sha256}` entry for a file inside the workspace.
+
+    `path` may be absolute, workspace-relative, or cwd-relative — callers pass
+    all three. Resolving both sides against the cwd first is what keeps them
+    equivalent: the old form joined `workspace` onto any non-absolute path, so
+    `consolidate myws` (a relative workspace, and `docs_path` therefore also
+    relative) looked for `myws/myws/docs.md` and crashed with FileNotFoundError
+    after docs.md had already been written.
+    """
+    abs_workspace = os.path.abspath(workspace)
+    full = os.path.abspath(path)
+    if not os.path.exists(full):
+        # Not cwd-relative — try it as workspace-relative before giving up.
+        full = os.path.abspath(os.path.join(abs_workspace, path))
+    return {"path": os.path.relpath(full, abs_workspace), "sha256": sha256_file(full)}

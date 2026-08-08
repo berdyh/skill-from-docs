@@ -84,7 +84,7 @@ Workspace layout at the end of Phase 1:
 ~/.claude/skill-from-docs/<tool-slug>/
 ├── docs.md                  # consolidated harvest with provenance + inlined image transcriptions
 ├── handoff.json             # pre-filled answers for skill-creator's interview (Step 5)
-├── manifest.json            # archetype-4: run records, allowed_hosts, spec/probe hashes (written by openapi-harvest)
+├── manifest.json            # archetype-4: run records (incl. per-run allowlist, audit only), spec/probe hashes
 ├── images/                  # per-image transcribed sidecars
 │   ├── <slug>-fig01.md
 │   └── ...

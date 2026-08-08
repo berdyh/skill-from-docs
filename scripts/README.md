@@ -34,6 +34,30 @@ Requires Python 3.10+.
 | `consolidate` | walk a workspace and emit `docs.md` (canonical H2s, per-tag H3s) and `handoff.json` | last step before handoff to `skill-creator` |
 | `validate` | local-by-default completion check (hashes, provenance, archetype-4 signals); supports `--strict` and `--json` for CI | gate the handoff |
 
+An **endpoint** is one operation: a path item keyed by one of the eight HTTP
+methods OpenAPI defines, `trace` included. `fetch --count-endpoints`,
+`raw/source-map.json`, `docs.md` and `handoff.json`'s `endpoint_count` all count
+the same set — one workspace, one number. A `handoff.json` produced before this
+was unified can disagree with a freshly generated one (`consolidate` used to omit
+`trace`); re-run `consolidate` on any workspace whose count you rely on.
+
+`auth` writes its cascade into the fixture manifest at
+`probes/auth-<host>-<status>.json`: `winner_pattern` (the pattern that returned
+200), `bad_token_status` (what a deliberately invalid token returned), and
+`attempts` (every pattern tried, with its status). Consumers should read these
+through `_schema.ProbeFixture.from_dict` rather than off the raw JSON.
+
+Re-running a subcommand over an existing workspace is safe. `manifest.json` is
+append-only, and `validate` hash-checks each path against the most recent run
+that wrote it.
+
+## Timeouts
+
+`--timeout` (default 30s) governs the URL you actually name. When that URL turns
+out not to be a spec, `fetch` guesses seven common spec paths against the origin;
+those guesses are capped at 5s each, so a host that blackholes packets fails
+discovery in about 35s rather than 210s.
+
 ## Error contract
 
 | Exit | Meaning | Example |
@@ -105,6 +129,26 @@ state. Document only — no lock implementation in v1.
 
 Stable v1. CI consumers may assert on `verdict` and `summary`.
 
+**Verdicts.** `fail` means a check with `severity: "error"` did not pass — the
+workspace is not ready to hand off, exit 1. `warn` means the only failing checks
+were advisory ones, today just the unreferenced-capture check; exit is still 0 so
+a pipeline keeps going. `pass` means neither.
+
+The `warnings` array is a third, softer channel — "recommended optional field
+absent". It is reported but never moves the non-strict verdict, because
+`spec_url` is legitimately absent for every local-file harvest and a verdict that
+says `warn` for the ordinary case is a verdict nobody reads.
+
+`--strict` promotes everything — advisory checks and the `warnings` array — to
+blocking, so the same workspace reports `fail` and exits 1.
+
+**If you gate CI on `validate`, use `--strict`.** A default run exits 0 on an
+unreferenced capture, and an unreferenced probe fixture holds a captured live-API
+response that nothing in `docs.md` accounts for.
+
+`scripts/test/test_cmd_validate.py` reads this file and asserts the three values
+above are exactly the ones the code can emit, so the list cannot drift again.
+
 ## Smoke test (offline)
 
 ```bash
@@ -135,6 +179,8 @@ openapi-harvest validate ~/.claude/skill-from-docs/api.hetzner.cloud
 ## Tests
 
 ```bash
-pip install -e ./scripts pytest
+pip install -e ./scripts
+pip install pytest ruff
 pytest scripts/test/ -v
+ruff check scripts/src scripts/test
 ```

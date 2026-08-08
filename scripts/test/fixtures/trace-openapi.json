@@ -1,0 +1,28 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Trace API",
+    "version": "1.0.0",
+    "description": "Two operations on one path, one of them TRACE. Exercises the method whitelist: fetch used to count `trace` and consolidate did not, so this spec reported two different endpoint counts in one workspace."
+  },
+  "paths": {
+    "/echo": {
+      "summary": "not an operation — a path item may carry these beside methods",
+      "parameters": [
+        {"name": "verbose", "in": "query", "schema": {"type": "boolean"}}
+      ],
+      "get": {
+        "operationId": "getEcho",
+        "summary": "Read the echo",
+        "tags": ["Echo"],
+        "responses": {"200": {"description": "OK"}}
+      },
+      "trace": {
+        "operationId": "traceEcho",
+        "summary": "Trace the echo",
+        "tags": ["Echo"],
+        "responses": {"200": {"description": "OK"}}
+      }
+    }
+  }
+}

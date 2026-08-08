@@ -19,8 +19,17 @@ from ._http import (
     require_allowlist,
 )
 from ._manifest import file_entry, now_iso, record_run, sha256_bytes
+from ._redaction import redact_url
 from ._slug import default_workspace
+from ._spec import count_operations, iter_operations, json_pointer
 
+
+# Per-request ceiling for the speculative common-path probes below. They are
+# guesses against paths the user never named, so they get a short leash;
+# `--timeout` still governs the URL the user did name. Concurrency was
+# considered and rejected — it fires seven requests at a stranger's origin to
+# save under a second on a command whose next act is downloading a large spec.
+DISCOVERY_PROBE_TIMEOUT = 5.0
 
 COMMON_SPEC_PATHS = (
     "/openapi.json",
@@ -221,8 +230,10 @@ def _collect_external_ref_violations(
         allowed_hosts = set()
         if source_host:
             allowed_hosts.add(source_host.lower())
-        # allowlist exposes its hosts via __contains__
-        if host not in allowed_hosts and host not in allowlist:
+        # `lists_host`, not `check`: this host came out of a downloaded spec,
+        # not from the user, so an empty allowlist must reject it rather than
+        # wave it through.
+        if host not in allowed_hosts and not allowlist.lists_host(host):
             violations.append(
                 f"external $ref host {host!r} is not in --allow-host: {ref!r}"
             )
@@ -249,35 +260,21 @@ def _resolve_refs(spec: dict[str, Any]) -> dict[str, Any]:
     return spec
 
 
-def _jp_escape(s: str) -> str:
-    """RFC 6901 JSON Pointer escape: `~` -> `~0`, `/` -> `~1`. (H7)"""
-    return s.replace("~", "~0").replace("/", "~1")
-
-
 def _build_source_map(spec: dict[str, Any], *, spec_url: str | None, sha256: str) -> dict[str, Any]:
     operations: dict[str, Any] = {}
-    paths = spec.get("paths") or {}
-    if isinstance(paths, dict):
-        for path, methods in paths.items():
-            if not isinstance(methods, dict):
-                continue
-            for method, op in methods.items():
-                if method.lower() not in (
-                    "get", "post", "put", "delete", "patch", "head", "options", "trace"
-                ):
-                    continue
-                if not isinstance(op, dict):
-                    continue
-                key = f"{path}:{method.lower()}"
-                # H7: build the pointer as `/paths/` + RFC-6901-encoded raw
-                # path. For `/v1/locations` this yields `/paths/~1v1~1locations/get`
-                # (single `~1` for each `/`), not `/paths/~11v1~1locations/get`.
-                operations[key] = {
-                    "original_pointer": f"/paths/{_jp_escape(path)}/{method.lower()}",
-                    "tags": op.get("tags", []),
-                }
+    for path, method, op in iter_operations(spec):
+        operations[f"{path}:{method}"] = {
+            "original_pointer": json_pointer(path, method),
+            "tags": op.get("tags", []),
+        }
     return {
-        "spec_url": spec_url,
+        # Redact HERE, not at each reader. This value is copied into
+        # source-map.json, every `<!-- source: -->` comment in docs.md,
+        # handoff.json's spec_url / provenance_index / coverage_checklist, and
+        # every probe fixture's spec_url_at_capture. A spec URL carrying
+        # `?api_key=` reached all of them; only cmd_quick_diff happened to
+        # redact on read. One redaction at the source closes every path.
+        "spec_url": redact_url(spec_url) if spec_url else spec_url,
         "spec_sha256": sha256,
         "fetched_at": now_iso(),
         "format": _detect_format(spec),
@@ -294,19 +291,6 @@ def _detect_format(spec: dict[str, Any]) -> str:
     return "unknown"
 
 
-def _count_endpoints(spec: dict[str, Any]) -> int:
-    n = 0
-    for _path, methods in (spec.get("paths") or {}).items():
-        if not isinstance(methods, dict):
-            continue
-        for m in methods:
-            if m.lower() in (
-                "get", "post", "put", "delete", "patch", "head", "options", "trace"
-            ):
-                n += 1
-    return n
-
-
 def _try_renderers(html: str, base_url: str) -> str | None:
     """Return the first renderer-discovered spec URL, or None."""
     for _name, pat in RENDERER_PATTERNS:
@@ -319,8 +303,14 @@ def _try_renderers(html: str, base_url: str) -> str | None:
     return None
 
 
-def _discover(client, base_url: str, allowlist: HostAllowlist) -> tuple[bytes, str]:
-    """Discovery cascade. Returns (spec_bytes, final_url) or raises FetchError."""
+def _discover(
+    client, base_url: str, allowlist: HostAllowlist, *, probe_timeout: float
+) -> tuple[bytes, str]:
+    """Discovery cascade. Returns (spec_bytes, final_url) or raises FetchError.
+
+    `probe_timeout` bounds only the speculative common-path probes in step 2.
+    The URL the user actually gave us keeps the full `--timeout`.
+    """
     # 1. Direct fetch.
     try:
         resp = request_with_retry(client, "GET", base_url, allowlist=allowlist, max_retries=0)
@@ -348,7 +338,10 @@ def _discover(client, base_url: str, allowlist: HostAllowlist) -> tuple[bytes, s
         # Continue to common-path probing for connection errors.
         pass
 
-    # 2. Common spec paths against the origin.
+    # 2. Common spec paths against the origin. These are guesses, tried one at
+    # a time, so they must not each inherit the spec-download timeout: against
+    # a host that blackholes rather than refuses, 7 paths x --timeout (30s by
+    # default) meant discovery took 210s to report failure.
     parsed = urlparse(base_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
     for path in COMMON_SPEC_PATHS:
@@ -359,7 +352,12 @@ def _discover(client, base_url: str, allowlist: HostAllowlist) -> tuple[bytes, s
             continue
         try:
             resp = request_with_retry(
-                client, "GET", candidate, allowlist=allowlist, max_retries=0
+                client,
+                "GET",
+                candidate,
+                allowlist=allowlist,
+                max_retries=0,
+                timeout=probe_timeout,
             )
         except Exception:
             continue
@@ -651,7 +649,12 @@ def run(args, *, log=None, transport=None) -> int:
             transport=transport,
         ) as client:
             try:
-                body, spec_url = _discover(client, args.source, allowlist)
+                body, spec_url = _discover(
+                    client,
+                    args.source,
+                    allowlist,
+                    probe_timeout=min(args.timeout, DISCOVERY_PROBE_TIMEOUT),
+                )
             except FetchError as fe:
                 print(f"ERROR: {fe}", file=sys.stderr)
                 return fe.exit_code
@@ -710,12 +713,9 @@ def run(args, *, log=None, transport=None) -> int:
             file=sys.stderr,
         )
 
-    sha = sha256_bytes(body)
-    source_map = _build_source_map(spec, spec_url=spec_url, sha256=sha)
-
     # 4. --count-endpoints short-circuit.
     if args.count_endpoints:
-        print(_count_endpoints(spec))
+        print(count_operations(spec))
         return 0
 
     # 5. Write outputs.
@@ -723,9 +723,18 @@ def run(args, *, log=None, transport=None) -> int:
     out_map = args.output_source_map or os.path.join(workspace, "raw", "source-map.json")
     os.makedirs(os.path.dirname(out_spec) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(out_map) or ".", exist_ok=True)
+
+    # Hash the bytes we WRITE, not the bytes we fetched. `quick-diff` re-hashes
+    # raw/spec.json to detect spec drift, and that file is re-serialized here
+    # (indent=2, possibly $ref-resolved), so hashing the fetched body instead
+    # guaranteed a mismatch and made every spec_revision drift report a false
+    # positive.
+    spec_text = json.dumps(spec, indent=2) + "\n"
+    sha = sha256_bytes(spec_text.encode("utf-8"))
+    source_map = _build_source_map(spec, spec_url=spec_url, sha256=sha)
+
     with open(out_spec, "w", encoding="utf-8") as f:
-        json.dump(spec, f, indent=2)
-        f.write("\n")
+        f.write(spec_text)
     with open(out_map, "w", encoding="utf-8") as f:
         json.dump(source_map, f, indent=2)
         f.write("\n")
@@ -734,7 +743,11 @@ def run(args, *, log=None, transport=None) -> int:
     record_run(
         workspace,
         subcommand="fetch",
-        args={"source": args.source, "no_resolve": args.no_resolve},
+        args={
+            "source": args.source,
+            "no_resolve": args.no_resolve,
+            "allow_host": sorted(args.allow_host or []),
+        },
         started_at=started,
         finished_at=finished,
         outputs=[file_entry(workspace, out_spec), file_entry(workspace, out_map)],

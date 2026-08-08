@@ -10,6 +10,7 @@ import sys
 from typing import Any
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
+from . import __version__
 from ._http import (
     AllowlistViolation,
     HostAllowlist,
@@ -18,7 +19,8 @@ from ._http import (
     require_allowlist,
 )
 from ._manifest import file_entry, now_iso, record_run
-from ._redaction import redact_body, redact_headers, redact_url
+from ._redaction import redact_body, redact_headers, redact_text, redact_url
+from ._schema import ProbeFixture, ProbeManifest, ProbeRequest, ProbeResponse
 from ._slug import default_workspace
 
 
@@ -49,8 +51,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     p.add_argument("--bad-token-pattern", default=FIXED_BAD_TOKEN)
     p.add_argument("--allow-host", action="append", default=[])
+    # Redirects are never followed; see cmd_probe for the reasoning. Accepted
+    # for compatibility, states the guarantee rather than toggling it.
     p.add_argument(
-        "--no-follow-redirects", dest="follow_redirects", action="store_false", default=False
+        "--no-follow-redirects",
+        dest="follow_redirects",
+        action="store_false",
+        default=False,
+        help="accepted for compatibility; redirects are never followed",
     )
     p.add_argument("--timeout", type=float, default=10.0)
     p.add_argument("--workspace")
@@ -271,7 +279,6 @@ def _try(
     headers: dict[str, str],
     *,
     allowlist: HostAllowlist,
-    timeout: float,
 ) -> tuple[int, dict[str, str], Any]:
     resp = request_with_retry(
         client, "GET", url, allowlist=allowlist, max_retries=0, headers=headers
@@ -294,7 +301,6 @@ def _format_markdown(report: dict[str, Any]) -> str:
     # H5: probe provenance comment so `validate` can index this as a source.
     fixture_rel = report.get("fixture_relpath")
     if fixture_rel:
-        host = urlparse(report["endpoint"]).hostname or "unknown"  # noqa: F841
         winner_status = (
             report["winner"]["status"]
             if report.get("winner") and "status" in report["winner"]
@@ -400,7 +406,7 @@ def run(args, *, transport=None) -> int:
         # Unauthenticated baseline.
         try:
             base_status, base_headers, base_body = _try(
-                client, args.endpoint, {}, allowlist=allowlist, timeout=args.timeout
+                client, args.endpoint, {}, allowlist=allowlist
             )
         except AllowlistViolation as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -422,7 +428,6 @@ def run(args, *, transport=None) -> int:
                 args.endpoint,
                 {"Authorization": f"Bearer {args.bad_token_pattern}"},
                 allowlist=allowlist,
-                timeout=args.timeout,
             )
         except Exception as e:
             print(f"ERROR: network error: {e}", file=sys.stderr)
@@ -455,13 +460,15 @@ def run(args, *, transport=None) -> int:
         for name, headers, url in cascade:
             try:
                 status, resp_headers, _body = _try(
-                    client, url, headers, allowlist=allowlist, timeout=args.timeout
+                    client, url, headers, allowlist=allowlist
                 )
             except AllowlistViolation as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)
                 return 1
             except Exception as e:
-                attempts.append({"name": name, "status": -1, "error": str(e)})
+                # The message can quote the URL that failed, and a
+                # `--include-query-auth` URL carries the token in its query.
+                attempts.append({"name": name, "status": -1, "error": redact_text(str(e))})
                 continue
             attempts.append({"name": name, "status": status})
             if status == 200 and winner is None:
@@ -496,37 +503,32 @@ def run(args, *, transport=None) -> int:
     host_slug = (parsed_endpoint.hostname or "unknown").replace(".", "-")
     fixture_filename = f"auth-{host_slug}-{baseline['status']}.json"
     fixture_path = os.path.join(probes_dir, fixture_filename)
-    fixture_payload = {
-        "scope": "auth-discovery",
-        "request": {
-            "method": "GET",
-            "url": redact_url(args.endpoint),
-            "headers": {},
-            "body": None,
-        },
-        "response": {
-            "status": baseline["status"],
-            "headers": redact_headers(
+    # Build through ProbeFixture rather than hand-rolling the dict: the reader
+    # (`cmd_consolidate._load_probes`) goes through `ProbeFixture.from_dict`,
+    # so a key this type does not declare is a key nothing can read.
+    fixture_payload = ProbeFixture(
+        scope="auth-discovery",
+        request=ProbeRequest(method="GET", url=redact_url(args.endpoint)),
+        response=ProbeResponse(
+            status=baseline["status"],
+            headers=redact_headers(
                 {
                     "WWW-Authenticate": baseline.get("www_authenticate") or "",
-                    **{k: v for k, v in rate_headers.items()},
+                    **rate_headers,
                 }
             ),
-            "body": baseline.get("body"),
-            "timing_ms": None,
-        },
-        "manifest": {
-            "tool_version": __import__("skill_from_docs").__version__,
-            "captured_at": started,
-            "spec_url_at_capture": None,
-            "spec_sha256_at_capture": None,
-            "winner_pattern": (winner or {}).get("name"),
-            "auth_method": auth_method,
-            "security_warnings": security_warnings,
-            "bad_token_status": bad_token["status"],
-            "attempts": attempts,
-        },
-    }
+            body=baseline.get("body"),
+        ),
+        manifest=ProbeManifest(
+            tool_version=__version__,
+            captured_at=started,
+            auth_method=auth_method,
+            security_warnings=security_warnings,
+            winner_pattern=(winner or {}).get("name"),
+            bad_token_status=bad_token["status"],
+            attempts=attempts,
+        ),
+    ).to_dict()
     with open(fixture_path, "w", encoding="utf-8") as f:
         json.dump(fixture_payload, f, indent=2)
         f.write("\n")
@@ -557,7 +559,11 @@ def run(args, *, transport=None) -> int:
     record_run(
         workspace,
         subcommand="auth",
-        args={"endpoint": args.endpoint, "patterns_tried": len(attempts)},
+        args={
+            "endpoint": args.endpoint,
+            "patterns_tried": len(attempts),
+            "allow_host": sorted(args.allow_host or []),
+        },
         started_at=started,
         finished_at=finished,
         outputs=[file_entry(workspace, fixture_rel)],

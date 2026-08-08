@@ -15,19 +15,8 @@ from ._manifest import file_entry, now_iso, record_run
 from ._provenance import emit_probe, emit_source
 from ._sanitize import sanitize_spec_descriptions, sanitize_text, sanitize_text_for_markdown
 from ._schema import HANDOFF_VERSION, ProbeFixture, lint_handoff
+from ._spec import iter_operations, json_pointer
 
-
-CANONICAL_H2 = [
-    "Coverage status",
-    "Installation",
-    "Authentication",
-    "Core concepts",
-    "API reference",
-    "Minimal working example",
-    "Errors",
-    "Rate limits, quotas, versioning",
-    "Gotchas",
-]
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -100,22 +89,9 @@ def _load_narratives(workspace: str, narrative_dir: str | None) -> dict[str, str
 
 def _group_ops_by_tag(spec: dict[str, Any]) -> dict[str, list[tuple[str, str, dict[str, Any]]]]:
     by_tag: dict[str, list[tuple[str, str, dict[str, Any]]]] = defaultdict(list)
-    paths = spec.get("paths") or {}
-    if not isinstance(paths, dict):
-        return by_tag
-    for path, methods in paths.items():
-        if not isinstance(methods, dict):
-            continue
-        for method, op in methods.items():
-            if method.lower() not in (
-                "get", "post", "put", "delete", "patch", "head", "options"
-            ):
-                continue
-            if not isinstance(op, dict):
-                continue
-            tags = op.get("tags") or ["_untagged"]
-            for tag in tags:
-                by_tag[tag].append((path, method.upper(), op))
+    for path, method, op in iter_operations(spec):
+        for tag in op.get("tags") or ["_untagged"]:
+            by_tag[tag].append((path, method.upper(), op))
     return by_tag
 
 
@@ -123,13 +99,6 @@ def _filter_tags(by_tag: dict, allowed: list[str]) -> dict:
     if not allowed:
         return by_tag
     return {k: v for k, v in by_tag.items() if k in allowed}
-
-
-def _spec_pointer(path: str, method: str) -> str:
-    escaped = path.replace("~", "~0").replace("/", "~1")
-    if path.startswith("/"):
-        escaped = f"~1{escaped[2:]}" if escaped.startswith("~1") else escaped
-    return f"/paths/{escaped}/{method.lower()}"
 
 
 def _endpoint_block(
@@ -185,7 +154,7 @@ def _endpoint_block(
             lines.append(f"- `{code}` — {d}")
         lines.append("")
 
-    pointer = _spec_pointer(path, method)
+    pointer = json_pointer(path, method)
     if spec_url:
         lines.append(
             emit_source(spec_url, retrieved=retrieved, raw_file=raw_file, spec_pointer=pointer)
@@ -217,8 +186,6 @@ def _match_probe(probe: ProbeFixture, path: str) -> bool:
     return pp == path or pp.endswith(path)
 
 
-def _section_or_default(narratives: dict[str, str], key: str, default: str) -> str:
-    return narratives.get(key, default)
 
 
 def _emit_narrative_section(
@@ -492,21 +459,11 @@ def _build_handoff(
     title = info.get("title", "tool")
     proposed_name = f"{title.lower().replace(' ', '-')}-integration"
     endpoint_count = 0
-    tag_count = 0
-    if spec:
-        paths = spec.get("paths") or {}
-        tags_seen: set[str] = set()
-        for _path, methods in paths.items():
-            if not isinstance(methods, dict):
-                continue
-            for m, op in methods.items():
-                if m.lower() not in ("get", "post", "put", "delete", "patch", "head", "options"):
-                    continue
-                endpoint_count += 1
-                if isinstance(op, dict):
-                    for t in op.get("tags", []):
-                        tags_seen.add(t)
-        tag_count = len(tags_seen)
+    tags_seen: set[str] = set()
+    for _path, _method, op in iter_operations(spec):
+        endpoint_count += 1
+        tags_seen.update(op.get("tags") or [])
+    tag_count = len(tags_seen)
 
     spec_url = (source_map or {}).get("spec_url")
     spec_format = (source_map or {}).get("format")
@@ -530,7 +487,7 @@ def _build_handoff(
             for path, method, _op in ops:
                 section_key = f"API reference > Tag: {tag} > {method} {path}"
                 provenance_index.setdefault(section_key, {"sources": [], "probes": []})
-                pointer = _spec_pointer(path, method)
+                pointer = json_pointer(path, method)
                 provenance_index[section_key]["sources"].append(
                     {
                         "type": "spec",

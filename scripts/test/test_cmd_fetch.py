@@ -10,6 +10,8 @@ from pathlib import Path
 import httpx
 import pytest
 
+from conftest import make_mock_transport as _transport
+
 from skill_from_docs import cmd_fetch
 
 
@@ -33,12 +35,6 @@ def _make_args(**overrides):
     return argparse.Namespace(**base)
 
 
-def _transport(routes):
-    def h(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        return routes.get(url, httpx.Response(404, text=""))
-
-    return httpx.MockTransport(h)
 
 
 def test_fetch_url_direct(tmp_path: Path, fixtures_dir: Path):
@@ -427,3 +423,72 @@ def test_source_map_json_pointers_correct(tmp_path: Path):
     assert sm["operations"]["/v1/server_types/{id}:get"]["original_pointer"] == (
         "/paths/~1v1~1server_types~1{id}/get"
     )
+
+
+def test_spec_url_credentials_are_redacted_at_the_source(tmp_path: Path):
+    """The spec URL is copied into source-map.json, every `<!-- source: -->`
+    comment in docs.md, handoff.json, and every probe fixture. Redacting it
+    once here closes all of those paths at the same time."""
+    source_map = cmd_fetch._build_source_map(
+        {"paths": {}},
+        spec_url="https://specs.example.com/openapi.json?api_key=SUPERSECRET&page=2",
+        sha256="abc",
+    )
+    assert "SUPERSECRET" not in json.dumps(source_map)
+    assert source_map["spec_url"] == (
+        "https://specs.example.com/openapi.json?api_key=<redacted>&page=2"
+    )
+
+
+def test_recorded_spec_hash_matches_the_written_file(tmp_path: Path, fixtures_dir: Path):
+    """`quick-diff` re-hashes raw/spec.json to detect spec drift. Hashing the
+    fetched bytes instead of the re-serialized file made that comparison
+    always mismatch, so every run reported phantom spec_revision drift."""
+    from skill_from_docs._manifest import sha256_file
+
+    spec_path = tmp_path / "in.json"
+    spec_path.write_text((fixtures_dir / "tiny-openapi-3.json").read_text())
+    ws = tmp_path / "ws"
+    assert cmd_fetch.run(_make_args(source=str(spec_path), workspace=str(ws))) == 0
+
+    recorded = json.loads((ws / "raw" / "source-map.json").read_text())["spec_sha256"]
+    assert recorded == sha256_file(str(ws / "raw" / "spec.json"))
+
+
+def test_discovery_probes_do_not_inherit_the_download_timeout(tmp_path: Path):
+    """Seven speculative paths x --timeout is the 210s worst case.
+
+    Only the URL the user actually named keeps the full budget; the guesses
+    that follow get a short leash.
+    """
+    seen: list[tuple[str, float | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        t = request.extensions.get("timeout") or {}
+        seen.append((str(request.url), t.get("read")))
+        return httpx.Response(404, text="")
+
+    args = _make_args(
+        source="https://api.example.com/docs", workspace=str(tmp_path), timeout=30.0
+    )
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 1
+
+    direct, probes = seen[0], seen[1:]
+    assert direct == ("https://api.example.com/docs", 30.0)
+    assert len(probes) == len(cmd_fetch.COMMON_SPEC_PATHS)
+    assert {t for _u, t in probes} == {cmd_fetch.DISCOVERY_PROBE_TIMEOUT}
+
+
+def test_discovery_probe_timeout_never_exceeds_the_user_timeout(tmp_path: Path):
+    """A --timeout tighter than the clamp wins; the clamp is a ceiling."""
+    seen: list[float | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.extensions.get("timeout") or {}).get("read"))
+        return httpx.Response(404, text="")
+
+    args = _make_args(
+        source="https://api.example.com/docs", workspace=str(tmp_path), timeout=1.0
+    )
+    cmd_fetch.run(args, transport=httpx.MockTransport(handler))
+    assert set(seen[1:]) == {1.0}

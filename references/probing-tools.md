@@ -146,7 +146,15 @@ Two distinct provenance shapes — spec-source and probe-source — sit side by 
 
 **How output integrates into `docs.md`.** It doesn't; `validate` is read-only. But every failure points at a specific line in `docs.md` or a specific file in `raw/` or `probes/`, so the fix path is mechanical.
 
-**How it shows up in `handoff.json`.** `validate` reads `handoff.json` and verifies it against the workspace. Failures it catches: every H2 + H3 section has a `<!-- source: -->` or `<!-- probe: -->` comment or carries `_Not documented upstream._`; every `<!-- TODO -->` marker has a matching `gap_list` entry; every file in `raw/` and `probes/` is referenced by some provenance comment (orphan-capture detection); every provenance comment's local file path resolves; every recorded manifest hash matches the file's current sha256; for archetype 4, `has_openapi_spec` is true, `spec_url` non-empty, `endpoint_count` ≥ 1.
+**How it shows up in `handoff.json`.** `validate` reads `handoff.json` and verifies it against the workspace, and sorts what it finds into three tiers.
+
+*Blocking* (verdict `fail`, exit 1): every H2 + H3 section has a `<!-- source: -->` or `<!-- probe: -->` comment or carries `_Not documented upstream._`; every `<!-- TODO -->` marker has a matching `gap_list` entry; every provenance comment's local file path resolves; the newest recorded manifest hash for each path matches the file's current sha256; for archetype 4, `has_openapi_spec` is true and `endpoint_count` ≥ 1.
+
+*Advisory* (verdict `warn`, exit 0): every file in `raw/` and `probes/` is referenced by some provenance comment (orphan-capture detection).
+
+*Reported but not verdict-moving*: recommended-but-optional archetype-4 signals — `spec_url`, `spec_format`, `tag_count` — plus `provenance_index` and `coverage_checklist` coverage. `spec_url` is legitimately absent for a local-file harvest, which is why these never fail a default run.
+
+`--strict` promotes both lower tiers to blocking. Use it when `validate` is a CI gate.
 
 **Security defaults.** Local-only by default — no network calls. `--network` re-fetches every source URL and verifies HTTP 200 with matching content-type; it **requires `--allow-host HOST`** (repeatable, non-empty), because the URL it fetches is read from `handoff.json`, which `validate` did not produce. `--strict` promotes warnings to errors (for CI consumers).
 
@@ -194,12 +202,22 @@ Prints the operation count. Exits 0. No workspace required, no token, no narrati
 
 ```bash
 # Seed workspace from bundled fixtures (see case-study-hetzner-openapi.md).
-cp scripts/test/fixtures/hcloud-offline/* ~/.claude/skill-from-docs/<slug>/
-openapi-harvest consolidate --merge-probes
-openapi-harvest validate
+# The raw/ and probes/ split matters — consolidate reads raw/spec.json, so a
+# flat copy of the fixture directory exits 3.
+WS=~/.claude/skill-from-docs/api.hetzner.cloud
+mkdir -p "$WS"/{raw,probes}
+cp scripts/test/fixtures/hcloud-offline/{spec,source-map}.json "$WS/raw/"
+cp scripts/test/fixtures/hcloud-offline/*-200.json "$WS/probes/"
+
+# Both subcommands take the workspace positionally; without it they default to
+# the current directory, not the slug path.
+openapi-harvest consolidate "$WS" --merge-probes
+openapi-harvest validate "$WS"
+# → verdict: pass
 ```
 
-Use this as the default contributor path. CI exercises this sequence on every PR.
+Use this as the default contributor path. CI exercises this sequence on every PR
+via `scripts/test/test_documented_offline_smoke.py`, so it cannot rot silently.
 
 ---
 
@@ -207,7 +225,7 @@ Use this as the default contributor path. CI exercises this sequence on every PR
 
 The defaults are conservative because a poisoned spec can specify an attacker-controlled endpoint URL, and a careless probe can leak a real token into a fixture file checked into a public repo. The eight defenses:
 
-- **Host allowlist.** Every outbound network call validates the target host against `--allow-host` (repeatable) plus the workspace's `manifest.json` `allowed_hosts` array. A poisoned spec pointing `GET /locations` at `attacker.example.com` is blocked at the call site, not after the token already leaked.
+- **Host allowlist.** Every outbound network call validates the target host against `--allow-host` (repeatable), which is required by `fetch` (URL source), `auth`, `probe`, and `validate --network`. It is the *only* input: `manifest.json` records the allowlist each run was given, but nothing reads it back, because a workspace file that could widen its own allowlist would defeat the check. A poisoned spec pointing `GET /locations` at `attacker.example.com` is blocked at the call site, not after the token already leaked.
 - **External `$ref` validation.** `fetch` walks every `$ref` before handing the spec to `prance`, rejecting `file://`, non-http(s) schemes, and hosts outside the allowlist — this is what stops `$ref: file:///etc/passwd` from being read server-side. Under `--no-resolve` nothing is dereferenced, so violations are downgraded to a stderr **warning** rather than exit 3; the refs are still written to `raw/spec.json` verbatim, so treat a warned spec as untrusted input for anything downstream that *does* resolve.
 - **Centralised redaction.** One implementation, applied uniformly: auth-suggestive request and response headers, `Set-Cookie`, `Location`, sensitive URL query keys, and sensitive JSON body keys on **both** the request and the response. Opt-out is per-flag and per-call; defaults stay on.
 - **Opt-in query-string auth and Basic.** `--include-query-auth` enables `?api_key=`, `?token=`, `?access_token=`, `?key=` in the auth cascade. `--basic-creds USER:PASS` enables `Authorization: Basic`. Both are off by default because query auth leaks tokens into logs/proxies/caches/fixtures and Basic without explicit creds shouldn't run.
@@ -216,7 +234,7 @@ The defaults are conservative because a poisoned spec can specify an attacker-co
 - **Prompt-injection guard.** `consolidate` sanitizes every spec-derived `description` and every community-mirror narrative source: escape `<!--` and `-->`, escape leading `#`, detect agent-instruction patterns and strip them with a stderr warning. Disable only for trusted internal specs (`--no-sanitize-descriptions`).
 - **Scope labels on probes.** Every probe fixture carries a `scope` field — `case-study`, `drift-validation`, `auth-discovery`, `ad-hoc`. The downstream `skill-creator` verifier applies stricter trust to spec-source than to probe-source, and within probe-source it can apply different trust per scope.
 
-The seven layers compose. A probe against a poisoned spec endpoint is blocked by the host allowlist before the redaction layer even sees the request. A real token in a header survives `--no-redact` because the host allowlist already vetted the destination. The point is not that any single layer is bulletproof; the point is that defeating the system requires defeating multiple layers, and the defaults defeat themselves zero of the time.
+The eight layers compose. A probe against a poisoned spec endpoint is blocked by the host allowlist before the redaction layer even sees the request. A real token in a header survives `--no-redact` because the host allowlist already vetted the destination. The point is not that any single layer is bulletproof; the point is that defeating the system requires defeating multiple layers, and the defaults defeat themselves zero of the time.
 
 ---
 

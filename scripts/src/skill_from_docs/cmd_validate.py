@@ -7,10 +7,16 @@ import json
 import os
 from typing import Any
 
-from ._manifest import now_iso, verify_hashes
+from ._manifest import now_iso, record_run, verify_hashes
 from ._http import require_allowlist
 from ._provenance import find_all_provenance
 from ._schema import lint_handoff
+
+
+# The `verdict` values `validate --json` can emit. scripts/README.md documents
+# this as a stable v1 contract CI consumers may assert on, so the two must not
+# drift — `test_cmd_validate.py` asserts the README lists exactly these.
+VERDICTS: tuple[str, ...] = ("pass", "warn", "fail")
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -47,7 +53,7 @@ def _extract_sections(text: str) -> list[tuple[int, str, str]]:
     return out
 
 
-def _section_has_provenance(text: str, line_idx: int, lines: list[str]) -> bool:
+def _section_has_provenance(line_idx: int, lines: list[str]) -> bool:
     """Look forward from `line_idx` (1-indexed) until the next heading or EOF;
     return True if any provenance comment OR `_Not documented upstream._` is found.
     """
@@ -77,6 +83,7 @@ def run(args) -> int:
         if network_allowlist is None:
             return 1
 
+    started = now_iso()
     workspace = args.workspace or os.getcwd()
     checks: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -124,7 +131,7 @@ def run(args) -> int:
     for line_no, level, title in sections:
         if level == "h2" and title in canonical_empty_h2:
             continue
-        ok = _section_has_provenance(docs_text, line_no, lines)
+        ok = _section_has_provenance(line_no, lines)
         cid = f"{level}_provenance_{title.lower().replace(' ', '_').replace('/', '_').replace(',', '')[:60]}"
         if not ok:
             _add_check(
@@ -164,11 +171,16 @@ def run(args) -> int:
                 # source-map.json + manifest-y files don't need provenance refs
                 if name in ("source-map.json",):
                     continue
+                # Non-fatal: an unreferenced capture means the harvest left a
+                # file behind, not that the workspace is unusable. It is the
+                # canonical `warn` — worth surfacing, worth failing under
+                # --strict, not worth blocking a handoff over.
                 _add_check(
                     checks,
                     f"orphan_capture_{rel.replace('/', '_')}",
                     False,
                     f"file {rel} is not referenced by any provenance comment",
+                    severity="warn",
                 )
 
     # 6. Provenance comments' local file paths resolve
@@ -306,20 +318,54 @@ def run(args) -> int:
         except RuntimeError:
             pass
 
-    # Compute verdict
-    failed = [c for c in checks if not c["passed"]]
+    # Compute verdict from the `checks` list, keyed on severity. `warnings` is
+    # a display and --strict channel only: it is populated by "recommended
+    # optional field absent", and `spec_url` is legitimately absent for every
+    # local-file harvest. Letting it move the non-strict verdict made the
+    # ordinary `fetch ./spec.json` -> consolidate -> validate flow report `warn`
+    # on a clean workspace, and a verdict that is `warn` for the normal case is
+    # a verdict nobody reads.
+    errors = [c for c in checks if not c["passed"] and c["severity"] == "error"]
+    soft = [c for c in checks if not c["passed"] and c["severity"] != "error"]
     if args.strict:
-        # Promote warnings to errors
-        for w in warnings:
-            failed.append(w)
-    verdict = "pass" if not failed else "fail"
-    if failed and not args.strict and not any(c["severity"] == "error" for c in failed):
+        # --strict promotes every advisory finding, both channels, to blocking.
+        verdict = "fail" if (errors or soft or warnings) else "pass"
+    elif errors:
+        verdict = "fail"
+    elif soft:
         verdict = "warn"
+    else:
+        verdict = "pass"
 
     summary = (
         f"Pass: {sum(1 for c in checks if c['passed'])}/{len(checks)}, "
-        f"warn: {len(warnings)}, fail: {sum(1 for c in checks if not c['passed'])}"
+        f"warn: {len(soft) + len(warnings)}, fail: {len(errors)}"
     )
+
+    # Only --network touches the network, and it is the one subcommand whose
+    # target host is read out of a workspace file rather than the CLI, so it is
+    # the run most worth having in the audit trail. Local runs stay silent —
+    # recording them would churn manifest.json on every CI invocation.
+    #
+    # Guarded on the manifest already existing, because `record_run` writes
+    # through `write_manifest`, which `os.makedirs` the workspace. Unguarded,
+    # `validate` healed the very thing it was checking: a first run failed
+    # `manifest_exists` and created a manifest, so a bare retry of a red CI step
+    # went green with nothing fixed. `validate --network /typo` also silently
+    # created `/typo`. This command reports on a workspace; it does not build one.
+    if args.network and os.path.exists(manifest_path):
+        record_run(
+            workspace,
+            subcommand="validate",
+            args={
+                "network": True,
+                "strict": bool(args.strict),
+                "allow_host": sorted(getattr(args, "allow_host", None) or []),
+            },
+            started_at=started,
+            finished_at=now_iso(),
+            outputs=[],
+        )
 
     if args.json_out:
         print(json.dumps(
@@ -338,14 +384,15 @@ def run(args) -> int:
         print(f"verdict:   {verdict}")
         print(summary)
         for c in checks:
-            mark = "OK  " if c["passed"] else "FAIL"
+            if c["passed"]:
+                mark = "OK  "
+            else:
+                mark = "FAIL" if c["severity"] == "error" else "WARN"
             extra = f" — {c['message']}" if c.get("message") else ""
             print(f"  {mark} {c['id']}{extra}")
         for w in warnings:
             print(f"  WARN {w['id']} — {w.get('message')}")
 
-    if verdict == "fail":
-        return 1
-    if verdict == "warn" and args.strict:
-        return 1
-    return 0
+    # `warn` is advisory: exit 0 so a pipeline keeps going. `--strict` is how
+    # you make it blocking, and it does that by producing `fail` above.
+    return 1 if verdict == "fail" else 0

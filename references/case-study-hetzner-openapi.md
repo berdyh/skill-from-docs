@@ -55,16 +55,23 @@ The intake answers go into `~/.claude/skill-from-docs/api.hetzner.cloud/manifest
 
 ```json
 {
-  "tool_slug": "api.hetzner.cloud",
-  "tool_name": "Hetzner Cloud",
-  "entry_url": "https://docs.hetzner.com/cloud/",
-  "target_languages": ["python", "language-agnostic"],
-  "declared_scope": "read-only: GET /locations, GET /datacenters, GET /server_types",
-  "allowed_hosts": ["api.hetzner.cloud", "raw.githubusercontent.com", "github.com", "docs.hetzner.com"]
+  "runs": [
+    {
+      "subcommand": "fetch",
+      "started_at": "2026-05-14T09:12:03Z",
+      "finished_at": "2026-05-14T09:12:07Z",
+      "args": {
+        "source": "https://api.hetzner.cloud/v1/openapi.json",
+        "no_resolve": false,
+        "allow_host": ["api.hetzner.cloud", "docs.hetzner.com"]
+      },
+      "outputs": [{"path": "raw/spec.json", "sha256": "…"}]
+    }
+  ]
 }
 ```
 
-The `allowed_hosts` list is what the host-allowlist check enforces on every subsequent outbound call. A poisoned spec that points `/locations` at an attacker-controlled host gets blocked here, not after the token already leaked.
+Each run records the `--allow-host` set it was given. That is an **audit trail**, not a policy input: nothing reads `allow_host` back out of the manifest, and passing `--allow-host` on every subsequent subcommand is required. The manifest lives inside the workspace, so a tampered workspace that could widen its own allowlist would defeat the check it is supposed to document. A poisoned spec pointing `/locations` at an attacker-controlled host is blocked by the allowlist you pass on the call, and the manifest is how you later prove which hosts each step was permitted to reach.
 
 ---
 

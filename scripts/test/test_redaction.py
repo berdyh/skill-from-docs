@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 
+from urllib.parse import parse_qsl, urlparse
+
 from skill_from_docs._redaction import (
+    DEFAULT_BODY_KEYS,
     REDACTED,
+    SENSITIVE_QUERY_KEYS,
     compile_patterns,
     redact_body,
     redact_headers,
+    redact_text,
     redact_url,
 )
 
@@ -127,3 +132,119 @@ def test_url_query_redaction_in_manifest_and_auth_markdown(tmp_path):
     )
     assert "secret" not in md
     assert "api_key=<redacted>" in md or "<redacted>" in md
+
+
+def test_redact_url_preserves_percent_encoding():
+    """parse_qsl hands back DECODED text; writing it back raw corrupted the URL.
+    `?q=one%26two` became `?q=one&two` — one parameter silently became two, in a
+    fixture that claims to record the request actually sent."""
+    cases = {
+        "https://x/a?q=one%26two": "https://x/a?q=one%26two",
+        "https://x/a?filter=a%3Db": "https://x/a?filter=a%3Db",
+        "https://x/a?tag=a%2Bb": "https://x/a?tag=a%2Bb",
+        "https://x/a?n=%C3%A9": "https://x/a?n=%C3%A9",
+    }
+    for src, expected in cases.items():
+        assert redact_url(src) == expected
+
+
+def test_redact_url_roundtrips_to_the_same_pairs():
+    for src in (
+        "https://x/a?q=one%26two&name=x%20y",
+        "https://x/a?tag=a%2Bb&other=plain",
+        "https://x/a?k[]=1&k[]=2",
+    ):
+        before = parse_qsl(urlparse(src).query, keep_blank_values=True)
+        after = parse_qsl(urlparse(redact_url(src)).query, keep_blank_values=True)
+        assert before == after
+
+
+def test_redact_url_is_idempotent():
+    """`probe` redacts the URL into the fixture and `quick-diff` redacts it
+    again for its report. The damage used to compound across those two passes:
+    `a%2Bb` became `a+b` in the fixture, then `a b` in the report."""
+    for src in (
+        "https://x/a?tag=a%2Bb&token=secret",
+        "https://x/a?q=one%26two",
+        "https://api.x/t?client_secret=REAL",
+    ):
+        once = redact_url(src)
+        assert redact_url(once) == once
+
+
+def test_query_keys_cover_the_same_credentials_as_body_keys():
+    """A credential is no less sensitive for arriving in a query string — and a
+    query string additionally reaches logs, proxies and CDN caches."""
+    for key in DEFAULT_BODY_KEYS:
+        assert key.lower() in SENSITIVE_QUERY_KEYS, key
+    redacted = redact_url("https://api.x/oauth/token?client_secret=REAL&refresh_token=R2")
+    assert "REAL" not in redacted
+    assert "R2" not in redacted
+
+
+def test_redacted_sentinel_is_not_percent_encoded():
+    """The sentinel stays readable in fixtures and logs — the one deliberate
+    exception to re-encoding."""
+    assert redact_url("https://x/a?token=abc") == "https://x/a?token=<redacted>"
+
+
+def test_encoded_sensitive_key_is_still_recognised():
+    """Decoding before the sensitivity check is what makes this work."""
+    assert redact_url("https://x/a?%74oken=secret") == "https://x/a?token=<redacted>"
+
+
+def test_redact_text_redacts_urls_embedded_in_free_text():
+    """`redact_url` only helps when you are holding a URL. Credentials also
+    travel inside strings that merely contain one — an exception message."""
+    msg = 'connection failed for https://api.example.com/v1?api_key=s3cr3t&page=2 (retrying)'
+    out = redact_text(msg)
+    assert "s3cr3t" not in out
+    assert "api_key=<redacted>" in out
+    assert "page=2" in out
+    assert out.startswith("connection failed for ")
+    assert out.endswith(" (retrying)")
+
+
+def test_redact_text_leaves_credential_free_text_alone():
+    assert redact_text("no urls here") == "no urls here"
+    assert redact_text("see https://example.com/docs") == "see https://example.com/docs"
+
+
+def test_redact_text_handles_several_urls_in_one_string():
+    out = redact_text("a https://x.test/?token=A then https://y.test/?token=B")
+    assert "A" not in out.split("then")[0].split("token=")[1]
+    assert out.count("<redacted>") == 2
+
+
+def test_redact_url_redacts_userinfo_credentials():
+    """`https://user:pass@host/...` passes the allowlist — urlparse().hostname
+    strips userinfo — so the credential reaches source-map.json, docs.md,
+    handoff.json and every fixture's spec_url_at_capture."""
+    assert redact_url("https://user:s3cr3t@api.example.com/spec.json") == (
+        f"https://{REDACTED}@api.example.com/spec.json"
+    )
+    assert redact_url("https://tok3n@api.example.com:8443/x") == (
+        f"https://{REDACTED}@api.example.com:8443/x"
+    )
+    out = redact_url("https://u:p@h/v1?api_key=k&page=2")
+    assert "p@" not in out and "=k" not in out
+    assert "page=2" in out
+    # No userinfo: the netloc is left exactly as it was.
+    assert redact_url("https://api.example.com/x?a=1") == "https://api.example.com/x?a=1"
+
+
+def test_redact_url_does_not_gratuitously_encode_benign_values():
+    """A recorded URL is an audit artifact. Only the characters that could
+    split one parameter into two are escaped."""
+    assert redact_url("https://h/p?filter=a/b,c") == "https://h/p?filter=a/b,c"
+    assert redact_url("https://h/p?cb=https://x.test/done") == "https://h/p?cb=https://x.test/done"
+    # ...but the split-causing ones still are, which is the bug this guards.
+    assert redact_url("https://h/p?q=one%26two") == "https://h/p?q=one%26two"
+
+
+def test_redact_text_is_idempotent():
+    """cmd_auth redacts URLs elsewhere, so an error string can already contain
+    the sentinel; redacting twice must not append a second one."""
+    once = redact_text("failed for https://h/p?token=abc")
+    assert once == redact_text(once)
+    assert once.count(REDACTED) == 1
