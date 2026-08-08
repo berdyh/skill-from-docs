@@ -223,8 +223,10 @@ def _collect_external_ref_violations(
         allowed_hosts = set()
         if source_host:
             allowed_hosts.add(source_host.lower())
-        # allowlist exposes its hosts via __contains__
-        if host not in allowed_hosts and host not in allowlist:
+        # `lists_host`, not `check`: this host came out of a downloaded spec,
+        # not from the user, so an empty allowlist must reject it rather than
+        # wave it through.
+        if host not in allowed_hosts and not allowlist.lists_host(host):
             violations.append(
                 f"external $ref host {host!r} is not in --allow-host: {ref!r}"
             )
