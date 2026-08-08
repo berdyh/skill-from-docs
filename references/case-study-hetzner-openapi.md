@@ -131,7 +131,7 @@ openapi-harvest fetch \
 What it writes:
 
 - `~/.claude/skill-from-docs/api.hetzner.cloud/raw/spec.json` — the normalized, `$ref`-resolved OpenAPI document. `prance[osv]` validates it against the OpenAPI 3.0 schema before saving.
-- `~/.claude/skill-from-docs/api.hetzner.cloud/raw/source-map.json` — JSON Pointer → original-source map. Because `prance` flattens `$ref`s, the original pointers no longer match the resolved tree; this sidecar lets `consolidate` emit accurate provenance.
+- `~/.claude/skill-from-docs/api.hetzner.cloud/raw/source-map.json` — JSON Pointer → original-source map. Because `prance` flattens `$ref`s, the original pointers no longer match the resolved tree; this sidecar lets `consolidate` emit accurate provenance. Written `0o600`: it is the one workspace file that can hold a live credential, in `fetch_url`. Do not hand it on.
 - `~/.claude/skill-from-docs/api.hetzner.cloud/manifest.json` — appended run record (subcommand args, started_at, finished_at, input/output hashes).
 
 A glimpse of `source-map.json`:
@@ -139,6 +139,7 @@ A glimpse of `source-map.json`:
 ```json
 {
   "spec_url": "https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json",
+  "fetch_url": "https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json",
   "spec_sha256": "ab12cd34ef56...",
   "fetched_at": "2026-05-14T09:30:00Z",
   "format": "openapi-3.0",
@@ -160,6 +161,8 @@ A glimpse of `source-map.json`:
 ```
 
 Note the JSON Pointer escaping: `/` in a path becomes `~1` (and a literal `~` would be `~0`). The `consolidate` step renders these pointers verbatim in provenance comments; getting the escapes right is what makes the pointers actually resolvable against the original raw file.
+
+`spec_url` and `fetch_url` are identical here because this URL carries no query string. They diverge whenever redaction has something to do — `?key=petstore` becomes `?key=<redacted>` in `spec_url`, and only `fetch_url` still names a URL you can GET. Everything downstream reads `spec_url`; `fetch_url` never leaves `raw/`.
 
 The spec covers endpoints but not narrative context — what the tool is for, how to get a token, what the rate-limit policy is. Enumerate sibling narrative pages on docs.hetzner.com:
 
