@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 
 from skill_from_docs import cmd_auth
 
@@ -486,3 +487,182 @@ def test_attempt_errors_do_not_leak_a_query_string_token(tmp_path: Path):
     assert errored, "expected at least one failed query-auth attempt"
     assert "s3cr3t" not in raw
     assert all("<redacted>" in a["error"] for a in errored)
+
+
+# ---------------------------------------------------------------------------
+# B6: the cascade table is the only list of patterns.
+#
+# `HEADER_PATTERNS` and `_filter_cascade_by_spec` used to be two parallel lists
+# of the same seven display names. Adding a header pattern and forgetting the
+# second list made it vanish from every spec-filtered run, silently: no error,
+# no failing test. These tests pin that failure mode.
+# ---------------------------------------------------------------------------
+
+
+def _spec_declaring_everything_for(header: str) -> dict:
+    """A spec that declares every scheme a header-based pattern could gate on.
+
+    Derived from the pattern's own header name, so a pattern added to
+    `HEADER_PATTERNS` gets a matching spec without editing this helper.
+    """
+    return {
+        "openapi": "3.0.0",
+        "info": {"title": "Test", "version": "1.0.0"},
+        "paths": {},
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {"type": "http", "scheme": "bearer"},
+                "basicAuth": {"type": "http", "scheme": "basic"},
+                "apiKeyAuth": {"type": "apiKey", "in": "header", "name": header},
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize("pattern", cmd_auth.HEADER_PATTERNS, ids=lambda p: p.name)
+def test_every_cascade_entry_is_reachable_through_spec_filtering(pattern, tmp_path: Path):
+    """Every entry in the cascade table survives spec filtering when the spec
+    declares its scheme — checked by iterating the table, so a pattern added
+    later is covered automatically instead of needing its own test."""
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(_spec_declaring_everything_for(pattern.header)))
+
+    sent: list[tuple[str, str]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        sent.extend((k, v) for k, v in req.headers.items())
+        return httpx.Response(401, json={})
+
+    args = _args(
+        workspace=str(tmp_path / "ws"),
+        spec=str(spec_path),
+        short_circuit=False,
+    )
+    cmd_auth.run(args, transport=_make_transport(handler))
+
+    expected = (pattern.header.lower(), pattern.value.format(token="real-secret-token"))
+    assert expected in [(k.lower(), v) for k, v in sent], (
+        f"{pattern.name!r} was dropped by spec filtering even though the spec "
+        f"declares its scheme; it is in HEADER_PATTERNS but unreachable."
+    )
+
+
+def test_new_cascade_entry_needs_no_second_edit_to_survive_filtering(
+    tmp_path: Path, monkeypatch
+):
+    """Adding a pattern to the cascade table must be a one-place edit.
+
+    This fails if `_filter_cascade_by_spec` decides by display name again: the
+    added pattern has no branch in such a chain, so it is filtered out of every
+    spec-aware run without a word of complaint. The spec below also declares
+    bearer, so the filtered cascade is non-empty and the "nothing matched, fall
+    back to brute force" escape hatch cannot mask the drop.
+    """
+    added = cmd_auth.HeaderPatternSpec(
+        "X-Custom-Auth",
+        cmd_auth.AUTH_API_KEY_HEADER,
+        "X-Custom-Auth",
+        "{token}",
+        cmd_auth._keep_if_declared_header,
+    )
+    monkeypatch.setattr(cmd_auth, "HEADER_PATTERNS", cmd_auth.HEADER_PATTERNS + (added,))
+
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps({
+        "openapi": "3.0.0",
+        "info": {"title": "Test", "version": "1.0.0"},
+        "paths": {},
+        "components": {
+            "securitySchemes": {
+                "bearerAuth": {"type": "http", "scheme": "bearer"},
+                "customKey": {"type": "apiKey", "in": "header", "name": "X-Custom-Auth"},
+            }
+        },
+    }))
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.headers.get("X-Custom-Auth") == "real-secret-token":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(401, json={})
+
+    args = _args(workspace=str(tmp_path / "ws"), spec=str(spec_path), short_circuit=False)
+    assert cmd_auth.run(args, transport=_make_transport(handler)) == 0
+
+    fixture = json.loads(next((tmp_path / "ws" / "probes").glob("auth-*.json")).read_text())
+    assert fixture["manifest"]["winner_pattern"] == "X-Custom-Auth"
+    assert fixture["manifest"]["auth_method"] == "api_key_header"
+
+
+def test_cascade_display_names_are_a_recorded_contract():
+    """Display names reach disk as `winner_pattern` and each `attempts[].name`,
+    and `test_cmd_consolidate` reads one of them back from a fixture. Renaming
+    an entry rewrites recorded artifacts, so pin the strings."""
+    assert [p.name for p in cmd_auth.HEADER_PATTERNS] == [
+        "Bearer header",
+        "Token header",
+        "raw Authorization",
+        "X-API-Key",
+        "X-Auth-Token",
+        "Api-Key",
+        "Token (custom header)",
+    ]
+    cascade = cmd_auth._build_cascade(
+        "https://api.example.com/v1/x",
+        "tok",
+        basic_creds="u:p",
+        include_query_auth=True,
+    )
+    assert [p.name for p in cascade[7:]] == [
+        "Basic auth",
+        "query ?api_key=",
+        "query ?token=",
+        "query ?access_token=",
+        "query ?key=",
+    ]
+
+
+def test_winner_classification_reads_kind_not_the_display_name():
+    """`_classify_winner` takes the winning pattern's `kind` — no string
+    prefix test on the label."""
+    cascade = cmd_auth._build_cascade(
+        "https://api.example.com/v1/x", "tok", basic_creds="u:p", include_query_auth=True
+    )
+    by_name = {p.name: p for p in cascade}
+    assert cmd_auth._classify_winner(by_name["Bearer header"].kind)[0] == "bearer"
+    assert cmd_auth._classify_winner(by_name["Token header"].kind)[0] == "auth_token_header"
+    assert cmd_auth._classify_winner(by_name["raw Authorization"].kind)[0] == "auth_token_header"
+    assert cmd_auth._classify_winner(by_name["X-API-Key"].kind)[0] == "api_key_header"
+    assert cmd_auth._classify_winner(by_name["Basic auth"].kind)[0] == "basic"
+    assert cmd_auth._classify_winner(by_name["query ?api_key="].kind)[0] == "query_string"
+    assert cmd_auth._classify_winner(None) == (None, [])
+
+
+def test_probe_comment_comes_from_the_shared_emitter():
+    """B7: the auth markdown's provenance comment is `_provenance.emit_probe`'s
+    output, not a second implementation of the same format. Output is
+    byte-identical either way, so this pins the coupling rather than a bug: it
+    goes red if the emitter's format moves and a copy here does not."""
+    from skill_from_docs._provenance import emit_probe
+
+    report = {
+        "endpoint": "https://api.example.com/v1/x",
+        "captured_at": "2026-01-01T00:00:00Z",
+        "unauthenticated": {"status": 401, "www_authenticate": None, "body": {}},
+        "bad_token": {"status": 401, "body": {}},
+        "attempts": [],
+        "winner": None,
+        "rate_limit_headers": {},
+        "fixture_relpath": "probes/auth-api-example-com-401.json",
+    }
+    line = next(
+        ln for ln in cmd_auth._format_markdown(report).splitlines()
+        if ln.startswith("<!-- probe:")
+    )
+    assert line == emit_probe(
+        "GET",
+        "https://api.example.com/v1/x",
+        status=401,
+        retrieved="2026-01-01T00:00:00Z",
+        scope="auth-discovery",
+        fixture="probes/auth-api-example-com-401.json",
+    )
