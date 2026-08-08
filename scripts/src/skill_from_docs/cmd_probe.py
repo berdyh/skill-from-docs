@@ -14,8 +14,8 @@ from urllib.parse import parse_qsl, urlparse
 from . import __version__
 from ._http import (
     AllowlistViolation,
-    HostAllowlist,
     build_client,
+    request_with_retry,
     require_allowlist,
 )
 from ._manifest import now_iso, record_run, sha256_file
@@ -158,46 +158,6 @@ def _fixture_slug(url: str, method: str) -> str:
     return f"{method.lower()}-{safe}"
 
 
-def _retry_with_policy(
-    client,
-    method: str,
-    url: str,
-    *,
-    headers: dict[str, str],
-    content: bytes | None,
-    allowlist: HostAllowlist,
-    max_retries: int,
-    sleeper=time.sleep,
-):
-    """Probe-specific retry: honors Retry-After on 429, backoff on 5xx,
-    returns the last response on max retries exceeded.
-
-    Redirects are not followed; a 30x is returned as-is for the caller to
-    record.
-    """
-    if allowlist is not None:
-        allowlist.check(url)
-
-    attempts = 0
-    last_resp = None
-    while True:
-        last_resp = client.request(method, url, headers=headers, content=content)
-        if last_resp.status_code == 429 and attempts < max_retries:
-            ra = last_resp.headers.get("Retry-After")
-            try:
-                delay = max(0.0, float(ra)) if ra else 2 ** attempts
-            except ValueError:
-                delay = 1.0
-            sleeper(delay)
-            attempts += 1
-            continue
-        if 500 <= last_resp.status_code < 600 and attempts < max_retries:
-            sleeper(2 ** attempts)
-            attempts += 1
-            continue
-        return last_resp
-
-
 def _load_spec_meta(workspace: str) -> tuple[str | None, str | None]:
     """Return (spec_url_at_capture, spec_sha256_at_capture) from raw/source-map.json."""
     path = os.path.join(workspace, "raw", "source-map.json")
@@ -276,18 +236,24 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
     started = now_iso()
     t0 = time.perf_counter()
     with build_client(
+        allowlist=allowlist,
         timeout=args.timeout,
         follow_redirects=False,
         transport=transport,
     ) as client:
         try:
-            resp = _retry_with_policy(
+            # B2: this used to be a 38-line local fork of `request_with_retry`
+            # with identical 429/5xx handling and one difference — it did not
+            # retry transient network errors. `probe` is the subcommand most
+            # likely to hit a flaky live API and the only one exposing
+            # `--max-retries`, so the fork had quietly dropped exactly the
+            # retry its own flag advertises.
+            resp = request_with_retry(
                 client,
                 args.method,
                 args.url,
                 headers=hdrs,
                 content=body_bytes,
-                allowlist=allowlist,
                 max_retries=args.max_retries,
                 sleeper=sleeper,
             )

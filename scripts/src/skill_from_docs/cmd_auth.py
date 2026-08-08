@@ -14,7 +14,6 @@ from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 from . import __version__
 from ._http import (
     AllowlistViolation,
-    HostAllowlist,
     build_client,
     request_with_retry,
     require_allowlist,
@@ -408,16 +407,11 @@ def _build_cascade(
     return cascade
 
 
-def _try(
-    client,
-    url: str,
-    headers: dict[str, str],
-    *,
-    allowlist: HostAllowlist,
-) -> tuple[int, dict[str, str], Any]:
-    resp = request_with_retry(
-        client, "GET", url, allowlist=allowlist, max_retries=0, headers=headers
-    )
+def _try(client, url: str, headers: dict[str, str]) -> tuple[int, dict[str, str], Any]:
+    # No allowlist argument: `client` is a GuardedClient bound to one, so the
+    # check happens inside `client.request` and raises AllowlistViolation from
+    # there. (D1)
+    resp = request_with_retry(client, "GET", url, max_retries=0, headers=headers)
     body: Any
     try:
         body = resp.json()
@@ -539,15 +533,14 @@ def run(args, *, transport=None) -> int:
     success_response_headers: dict[str, str] = {}
 
     with build_client(
+        allowlist=allowlist,
         timeout=args.timeout,
         follow_redirects=args.follow_redirects,
         transport=transport,
     ) as client:
         # Unauthenticated baseline.
         try:
-            base_status, base_headers, base_body = _try(
-                client, args.endpoint, {}, allowlist=allowlist
-            )
+            base_status, base_headers, base_body = _try(client, args.endpoint, {})
         except AllowlistViolation as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
@@ -567,7 +560,6 @@ def run(args, *, transport=None) -> int:
                 client,
                 args.endpoint,
                 {"Authorization": f"Bearer {args.bad_token_pattern}"},
-                allowlist=allowlist,
             )
         except Exception as e:
             print(f"ERROR: network error: {e}", file=sys.stderr)
@@ -596,9 +588,7 @@ def run(args, *, transport=None) -> int:
 
         for pattern in cascade:
             try:
-                status, resp_headers, _body = _try(
-                    client, pattern.url, pattern.headers, allowlist=allowlist
-                )
+                status, resp_headers, _body = _try(client, pattern.url, pattern.headers)
             except AllowlistViolation as exc:
                 print(f"ERROR: {exc}", file=sys.stderr)
                 return 1

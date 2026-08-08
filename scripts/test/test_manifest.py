@@ -98,6 +98,57 @@ def test_probe_records_allow_host_per_run(tmp_path):
     assert run["args"]["allow_host"] == ["api.example.com", "cdn.example.com"]
 
 
+def test_fetch_records_allow_host_per_run(tmp_path: Path):
+    """A12: `cmd_fetch` writes the same per-run audit record as `cmd_probe`,
+    and only probe's was covered — deleting fetch's left the suite green."""
+    import argparse
+
+    import httpx
+
+    from skill_from_docs import cmd_fetch
+
+    spec = json.dumps({"openapi": "3.0.3", "info": {"title": "x", "version": "1"}})
+    transport = httpx.MockTransport(
+        lambda r: httpx.Response(
+            200, content=spec.encode(), headers={"Content-Type": "application/json"}
+        )
+    )
+    args = argparse.Namespace(
+        source="https://api.example.com/openapi.json", output_spec=None,
+        output_source_map=None, no_resolve=True, user_agent=None, timeout=5.0,
+        staleness_days=0, staleness_api_host=None, staleness_api_style=None,
+        count_endpoints=False,
+        allow_host=["api.example.com", "cdn.example.com"],
+        workspace=str(tmp_path), quiet=True,
+    )
+    assert cmd_fetch.run(args, transport=transport) == 0
+    run = json.loads((tmp_path / "manifest.json").read_text())["runs"][-1]
+    assert run["subcommand"] == "fetch"
+    assert run["args"]["allow_host"] == ["api.example.com", "cdn.example.com"]
+
+
+def test_auth_records_allow_host_per_run(tmp_path: Path):
+    """A12: same record, same gap, in `cmd_auth`."""
+    import argparse
+
+    import httpx
+
+    from skill_from_docs import cmd_auth
+
+    args = argparse.Namespace(
+        endpoint="https://api.example.com/v1/x", token="tok", output=None,
+        short_circuit=True, include_query_auth=False, basic_creds=None,
+        basic_creds_env=None, spec=None, bad_token_pattern="bad",
+        allow_host=["api.example.com", "cdn.example.com"],
+        follow_redirects=False, timeout=5.0, workspace=str(tmp_path), quiet=True,
+    )
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json={"ok": True}))
+    assert cmd_auth.run(args, transport=transport) == 0
+    run = json.loads((tmp_path / "manifest.json").read_text())["runs"][-1]
+    assert run["subcommand"] == "auth"
+    assert run["args"]["allow_host"] == ["api.example.com", "cdn.example.com"]
+
+
 def test_allowed_hosts_is_never_read_back_as_an_allowlist(tmp_path):
     """Regression guard for a documented-but-refused feature: a manifest that
     names a host must not grant `probe` permission to reach it."""

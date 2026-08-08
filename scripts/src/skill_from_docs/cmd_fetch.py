@@ -13,6 +13,7 @@ from urllib.parse import urljoin, urlparse
 from ._http import (
     AllowlistViolation,
     DEFAULT_USER_AGENT,
+    NETWORK_ERRORS,
     HostAllowlist,
     build_client,
     request_with_retry,
@@ -303,67 +304,111 @@ def _try_renderers(html: str, base_url: str) -> str | None:
     return None
 
 
-def _discover(
-    client, base_url: str, allowlist: HostAllowlist, *, probe_timeout: float
-) -> tuple[bytes, str]:
-    """Discovery cascade. Returns (spec_bytes, final_url) or raises FetchError.
+def _fetch_direct(client, base_url: str) -> tuple[bytes, str] | None:
+    """Cascade steps 1 and 2: the URL the user named, then — if that page is a
+    renderer shell rather than a spec — the spec URL the shell points at.
 
-    `probe_timeout` bounds only the speculative common-path probes in step 2.
-    The URL the user actually gave us keeps the full `--timeout`.
+    Returns (spec_bytes, final_url), or None to mean "keep looking". An
+    unreachable origin and a renderer 404 both return None; an off-allowlist
+    renderer URL raises AllowlistViolation instead, because that is a user error
+    worth reporting, not something to fall through into common-path probing.
+    A request that could not be *issued* raises FetchError — see
+    `_probe_common_paths`.
     """
-    # 1. Direct fetch.
     try:
-        resp = request_with_retry(client, "GET", base_url, allowlist=allowlist, max_retries=0)
-        if resp.status_code == 200:
-            ct = resp.headers.get("Content-Type", "").lower()
-            body = resp.content
-            if any(t in ct for t in ("json", "yaml", "yml")) or _looks_like_spec(body):
-                return body, base_url
-            # treat as HTML — try renderers
-            html = body.decode("utf-8", errors="replace")
-            renderer_url = _try_renderers(html, base_url)
-            if renderer_url:
-                # Let AllowlistViolation propagate to the handler below — an
-                # off-allowlist renderer URL is a user error worth reporting,
-                # not something to fall through into common-path probing.
-                allowlist.check(renderer_url)
-                r2 = request_with_retry(
-                    client, "GET", renderer_url, allowlist=allowlist, max_retries=0
-                )
-                if r2.status_code == 200:
-                    return r2.content, renderer_url
-    except AllowlistViolation as exc:
-        raise FetchError(str(exc), exit_code=1)
-    except Exception:
-        # Continue to common-path probing for connection errors.
-        pass
+        resp = request_with_retry(client, "GET", base_url, max_retries=0)
+    except AllowlistViolation:
+        raise
+    except NETWORK_ERRORS:
+        return None
+    except Exception as exc:
+        raise FetchError(f"could not issue a request for {base_url}: {exc}", exit_code=1)
+    if resp.status_code != 200:
+        return None
 
-    # 2. Common spec paths against the origin. These are guesses, tried one at
-    # a time, so they must not each inherit the spec-download timeout: against
-    # a host that blackholes rather than refuses, 7 paths x --timeout (30s by
-    # default) meant discovery took 210s to report failure.
+    body = resp.content
+    ct = resp.headers.get("Content-Type", "").lower()
+    if any(t in ct for t in ("json", "yaml", "yml")) or _looks_like_spec(body):
+        return body, base_url
+
+    renderer_url = _try_renderers(body.decode("utf-8", errors="replace"), base_url)
+    if renderer_url is None:
+        return None
+    try:
+        r2 = request_with_retry(client, "GET", renderer_url, max_retries=0)
+    except AllowlistViolation:
+        raise
+    except NETWORK_ERRORS:
+        return None
+    except Exception as exc:
+        raise FetchError(
+            f"could not issue a request for {renderer_url}: {exc}", exit_code=1
+        )
+    if r2.status_code == 200:
+        return r2.content, renderer_url
+    return None
+
+
+def _probe_common_paths(client, base_url: str, *, timeout: float) -> tuple[bytes, str] | None:
+    """Cascade step 3: guess `COMMON_SPEC_PATHS` against the origin.
+
+    These are guesses at paths the user never named, tried one at a time, so
+    they must not each inherit the spec-download timeout: against a host that
+    blackholes rather than refuses, 7 paths x --timeout (30s by default) meant
+    discovery took 210s to report failure.
+    """
     parsed = urlparse(base_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
-    for path in COMMON_SPEC_PATHS:
-        candidate = origin + path
-        try:
-            allowlist.check(candidate)
-        except AllowlistViolation:
-            continue
-        try:
-            resp = request_with_retry(
-                client,
-                "GET",
-                candidate,
-                allowlist=allowlist,
-                max_retries=0,
-                timeout=probe_timeout,
-            )
-        except Exception:
-            continue
-        if resp.status_code == 200 and _looks_like_spec(resp.content):
-            return resp.content, candidate
+    origin_host = parsed.hostname
+    if origin_host is None:
+        return None
 
+    # Speculative probes get a narrowed client as well as a shorter timeout:
+    # every candidate is same-origin by construction, so nothing here needs the
+    # rest of --allow-host. `narrowed` can only restrict, so this cannot reach
+    # anywhere the outer allowlist would have refused.
+    with client.narrowed(HostAllowlist([origin_host])):
+        for path in COMMON_SPEC_PATHS:
+            candidate = origin + path
+            try:
+                resp = request_with_retry(
+                    client, "GET", candidate, max_retries=0, timeout=timeout
+                )
+            except AllowlistViolation:
+                continue
+            except NETWORK_ERRORS:
+                # This candidate is unreachable. Try the next one.
+                continue
+            except Exception as exc:
+                # NOT a network failure: the request could not be issued at all
+                # (a degenerate timeout, a malformed URL). Swallowing this is
+                # how `--timeout 0` came to report "could not discover an
+                # OpenAPI spec" — a network-shaped message for a config
+                # mistake — after silently skipping all seven probes. (A10)
+                raise FetchError(
+                    f"could not issue discovery probe for {candidate}: {exc}",
+                    exit_code=1,
+                )
+            if resp.status_code == 200 and _looks_like_spec(resp.content):
+                return resp.content, candidate
+    return None
+
+
+def _discover(client, base_url: str, *, probe_timeout: float) -> tuple[bytes, str]:
+    """Discovery cascade: direct -> renderer -> common paths. Returns
+    (spec_bytes, final_url) or raises FetchError.
+
+    `probe_timeout` bounds only the speculative common-path probes. The URL the
+    user actually gave us keeps the full `--timeout`.
+    """
+    try:
+        found = _fetch_direct(client, base_url) or _probe_common_paths(
+            client, base_url, timeout=probe_timeout
+        )
+    except AllowlistViolation as exc:
+        raise FetchError(str(exc), exit_code=1)
+    if found is not None:
+        return found
     raise FetchError(
         f"could not discover an OpenAPI spec from {base_url}", exit_code=1
     )
@@ -521,9 +566,11 @@ def _parse_iso_date(date_str: str):
 def _check_staleness(
     source_url: str,
     days: int,
-    client,
     *,
     log,
+    timeout: float = 10.0,
+    transport=None,
+    user_agent: str | None = None,
     explicit_host: str | None = None,
     explicit_style: str | None = None,
 ) -> None:
@@ -531,10 +578,14 @@ def _check_staleness(
     URL's host; falls back to explicit flags for self-hosted instances; skips
     with an actionable note when neither resolves.
 
-    Replaces the original GitHub-only logic. The derived `api_host` becomes a
-    function-local allowlist for the single staleness call — global
-    `--allow-host` is NOT honored here, preserving the narrowed attack surface
-    the codex review imposed.
+    The derived `api_host` is the *only* host this call may reach, and global
+    `--allow-host` does not widen it — `api.github.com` is deliberately not on
+    the fetch allowlist. That is why this builds its own single-host client
+    rather than borrowing the caller's: `GuardedClient.narrowed` only ever
+    restricts, so narrowing a client bound to {raw.githubusercontent.com} down
+    to {api.github.com} correctly permits nothing. A second client states the
+    same per-call policy without giving `narrowed` a widening mode — which is
+    the failure this codebase has shipped before (failure mode 6).
     """
     if days <= 0:
         return
@@ -552,31 +603,31 @@ def _check_staleness(
         )
         return
 
-    # Function-local allowlist: only the derived/explicit api_host is allowed
-    # for this one outbound call. Global --allow-host does not widen this scope.
-    local_allowlist = HostAllowlist([target.api_host])
-    try:
-        local_allowlist.check(target.api_url)
-    except AllowlistViolation as exc:
-        log(f"staleness check: internal allowlist mismatch ({exc})")
-        return
-
-    try:
-        resp = client.get(target.api_url)
-    except Exception as e:
-        log(f"staleness check failed ({target.style}): {e}")
-        return
-    if resp.status_code != 200:
-        log(
-            f"staleness check: {target.style} commits API returned "
-            f"{resp.status_code}"
-        )
-        return
-    try:
-        payload = resp.json()
-    except Exception:
-        log(f"staleness check: {target.style} response was not JSON")
-        return
+    with build_client(
+        allowlist=HostAllowlist([target.api_host]),
+        timeout=timeout,
+        user_agent=user_agent,
+        transport=transport,
+    ) as client:
+        try:
+            resp = client.get(target.api_url)
+        except AllowlistViolation as exc:
+            log(f"staleness check: internal allowlist mismatch ({exc})")
+            return
+        except Exception as e:
+            log(f"staleness check failed ({target.style}): {e}")
+            return
+        if resp.status_code != 200:
+            log(
+                f"staleness check: {target.style} commits API returned "
+                f"{resp.status_code}"
+            )
+            return
+        try:
+            payload = resp.json()
+        except Exception:
+            log(f"staleness check: {target.style} response was not JSON")
+            return
 
     date_str = _extract_commit_date(payload, target.style)
     if not date_str:
@@ -617,6 +668,18 @@ def run(args, *, log=None, transport=None) -> int:
         )
         return 1
 
+    # A10: a non-positive --timeout is a config mistake, and it used to present
+    # as a network one. httpx rejects the value ("Timeout value out of range")
+    # or connects instantly and fails, `_discover` swallowed that per candidate,
+    # and `fetch` reported "could not discover an OpenAPI spec" having issued
+    # nothing. Reject it here where the cause is still visible.
+    if args.timeout <= 0:
+        print(
+            f"ERROR: --timeout must be positive (got {args.timeout}).",
+            file=sys.stderr,
+        )
+        return 1
+
     workspace = args.workspace or default_workspace(args.source)
     os.makedirs(workspace, exist_ok=True)
     os.makedirs(os.path.join(workspace, "raw"), exist_ok=True)
@@ -644,6 +707,7 @@ def run(args, *, log=None, transport=None) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
         with build_client(
+            allowlist=allowlist,
             timeout=args.timeout,
             user_agent=args.user_agent or DEFAULT_USER_AGENT,
             transport=transport,
@@ -652,7 +716,6 @@ def run(args, *, log=None, transport=None) -> int:
                 body, spec_url = _discover(
                     client,
                     args.source,
-                    allowlist,
                     probe_timeout=min(args.timeout, DISCOVERY_PROBE_TIMEOUT),
                 )
             except FetchError as fe:
@@ -661,14 +724,19 @@ def run(args, *, log=None, transport=None) -> int:
             except Exception as e:
                 print(f"ERROR: network error: {e}", file=sys.stderr)
                 return 2
-            _check_staleness(
-                spec_url,
-                args.staleness_days,
-                client,
-                log=log,
-                explicit_host=args.staleness_api_host,
-                explicit_style=args.staleness_api_style,
-            )
+        # Outside the block on purpose: the staleness call must NOT ride on the
+        # fetch client, whose allowlist does not (and must not) list the commits
+        # API host. It builds its own, bound to that one host.
+        _check_staleness(
+            spec_url,
+            args.staleness_days,
+            log=log,
+            timeout=args.timeout,
+            transport=transport,
+            user_agent=args.user_agent,
+            explicit_host=args.staleness_api_host,
+            explicit_style=args.staleness_api_style,
+        )
     else:
         if not os.path.exists(args.source):
             print(f"ERROR: file not found: {args.source}", file=sys.stderr)

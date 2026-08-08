@@ -230,25 +230,21 @@ def test_fetch_local_path_skips_allow_host(tmp_path: Path, fixtures_dir: Path):
 def test_staleness_only_allows_api_github_com():
     """B2: the staleness check function constructs a URL that always targets
     api.github.com — never user-controllable."""
-    import httpx as _httpx
-
     captured_urls: list[str] = []
 
-    def handler(req: _httpx.Request) -> _httpx.Response:
+    def handler(req: httpx.Request) -> httpx.Response:
         captured_urls.append(str(req.url))
-        return _httpx.Response(
+        return httpx.Response(
             200,
             json=[{"commit": {"committer": {"date": "2026-04-01T00:00:00Z"}}}],
         )
 
-    transport = _httpx.MockTransport(handler)
-    with _httpx.Client(transport=transport, trust_env=False) as client:
-        cmd_fetch._check_staleness(
-            "https://raw.githubusercontent.com/owner/repo/main/openapi.json",
-            days=1,
-            client=client,
-            log=lambda m: None,
-        )
+    cmd_fetch._check_staleness(
+        "https://raw.githubusercontent.com/owner/repo/main/openapi.json",
+        days=1,
+        log=lambda m: None,
+        transport=httpx.MockTransport(handler),
+    )
     assert captured_urls
     for url in captured_urls:
         host = re.match(r"https://([^/]+)/", url).group(1)
@@ -477,6 +473,92 @@ def test_discovery_probes_do_not_inherit_the_download_timeout(tmp_path: Path):
     assert direct == ("https://api.example.com/docs", 30.0)
     assert len(probes) == len(cmd_fetch.COMMON_SPEC_PATHS)
     assert {t for _u, t in probes} == {cmd_fetch.DISCOVERY_PROBE_TIMEOUT}
+
+
+@pytest.mark.parametrize("bad", [0, 0.0, -1.0])
+def test_non_positive_timeout_is_reported_as_a_config_error(tmp_path: Path, capsys, bad):
+    """A10: `min(--timeout, DISCOVERY_PROBE_TIMEOUT)` forwarded the degenerate
+    value to httpx, which raises before issuing anything, and `_discover`
+    swallowed it once per candidate. All seven probes were skipped and `fetch`
+    reported "could not discover an OpenAPI spec" — a network-shaped message
+    for a config mistake. Reject it where the cause is still visible."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(404, text="")
+
+    args = _make_args(workspace=str(tmp_path), timeout=bad)
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 1
+    err = capsys.readouterr().err
+    assert "--timeout" in err
+    assert "could not discover" not in err
+    # And nothing was attempted: this is rejected before any client is built.
+    assert calls == []
+
+
+def test_a_request_that_cannot_be_issued_is_not_reported_as_a_404(
+    tmp_path: Path, capsys
+):
+    """B5/A10 second half: the probe loop must tell "this candidate 404'd"
+    apart from "the request could not be issued at all". httpx raises
+    ValueError (not a RequestError) for a timeout out of range; swallowing it
+    per candidate is what turned a config mistake into "could not discover"."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise ValueError("Timeout value out of range")
+
+    args = _make_args(source="https://api.example.com/docs", workspace=str(tmp_path))
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 1
+    err = capsys.readouterr().err
+    assert "could not issue" in err
+    assert "could not discover" not in err
+
+
+def test_an_unreachable_origin_still_falls_through_to_common_paths(
+    tmp_path: Path, fixtures_dir: Path
+):
+    """The other half of the same distinction: a genuine network failure on
+    the URL the user named is *not* fatal — the origin may still serve a spec
+    at one of the common paths."""
+    spec_text = (fixtures_dir / "tiny-openapi-3.json").read_text()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/docs":
+            raise httpx.ConnectError("refused", request=request)
+        if request.url.path == "/openapi.json":
+            return httpx.Response(
+                200,
+                content=spec_text.encode(),
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404, text="")
+
+    args = _make_args(source="https://api.example.com/docs", workspace=str(tmp_path))
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 0
+    assert json.loads((tmp_path / "raw" / "spec.json").read_text())["info"]["title"] == (
+        "Tiny API"
+    )
+
+
+def test_common_path_probes_cannot_leave_the_origin(tmp_path: Path):
+    """The speculative probes run under a narrowed client: same-origin only,
+    even when --allow-host names more hosts. They get a short leash on reach
+    for the same reason they get one on time."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(404, text="")
+
+    args = _make_args(
+        source="https://docs.example.com/api/",
+        workspace=str(tmp_path),
+        allow_host=["docs.example.com", "api.example.com"],
+    )
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 1
+    hosts = {httpx.URL(u).host for u in seen}
+    assert hosts == {"docs.example.com"}
 
 
 def test_discovery_probe_timeout_never_exceeds_the_user_timeout(tmp_path: Path):
