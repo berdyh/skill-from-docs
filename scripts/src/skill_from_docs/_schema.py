@@ -28,9 +28,19 @@ class ProbeManifest:
     captured_at: str
     spec_url_at_capture: str | None = None
     spec_sha256_at_capture: str | None = None
-    # auth-discovery probes carry these. Other scopes leave them None.
+    # auth-discovery probes carry these. Other scopes leave them at defaults.
     auth_method: str | None = None
     security_warnings: list[str] = field(default_factory=list)
+    # The auth cascade: which pattern won, what a deliberately bad token
+    # returned, and every pattern tried with its status. `cmd_auth` used to
+    # hand-build its fixture dict and write these three keys directly, but
+    # `from_dict` did not know them and `cmd_consolidate._load_probes` — the
+    # only reader — goes through `from_dict`, so the whole record was written
+    # to disk and silently dropped on read. They are declared here so the
+    # round-trip is closed.
+    winner_pattern: str | None = None
+    bad_token_status: int | None = None
+    attempts: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -62,6 +72,9 @@ class ProbeFixture:
                 "spec_sha256_at_capture": self.manifest.spec_sha256_at_capture,
                 "auth_method": self.manifest.auth_method,
                 "security_warnings": list(self.manifest.security_warnings),
+                "winner_pattern": self.manifest.winner_pattern,
+                "bad_token_status": self.manifest.bad_token_status,
+                "attempts": list(self.manifest.attempts),
             },
         }
 
@@ -91,6 +104,9 @@ class ProbeFixture:
                 spec_sha256_at_capture=man.get("spec_sha256_at_capture"),
                 auth_method=man.get("auth_method"),
                 security_warnings=list(man.get("security_warnings") or []),
+                winner_pattern=man.get("winner_pattern"),
+                bad_token_status=man.get("bad_token_status"),
+                attempts=list(man.get("attempts") or []),
             ),
         )
 

@@ -12,6 +12,7 @@ from skill_from_docs._redaction import (
     compile_patterns,
     redact_body,
     redact_headers,
+    redact_text,
     redact_url,
 )
 
@@ -190,3 +191,26 @@ def test_redacted_sentinel_is_not_percent_encoded():
 def test_encoded_sensitive_key_is_still_recognised():
     """Decoding before the sensitivity check is what makes this work."""
     assert redact_url("https://x/a?%74oken=secret") == "https://x/a?token=<redacted>"
+
+
+def test_redact_text_redacts_urls_embedded_in_free_text():
+    """`redact_url` only helps when you are holding a URL. Credentials also
+    travel inside strings that merely contain one — an exception message."""
+    msg = 'connection failed for https://api.example.com/v1?api_key=s3cr3t&page=2 (retrying)'
+    out = redact_text(msg)
+    assert "s3cr3t" not in out
+    assert "api_key=<redacted>" in out
+    assert "page=2" in out
+    assert out.startswith("connection failed for ")
+    assert out.endswith(" (retrying)")
+
+
+def test_redact_text_leaves_credential_free_text_alone():
+    assert redact_text("no urls here") == "no urls here"
+    assert redact_text("see https://example.com/docs") == "see https://example.com/docs"
+
+
+def test_redact_text_handles_several_urls_in_one_string():
+    out = redact_text("a https://x.test/?token=A then https://y.test/?token=B")
+    assert "A" not in out.split("then")[0].split("token=")[1]
+    assert out.count("<redacted>") == 2

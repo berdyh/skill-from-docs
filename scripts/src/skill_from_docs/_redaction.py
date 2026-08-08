@@ -89,6 +89,24 @@ def redact_url(url: str) -> str:
     return urlunparse(parsed._replace(query="&".join(rebuilt)))
 
 
+# A URL embedded in free text — an exception message, a log line. Stops at
+# whitespace, quotes, and the punctuation that usually ends a sentence rather
+# than a URL.
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'<>\\]+")
+
+
+def redact_text(text: str) -> str:
+    """Run `redact_url` over every http(s) URL found inside free text.
+
+    `redact_url` only helps when you are holding a URL. Credentials also travel
+    inside strings that merely *contain* one — an httpx exception message for a
+    `--include-query-auth` attempt carries the token in the URL it quotes, and
+    that string is written to a probe fixture. Redact where the value enters the
+    workspace, not at each place it leaves.
+    """
+    return _URL_IN_TEXT_RE.sub(lambda m: redact_url(m.group(0)), text)
+
+
 def redact_body(
     body: Any,
     *,
