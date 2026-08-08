@@ -101,6 +101,15 @@ def require_httpx() -> None:
         )
 
 
+# The exception types that mean "the request reached the network stack and the
+# server did not answer". Anything *outside* this tuple means the request could
+# not be issued at all — a degenerate timeout, a malformed URL — which is a
+# config error a probe loop must not swallow as "that candidate 404'd". (A10/B5)
+NETWORK_ERRORS: tuple[type[BaseException], ...] = (
+    () if httpx is None else (httpx.RequestError,)
+)
+
+
 class _ClientPolicy:
     """The allowlist a `GuardedClient` enforces, plus its narrowing stack.
 
@@ -247,7 +256,6 @@ def request_with_retry(
     method: str,
     url: str,
     *,
-    allowlist: HostAllowlist | None = None,
     max_retries: int = 3,
     headers: dict[str, str] | None = None,
     content: bytes | None = None,
@@ -257,18 +265,15 @@ def request_with_retry(
     """Run a request with 429-Retry-After + 5xx exponential-backoff retries.
 
     Returns the final response (success OR last failing). Raises
-    AllowlistViolation if the URL host isn't allowed. The client enforces its
-    own bound allowlist now; the `allowlist` argument is a redundant pre-check
-    kept only until its last caller (`cmd_fetch._discover`) is rewritten.
+    AllowlistViolation if the URL host isn't allowed by the client's bound
+    allowlist — there is no `allowlist` parameter here any more, because the
+    client enforces it and a second gate is a second thing to remember (D1).
 
     `timeout` overrides the client's timeout for this request only — used for
     speculative probes that should not inherit a long download budget.
 
     Backoff schedule: 1s, 2s, 4s, ...
     """
-    if allowlist is not None:
-        allowlist.check(url)
-
     extra = {} if timeout is None else {"timeout": timeout}
     attempts = 0
     while True:

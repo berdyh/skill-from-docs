@@ -475,6 +475,70 @@ def test_discovery_probes_do_not_inherit_the_download_timeout(tmp_path: Path):
     assert {t for _u, t in probes} == {cmd_fetch.DISCOVERY_PROBE_TIMEOUT}
 
 
+def test_a_request_that_cannot_be_issued_is_not_reported_as_a_404(
+    tmp_path: Path, capsys
+):
+    """B5/A10 second half: the probe loop must tell "this candidate 404'd"
+    apart from "the request could not be issued at all". httpx raises
+    ValueError (not a RequestError) for a timeout out of range; swallowing it
+    per candidate is what turned a config mistake into "could not discover"."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise ValueError("Timeout value out of range")
+
+    args = _make_args(source="https://api.example.com/docs", workspace=str(tmp_path))
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 1
+    err = capsys.readouterr().err
+    assert "could not issue" in err
+    assert "could not discover" not in err
+
+
+def test_an_unreachable_origin_still_falls_through_to_common_paths(
+    tmp_path: Path, fixtures_dir: Path
+):
+    """The other half of the same distinction: a genuine network failure on
+    the URL the user named is *not* fatal — the origin may still serve a spec
+    at one of the common paths."""
+    spec_text = (fixtures_dir / "tiny-openapi-3.json").read_text()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/docs":
+            raise httpx.ConnectError("refused", request=request)
+        if request.url.path == "/openapi.json":
+            return httpx.Response(
+                200,
+                content=spec_text.encode(),
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404, text="")
+
+    args = _make_args(source="https://api.example.com/docs", workspace=str(tmp_path))
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 0
+    assert json.loads((tmp_path / "raw" / "spec.json").read_text())["info"]["title"] == (
+        "Tiny API"
+    )
+
+
+def test_common_path_probes_cannot_leave_the_origin(tmp_path: Path):
+    """The speculative probes run under a narrowed client: same-origin only,
+    even when --allow-host names more hosts. They get a short leash on reach
+    for the same reason they get one on time."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(404, text="")
+
+    args = _make_args(
+        source="https://docs.example.com/api/",
+        workspace=str(tmp_path),
+        allow_host=["docs.example.com", "api.example.com"],
+    )
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 1
+    hosts = {httpx.URL(u).host for u in seen}
+    assert hosts == {"docs.example.com"}
+
+
 def test_discovery_probe_timeout_never_exceeds_the_user_timeout(tmp_path: Path):
     """A --timeout tighter than the clamp wins; the clamp is a ceiling."""
     seen: list[float | None] = []
