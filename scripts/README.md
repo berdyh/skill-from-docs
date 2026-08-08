@@ -135,6 +135,8 @@ openapi-harvest validate ~/.claude/skill-from-docs/api.hetzner.cloud
 ## Tests
 
 ```bash
-pip install -e ./scripts pytest
+pip install -e ./scripts
+pip install pytest ruff
 pytest scripts/test/ -v
+ruff check scripts/src scripts/test
 ```
