@@ -493,3 +493,20 @@ def test_empty_narrative_file_is_treated_as_absent(tmp_path: Path, fixtures_dir:
     assert "<!-- TODO: provide a minimal working example -->" in docs
     assert "raw_file: narrative/example.md" not in docs
     assert "raw_file: narrative/errors.md" not in docs
+
+
+def test_spec_is_walked_exactly_once(tmp_path: Path, fixtures_dir: Path, monkeypatch):
+    """B3: the spec used to be traversed three times per run — twice to group
+    by tag and once for the endpoint/tag counts. `WalkedSpec` is that walk."""
+    (tmp_path / "raw").mkdir()
+    shutil.copy(fixtures_dir / "tiny-openapi-3.json", tmp_path / "raw" / "spec.json")
+    real = cmd_consolidate.iter_operations
+    calls = []
+
+    def counting(spec):
+        calls.append(1)
+        return real(spec)
+
+    monkeypatch.setattr(cmd_consolidate, "iter_operations", counting)
+    assert cmd_consolidate.run(_args(str(tmp_path), merge_probes=True)) == 0
+    assert len(calls) == 1, f"spec traversed {len(calls)} times"

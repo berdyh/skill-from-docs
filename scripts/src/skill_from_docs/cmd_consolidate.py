@@ -8,6 +8,7 @@ import os
 import re
 import sys
 from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 from urllib.parse import urlparse
 
@@ -150,18 +151,47 @@ def _load_narratives(workspace: str, narrative_dir: str | None) -> dict[str, str
     return out
 
 
-def _group_ops_by_tag(spec: dict[str, Any]) -> dict[str, list[tuple[str, str, dict[str, Any]]]]:
-    by_tag: dict[str, list[tuple[str, str, dict[str, Any]]]] = defaultdict(list)
-    for path, method, op in iter_operations(spec):
-        for tag in op.get("tags") or ["_untagged"]:
-            by_tag[tag].append((path, method.upper(), op))
-    return by_tag
+@dataclass
+class WalkedSpec:
+    """Everything both builders need from the spec, derived in one traversal.
 
+    `iter_operations` made the renderer and the handoff builder share one
+    definition of "an operation"; it did not stop them walking the spec three
+    times per run (twice to group by tag, once for the counts). This is that
+    walk, done once in `run()`.
 
-def _filter_tags(by_tag: dict, allowed: list[str]) -> dict:
-    if not allowed:
-        return by_tag
-    return {k: v for k, v in by_tag.items() if k in allowed}
+    `by_tag` is already `--tag`-filtered; `endpoint_count` and `tag_count`
+    deliberately are not — they describe the spec, not the slice being rendered.
+    """
+
+    operations: tuple[tuple[str, str, dict[str, Any]], ...] = ()
+    by_tag: dict[str, list[tuple[str, str, dict[str, Any]]]] = field(default_factory=dict)
+    paths: tuple[str, ...] = ()
+    endpoint_count: int = 0
+    tag_count: int = 0
+
+    @classmethod
+    def walk(cls, spec: dict[str, Any] | None, *, tags_filter: list[str]) -> "WalkedSpec":
+        operations: list[tuple[str, str, dict[str, Any]]] = []
+        grouped: dict[str, list[tuple[str, str, dict[str, Any]]]] = defaultdict(list)
+        tags_seen: set[str] = set()
+        for path, method, op in iter_operations(spec):
+            operations.append((path, method, op))
+            tags = op.get("tags")
+            tags_seen.update(tags or [])
+            for tag in tags or ["_untagged"]:
+                grouped[tag].append((path, method.upper(), op))
+        by_tag = dict(grouped)
+        if tags_filter:
+            by_tag = {k: v for k, v in by_tag.items() if k in tags_filter}
+        paths = list(dict.fromkeys(p for ops in by_tag.values() for p, _m, _op in ops))
+        return cls(
+            operations=tuple(operations),
+            by_tag=by_tag,
+            paths=tuple(paths),
+            endpoint_count=len(operations),
+            tag_count=len(tags_seen),
+        )
 
 
 def _endpoint_block(
@@ -331,6 +361,7 @@ def _api_reference_body(
     source_map: dict[str, Any] | None,
     spec_path: str | None,
     probes: ProbeIndex,
+    walked: WalkedSpec,
     *,
     tags_filter: list[str],
     merge_probes: bool,
@@ -346,9 +377,7 @@ def _api_reference_body(
         if spec_path
         else "raw/spec.json"
     )
-    by_tag = _group_ops_by_tag(spec)
-    by_tag = _filter_tags(by_tag, tags_filter)
-    spec_paths = [path for ops in by_tag.values() for path, _m, _op in ops]
+    by_tag = walked.by_tag
     lines: list[str] = []
 
     if not by_tag:
@@ -404,7 +433,7 @@ def _api_reference_body(
     else:
         orphan_msg = None
     if orphan_msg:
-        for probe, _filename in probes.unmatched(spec_paths):
+        for probe, _filename in probes.unmatched(walked.paths):
             warnings.append(
                 f"probe {probe.request.method} {probe.request.url} {orphan_msg}"
             )
@@ -417,6 +446,7 @@ def _build_docs_md(
     spec_path: str | None,
     probes: ProbeIndex,
     narratives: dict[str, str],
+    walked: WalkedSpec,
     *,
     tags_filter: list[str],
     merge_probes: bool,
@@ -455,6 +485,7 @@ def _build_docs_md(
             source_map,
             spec_path,
             probes,
+            walked,
             tags_filter=tags_filter,
             merge_probes=merge_probes,
             retrieved=retrieved,
@@ -507,26 +538,18 @@ def _build_handoff(
     retrieved: str,
     docs_md_text: str,
     *,
-    tag_filter: list[str],
+    walked: WalkedSpec,
 ) -> dict[str, Any]:
     info = (spec or {}).get("info", {})
     title = info.get("title", "tool")
     proposed_name = f"{title.lower().replace(' ', '-')}-integration"
-    endpoint_count = 0
-    tags_seen: set[str] = set()
-    for _path, _method, op in iter_operations(spec):
-        endpoint_count += 1
-        tags_seen.update(op.get("tags") or [])
-    tag_count = len(tags_seen)
 
     spec_url = (source_map or {}).get("spec_url")
     spec_format = (source_map or {}).get("format")
 
     provenance_index: dict[str, Any] = {}
     if spec:
-        by_tag = _group_ops_by_tag(spec)
-        by_tag = _filter_tags(by_tag, tag_filter)
-        for tag, ops in by_tag.items():
+        for tag, ops in walked.by_tag.items():
             # tag-level entry for the H3 section in docs.md
             tag_section_key = f"API reference > Tag: {tag}"
             provenance_index.setdefault(tag_section_key, {"sources": [], "probes": []})
@@ -580,8 +603,8 @@ def _build_handoff(
         "has_openapi_spec": bool(spec),
         "spec_url": spec_url,
         "spec_format": spec_format,
-        "endpoint_count": endpoint_count,
-        "tag_count": tag_count,
+        "endpoint_count": walked.endpoint_count,
+        "tag_count": walked.tag_count,
     }
     if auth_method is not None:
         content_shape_signals["auth_method"] = auth_method
@@ -782,6 +805,9 @@ def run(args) -> int:
             sanitized_narratives[k] = result.text
         narratives = sanitized_narratives
 
+    # The one spec traversal. Both builders read this value.
+    walked = WalkedSpec.walk(spec, tags_filter=args.tag)
+
     warnings: list[str] = []
     docs_md = _build_docs_md(
         spec,
@@ -789,6 +815,7 @@ def run(args) -> int:
         spec_path,
         probes,
         narratives,
+        walked,
         tags_filter=args.tag,
         merge_probes=args.merge_probes,
         retrieved=retrieved,
@@ -802,7 +829,7 @@ def run(args) -> int:
             print("\n=== handoff.json ===")
             print(json.dumps(
                 _build_handoff(
-                    workspace, spec, source_map, probes, retrieved, docs_md, tag_filter=args.tag
+                    workspace, spec, source_map, probes, retrieved, docs_md, walked=walked
                 ),
                 indent=2,
             ))
@@ -818,7 +845,7 @@ def run(args) -> int:
 
     if args.emit_handoff:
         handoff = _build_handoff(
-            workspace, spec, source_map, probes, retrieved, docs_md, tag_filter=args.tag
+            workspace, spec, source_map, probes, retrieved, docs_md, walked=walked
         )
         handoff_path = os.path.join(workspace, "handoff.json")
         with open(handoff_path, "w", encoding="utf-8") as f:
