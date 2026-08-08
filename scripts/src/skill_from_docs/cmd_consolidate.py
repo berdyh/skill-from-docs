@@ -49,6 +49,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.set_defaults(func=run)
 
 
+# --------------------------------------------------------------------------
+# Load layer
+# --------------------------------------------------------------------------
+
+
 def _read_json(path: str) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -161,6 +166,11 @@ def _load_narratives(workspace: str, narrative_dir: str | None) -> dict[str, str
     return out
 
 
+# --------------------------------------------------------------------------
+# Spec-walk layer
+# --------------------------------------------------------------------------
+
+
 @dataclass
 class WalkedSpec:
     """Everything both builders need from the spec, derived in one traversal.
@@ -202,6 +212,57 @@ class WalkedSpec:
             endpoint_count=len(operations),
             tag_count=len(tags_seen),
         )
+
+
+# --------------------------------------------------------------------------
+# Render layer
+# --------------------------------------------------------------------------
+
+
+def _emit_section(lines: list[str], heading: str, body: Iterable[str]) -> None:
+    """Write one `## <heading>` section: the heading, a blank, the body, and
+    exactly one trailing blank line. Nine sections used to repeat this
+    scaffolding by hand, ~100 lines of it.
+
+    Trailing blanks already in `body` are collapsed into that one separator, so
+    a body that naturally ends in a blank (every endpoint block does) does not
+    open a double gap before the next H2.
+    """
+    lines.append(f"## {heading}")
+    lines.append("")
+    body = list(body)
+    while body and body[-1] == "":
+        body.pop()
+    lines.extend(body)
+    lines.append("")
+
+
+def _emit_narrative_section(
+    lines: list[str],
+    heading: str,
+    narratives: dict[str, str],
+    key: str,
+    retrieved: str,
+    *,
+    missing_todo: str | None = None,
+) -> None:
+    """H6: write a section body sourced from `narrative/<key>.md`, emitting a
+    `<!-- source: narrative file: ... -->` provenance comment so `validate`
+    accepts the section. Falls back to `_Not documented upstream._` (plus
+    `missing_todo`, if the section has one) when no narrative exists.
+    """
+    body = narratives.get(key)
+    if body:
+        section = [
+            body,
+            "",
+            emit_source("(narrative)", retrieved=retrieved, raw_file=f"narrative/{key}.md"),
+        ]
+    else:
+        section = ["_Not documented upstream._"]
+        if missing_todo:
+            section.extend(["", missing_todo])
+    _emit_section(lines, heading, section)
 
 
 def _endpoint_block(
@@ -280,52 +341,6 @@ def _endpoint_block(
         )
     lines.append("")
     return lines
-
-
-def _emit_section(lines: list[str], heading: str, body: Iterable[str]) -> None:
-    """Write one `## <heading>` section: the heading, a blank, the body, and
-    exactly one trailing blank line. Nine sections used to repeat this
-    scaffolding by hand, ~100 lines of it.
-
-    Trailing blanks already in `body` are collapsed into that one separator, so
-    a body that naturally ends in a blank (every endpoint block does) does not
-    open a double gap before the next H2.
-    """
-    lines.append(f"## {heading}")
-    lines.append("")
-    body = list(body)
-    while body and body[-1] == "":
-        body.pop()
-    lines.extend(body)
-    lines.append("")
-
-
-def _emit_narrative_section(
-    lines: list[str],
-    heading: str,
-    narratives: dict[str, str],
-    key: str,
-    retrieved: str,
-    *,
-    missing_todo: str | None = None,
-) -> None:
-    """H6: write a section body sourced from `narrative/<key>.md`, emitting a
-    `<!-- source: narrative file: ... -->` provenance comment so `validate`
-    accepts the section. Falls back to `_Not documented upstream._` (plus
-    `missing_todo`, if the section has one) when no narrative exists.
-    """
-    body = narratives.get(key)
-    if body:
-        section = [
-            body,
-            "",
-            emit_source("(narrative)", retrieved=retrieved, raw_file=f"narrative/{key}.md"),
-        ]
-    else:
-        section = ["_Not documented upstream._"]
-        if missing_todo:
-            section.extend(["", missing_todo])
-    _emit_section(lines, heading, section)
 
 
 def _authentication_body(
@@ -480,13 +495,17 @@ def _build_docs_md(
             "- [x] Probes merged" if merge_probes and probes else "- [ ] Probes not merged",
         ],
     )
-    _emit_narrative_section(lines, _HEADING["Installation"], narratives, "installation", retrieved)
+    _emit_narrative_section(
+        lines, _HEADING["Installation"], narratives, "installation", retrieved
+    )
     _emit_section(
         lines,
         _HEADING["Authentication"],
         _authentication_body(spec, source_map, narratives, retrieved),
     )
-    _emit_narrative_section(lines, _HEADING["Core concepts"], narratives, "core-concepts", retrieved)
+    _emit_narrative_section(
+        lines, _HEADING["Core concepts"], narratives, "core-concepts", retrieved
+    )
     _emit_section(
         lines,
         _HEADING["API reference"],
@@ -517,6 +536,11 @@ def _build_docs_md(
     _emit_narrative_section(lines, _HEADING["Gotchas"], narratives, "gotchas", retrieved)
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+# --------------------------------------------------------------------------
+# Driver
+# --------------------------------------------------------------------------
 
 
 def run(args) -> int:
