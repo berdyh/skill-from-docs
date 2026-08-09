@@ -25,7 +25,7 @@ from ._manifest import file_entry, now_iso, record_run
 from ._provenance import emit_probe, emit_source
 from ._sanitize import sanitize_spec_descriptions, sanitize_text, sanitize_text_for_markdown
 from ._schema import ProbeFixture, read_source_map
-from ._spec import iter_operations, json_pointer
+from ._spec import classify_mirror, iter_operations, json_pointer
 
 # One source of truth for the canonical H2s, indexed by the name
 # `handoff.coverage_checklist` uses. The renderer and the checklist used to
@@ -275,6 +275,7 @@ def _endpoint_block(
     op: dict[str, Any],
     *,
     spec_url: str | None,
+    mirror: str | None,
     retrieved: str,
     raw_file: str,
     probes_for_endpoint: list[tuple[ProbeFixture, str]],
@@ -325,7 +326,13 @@ def _endpoint_block(
     pointer = json_pointer(path, method)
     if spec_url:
         lines.append(
-            emit_source(spec_url, retrieved=retrieved, raw_file=raw_file, spec_pointer=pointer)
+            emit_source(
+                spec_url,
+                retrieved=retrieved,
+                raw_file=raw_file,
+                spec_pointer=pointer,
+                mirror=mirror,
+            )
         )
     else:
         lines.append(
@@ -355,6 +362,7 @@ def _authentication_body(
 ) -> list[str]:
     auth_body = narratives.get("authentication")
     spec_url_for_auth = (source_map or {}).get("spec_url")
+    mirror = classify_mirror(spec_url_for_auth, spec)
     if auth_body:
         return [
             auth_body,
@@ -363,6 +371,7 @@ def _authentication_body(
                 spec_url_for_auth or "(narrative)",
                 retrieved=retrieved,
                 raw_file="narrative/authentication.md",
+                mirror=mirror,
             ),
         ]
     sec = (spec or {}).get("components", {}).get("securitySchemes", {})
@@ -380,6 +389,7 @@ def _authentication_body(
             retrieved=retrieved,
             raw_file="raw/spec.json",
             spec_pointer="/components/securitySchemes",
+            mirror=mirror,
         )
     )
     return lines
@@ -401,6 +411,7 @@ def _api_reference_body(
         return ["_No spec available._"]
 
     spec_url = (source_map or {}).get("spec_url")
+    mirror = classify_mirror(spec_url, spec)
     spec_raw_rel = (
         os.path.relpath(spec_path, os.path.dirname(os.path.dirname(spec_path)))
         if spec_path
@@ -432,6 +443,7 @@ def _api_reference_body(
                 retrieved=retrieved,
                 raw_file=spec_raw_rel,
                 spec_pointer=f"/tags/{pointer_tag}",
+                mirror=mirror,
             )
         )
         lines.append("")
@@ -443,6 +455,7 @@ def _api_reference_body(
                     method,
                     op,
                     spec_url=spec_url,
+                    mirror=mirror,
                     retrieved=retrieved,
                     raw_file=spec_raw_rel,
                     probes_for_endpoint=probes.for_path(path) if merge_probes else [],

@@ -14,6 +14,7 @@ editing `HTTP_METHODS` and nothing else.
 from __future__ import annotations
 
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
 
 HTTP_METHODS: tuple[str, ...] = (
@@ -67,3 +68,50 @@ def json_pointer(path: str, method: str) -> str:
     """
     escaped = path.replace("~", "~0").replace("/", "~1")
     return f"/paths/{escaped}/{method.lower()}"
+
+
+def declared_api_hosts(spec: dict[str, Any] | None) -> set[str]:
+    """Hosts the spec's own `servers` block says the API lives on.
+
+    Relative server URLs ("/v1") name no host and are skipped: they mean "same
+    origin as wherever you got this spec", which is the opposite of a mirror.
+    """
+    hosts: set[str] = set()
+    for server in (spec or {}).get("servers") or []:
+        if not isinstance(server, dict):
+            continue
+        url = server.get("url")
+        if not isinstance(url, str):
+            continue
+        try:
+            host = urlparse(url).hostname
+        except ValueError:
+            continue
+        if host:
+            hosts.add(host.lower())
+    return hosts
+
+
+def classify_mirror(spec_url: str | None, spec: dict[str, Any] | None) -> str | None:
+    """Return `"unofficial"` when the spec was served by a host other than the
+    API's own, else None.
+
+    This records a *fact* — "this spec came from somewhere other than the API it
+    describes" — not a judgement about who maintains it. A vendor's own spec
+    published to a code-hosting site is labelled the same as a third-party
+    re-host, because from here they are indistinguishable. Downstream should
+    read it as "verify this source", not "distrust this source".
+
+    Returns None when either side is unknown, so absence of the label never
+    means "verified official".
+    """
+    if not spec_url:
+        return None
+    try:
+        source_host = urlparse(spec_url).hostname
+    except ValueError:
+        return None
+    declared = declared_api_hosts(spec)
+    if not source_host or not declared:
+        return None
+    return None if source_host.lower() in declared else "unofficial"

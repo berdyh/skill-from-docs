@@ -551,3 +551,49 @@ def test_suggested_test_cases_skip_non_operation_path_keys(tmp_path: Path):
     endpoints = [c["endpoint"] for c in handoff["suggested_test_cases"]]
     assert "PARAMETERS /x" not in endpoints
     assert "GET /x" in endpoints
+
+
+def test_mirror_label_marks_a_spec_served_from_another_host(tmp_path: Path, fixtures_dir: Path):
+    """`mirror: unofficial` was documented in three places as driving
+    skill-creator's trust handling, `_provenance` supported the field, and
+    `consolidate` never set it — a downstream contract nothing produced.
+
+    It records a fact: the spec came from a host other than the one its own
+    `servers` block declares. It is not a claim about who maintains it.
+    """
+    ws = tmp_path
+    (ws / "raw").mkdir()
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "T", "version": "1"},
+        "servers": [{"url": "https://api.example.com/v1"}],
+        "paths": {"/x": {"get": {"summary": "s", "responses": {"200": {"description": "ok"}}}}},
+    }
+    (ws / "raw" / "spec.json").write_text(json.dumps(spec))
+    (ws / "raw" / "source-map.json").write_text(
+        json.dumps({"spec_url": "https://mirror.example.net/openapi.json"})
+    )
+    cmd_consolidate.run(_args(str(ws)))
+    assert "mirror: unofficial" in (ws / "docs.md").read_text()
+
+
+def test_no_mirror_label_when_the_spec_came_from_its_own_api_host(
+    tmp_path: Path, fixtures_dir: Path
+):
+    """Absence must not be noise. A spec served by the API it describes is not a
+    mirror, so the label stays off — and it also stays off when either side is
+    unknown, so absence never means "verified official"."""
+    ws = tmp_path
+    (ws / "raw").mkdir()
+    spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "T", "version": "1"},
+        "servers": [{"url": "https://api.example.com/v1"}],
+        "paths": {"/x": {"get": {"summary": "s", "responses": {"200": {"description": "ok"}}}}},
+    }
+    (ws / "raw" / "spec.json").write_text(json.dumps(spec))
+    (ws / "raw" / "source-map.json").write_text(
+        json.dumps({"spec_url": "https://api.example.com/openapi.json"})
+    )
+    cmd_consolidate.run(_args(str(ws)))
+    assert "mirror:" not in (ws / "docs.md").read_text()
