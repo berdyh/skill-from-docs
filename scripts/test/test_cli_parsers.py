@@ -36,7 +36,9 @@ EXPECTED_OPTIONS = {
         "-o/--output", "--scope", "--no-redact", "--redact-body-key",
         "--redact-body-pattern", "--max-retries", "--dry-run",
     },
-    "quick-diff": {"-h/--help", "-o/--output", "--source-map", "--strict"},
+    # No --source-map: it was accepted and read by nothing, so passing it was a
+    # silent no-op. Removed rather than implemented.
+    "quick-diff": {"-h/--help", "-o/--output", "--strict"},
     "consolidate": {
         "-h/--help", "-q/--quiet", "--merge-probes", "--tag", "--narrative-dir",
         "--emit-handoff", "--no-emit-handoff", "--no-sanitize-descriptions",

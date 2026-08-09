@@ -41,7 +41,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("fixture")
     p.add_argument("spec")
     p.add_argument("-o", "--output")
-    p.add_argument("--source-map")
+    # No --source-map. It was accepted here and read by nothing, so passing it
+    # was a silent no-op — the user believed they had scoped the comparison and
+    # had not. Removed rather than implemented, the same call made for
+    # --follow-redirects: an option obliges you to maintain what it promises,
+    # and argparse rejecting an unknown flag tells the user immediately.
     p.add_argument("--strict", action="store_true")
     p.set_defaults(func=run)
 
