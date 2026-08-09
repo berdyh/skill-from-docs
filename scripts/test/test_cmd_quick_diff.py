@@ -11,7 +11,7 @@ from skill_from_docs import cmd_quick_diff
 
 def _args(fixture: str, spec: str, **overrides):
     base = dict(
-        fixture=fixture, spec=spec, output=None, source_map=None, strict=False
+        fixture=fixture, spec=spec, output=None, strict=False
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -215,3 +215,21 @@ def test_quick_diff_output_has_drift_validation_provenance(
     assert "<!-- probe:" in out
     assert "scope: drift-validation" in out
     assert "fixture:" in out
+
+
+def test_source_map_flag_is_rejected_rather_than_silently_ignored():
+    """`--source-map` was accepted by the parser and read by no code path.
+
+    A user passing it got no error and no effect — they believed they had
+    scoped the comparison and had not. argparse rejecting it is the whole
+    point: a no-op flag is worse than a missing one.
+    """
+    import pytest
+
+    from skill_from_docs.openapi_harvest import build_parser
+
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(
+            ["quick-diff", "fix.json", "spec.json", "--source-map", "raw/source-map.json"]
+        )
+    assert exc.value.code == 2

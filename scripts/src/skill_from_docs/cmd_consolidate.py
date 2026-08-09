@@ -1,4 +1,10 @@
-"""openapi-harvest consolidate — emit docs.md and handoff.json from a workspace."""
+"""openapi-harvest consolidate — emit docs.md and handoff.json from a workspace.
+
+Three layers live here — load, spec-walk, render — and the fourth, the handoff
+packet, lives in `_handoff.py`. The spec is walked exactly once per run, in
+`WalkedSpec.walk`, and the resulting value feeds both the renderer and the
+handoff builder.
+"""
 
 from __future__ import annotations
 
@@ -8,15 +14,23 @@ import os
 import re
 import sys
 from collections import defaultdict
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Iterator
+from urllib.parse import urlparse
 
-from . import __version__
+from . import _cli
+from ._handoff import CANONICAL_SECTIONS, build_handoff
+from ._io import write_json, write_text
 from ._manifest import file_entry, now_iso, record_run
 from ._provenance import emit_probe, emit_source
 from ._sanitize import sanitize_spec_descriptions, sanitize_text, sanitize_text_for_markdown
-from ._schema import HANDOFF_VERSION, ProbeFixture, lint_handoff
-from ._spec import iter_operations, json_pointer
+from ._schema import ProbeFixture, read_source_map
+from ._spec import classify_mirror, iter_operations, json_pointer
 
+# One source of truth for the canonical H2s, indexed by the name
+# `handoff.coverage_checklist` uses. The renderer and the checklist used to
+# carry separate copies that disagreed on "Rate limits, quotas, versioning".
+_HEADING: dict[str, str] = {s.name: s.heading for s in CANONICAL_SECTIONS}
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -24,6 +38,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "consolidate",
         help="emit docs.md + handoff.json",
         description="Walk a workspace and assemble docs.md (canonical H2s, per-tag H3s) plus handoff.json.",
+        parents=[_cli.quiet()],
     )
     p.add_argument("workspace", nargs="?")
     p.add_argument("--merge-probes", action="store_true")
@@ -33,8 +48,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--no-emit-handoff", dest="emit_handoff", action="store_false")
     p.add_argument("--no-sanitize-descriptions", dest="sanitize", action="store_false", default=True)
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("-q", "--quiet", action="store_true")
     p.set_defaults(func=run)
+
+
+# --------------------------------------------------------------------------
+# Load layer
+# --------------------------------------------------------------------------
 
 
 def _read_json(path: str) -> Any:
@@ -49,19 +68,83 @@ def _read_text(path: str) -> str:
 
 def _load_spec(workspace: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
     spec_path = os.path.join(workspace, "raw", "spec.json")
-    map_path = os.path.join(workspace, "raw", "source-map.json")
     if not os.path.exists(spec_path):
         return None, None, None
     spec = _read_json(spec_path)
-    source_map = _read_json(map_path) if os.path.exists(map_path) else {}
+    # `read_source_map`, not `_read_json`: it strips `fetch_url`, so the layer
+    # that writes `docs.md` and `handoff.json` is never handed the unredacted
+    # spec URL in the first place (A8). Everything below reads `spec_url`.
+    source_map = read_source_map(workspace)
     return spec, source_map, spec_path
 
 
-def _load_probes(workspace: str) -> list[tuple[ProbeFixture, str]]:
-    """Return [(fixture, filename), ...] from the workspace probes/ directory."""
+def _probe_url_path(url: str) -> str:
+    """The path component of a probe's request URL, or `""` if it cannot be
+    parsed. `urlparse` raises on a malformed IPv6 literal (`http://[::1`); a
+    fixture carrying one used to take the whole run down with a traceback,
+    breaking the numeric exit-code contract. An unparseable URL now simply
+    matches no endpoint, which surfaces as the usual orphan-probe warning.
+    """
+    try:
+        return urlparse(url).path
+    except ValueError:
+        return ""
+
+
+class ProbeIndex:
+    """Probe fixtures, with each request URL's path parsed once at load.
+
+    Matching is by path suffix, and five independent passes over the spec each
+    ask the same questions. The old `_match_probe` called `urlparse` per
+    (probe, path) pair: 105,842 calls and 0.80 s of a 1.28 s profiled run at
+    Stripe scale, for a value with 30 distinct inputs. Parsing at load kills the
+    per-call cost; memoising the scan per path kills the pass multiplier.
+    """
+
+    __slots__ = ("_entries", "_paths", "_cache")
+
+    def __init__(self, entries: Iterable[tuple[ProbeFixture, str]] = ()) -> None:
+        self._entries: list[tuple[ProbeFixture, str]] = list(entries)
+        self._paths: list[str] = [_probe_url_path(f.request.url) for f, _n in self._entries]
+        self._cache: dict[str, list[int]] = {}
+
+    def __iter__(self) -> Iterator[tuple[ProbeFixture, str]]:
+        return iter(self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __bool__(self) -> bool:
+        return bool(self._entries)
+
+    def _indices_for(self, path: str) -> list[int]:
+        hit = self._cache.get(path)
+        if hit is None:
+            # `pp == path` is the degenerate case of the suffix test.
+            hit = [i for i, pp in enumerate(self._paths) if pp.endswith(path)]
+            self._cache[path] = hit
+        return hit
+
+    def for_path(self, path: str) -> list[tuple[ProbeFixture, str]]:
+        """Fixtures whose URL path ends with `path`, in load order."""
+        return [self._entries[i] for i in self._indices_for(path)]
+
+    def has_match(self, path: str) -> bool:
+        return bool(self._indices_for(path))
+
+    def unmatched(self, paths: Iterable[str]) -> list[tuple[ProbeFixture, str]]:
+        """Fixtures matching none of `paths`, in load order."""
+        seen: set[int] = set()
+        for path in paths:
+            seen.update(self._indices_for(path))
+        return [e for i, e in enumerate(self._entries) if i not in seen]
+
+
+def _load_probes(workspace: str) -> ProbeIndex:
+    """Index the workspace's probes/ directory."""
     probes_dir = os.path.join(workspace, "probes")
     if not os.path.isdir(probes_dir):
-        return []
+        return ProbeIndex()
     out: list[tuple[ProbeFixture, str]] = []
     for name in sorted(os.listdir(probes_dir)):
         if not name.endswith(".json"):
@@ -71,7 +154,7 @@ def _load_probes(workspace: str) -> list[tuple[ProbeFixture, str]]:
             out.append((ProbeFixture.from_dict(data), name))
         except Exception:
             continue
-    return out
+    return ProbeIndex(out)
 
 
 def _load_narratives(workspace: str, narrative_dir: str | None) -> dict[str, str]:
@@ -87,18 +170,103 @@ def _load_narratives(workspace: str, narrative_dir: str | None) -> dict[str, str
     return out
 
 
-def _group_ops_by_tag(spec: dict[str, Any]) -> dict[str, list[tuple[str, str, dict[str, Any]]]]:
-    by_tag: dict[str, list[tuple[str, str, dict[str, Any]]]] = defaultdict(list)
-    for path, method, op in iter_operations(spec):
-        for tag in op.get("tags") or ["_untagged"]:
-            by_tag[tag].append((path, method.upper(), op))
-    return by_tag
+# --------------------------------------------------------------------------
+# Spec-walk layer
+# --------------------------------------------------------------------------
 
 
-def _filter_tags(by_tag: dict, allowed: list[str]) -> dict:
-    if not allowed:
-        return by_tag
-    return {k: v for k, v in by_tag.items() if k in allowed}
+@dataclass
+class WalkedSpec:
+    """Everything both builders need from the spec, derived in one traversal.
+
+    `iter_operations` made the renderer and the handoff builder share one
+    definition of "an operation"; it did not stop them walking the spec three
+    times per run (twice to group by tag, once for the counts). This is that
+    walk, done once in `run()`.
+
+    `by_tag` is already `--tag`-filtered; `endpoint_count` and `tag_count`
+    deliberately are not — they describe the spec, not the slice being rendered.
+    """
+
+    operations: tuple[tuple[str, str, dict[str, Any]], ...] = ()
+    by_tag: dict[str, list[tuple[str, str, dict[str, Any]]]] = field(default_factory=dict)
+    paths: tuple[str, ...] = ()
+    endpoint_count: int = 0
+    tag_count: int = 0
+
+    @classmethod
+    def walk(cls, spec: dict[str, Any] | None, *, tags_filter: list[str]) -> "WalkedSpec":
+        operations: list[tuple[str, str, dict[str, Any]]] = []
+        grouped: dict[str, list[tuple[str, str, dict[str, Any]]]] = defaultdict(list)
+        tags_seen: set[str] = set()
+        for path, method, op in iter_operations(spec):
+            operations.append((path, method, op))
+            tags = op.get("tags")
+            tags_seen.update(tags or [])
+            for tag in tags or ["_untagged"]:
+                grouped[tag].append((path, method.upper(), op))
+        by_tag = dict(grouped)
+        if tags_filter:
+            by_tag = {k: v for k, v in by_tag.items() if k in tags_filter}
+        paths = list(dict.fromkeys(p for ops in by_tag.values() for p, _m, _op in ops))
+        return cls(
+            operations=tuple(operations),
+            by_tag=by_tag,
+            paths=tuple(paths),
+            endpoint_count=len(operations),
+            tag_count=len(tags_seen),
+        )
+
+
+# --------------------------------------------------------------------------
+# Render layer
+# --------------------------------------------------------------------------
+
+
+def _emit_section(lines: list[str], heading: str, body: Iterable[str]) -> None:
+    """Write one `## <heading>` section: the heading, a blank, the body, and
+    exactly one trailing blank line. Nine sections used to repeat this
+    scaffolding by hand, ~100 lines of it.
+
+    Trailing blanks already in `body` are collapsed into that one separator, so
+    a body that naturally ends in a blank (every endpoint block does) does not
+    open a double gap before the next H2.
+    """
+    lines.append(f"## {heading}")
+    lines.append("")
+    body = list(body)
+    while body and body[-1] == "":
+        body.pop()
+    lines.extend(body)
+    lines.append("")
+
+
+def _emit_narrative_section(
+    lines: list[str],
+    heading: str,
+    narratives: dict[str, str],
+    key: str,
+    retrieved: str,
+    *,
+    missing_todo: str | None = None,
+) -> None:
+    """H6: write a section body sourced from `narrative/<key>.md`, emitting a
+    `<!-- source: narrative file: ... -->` provenance comment so `validate`
+    accepts the section. Falls back to `_Not documented upstream._` (plus
+    `missing_todo`, if the section has one) when no narrative exists.
+    """
+    body = narratives.get(key)
+    if body:
+        section = [
+            body,
+            "",
+            emit_source("(narrative)", retrieved=retrieved, raw_file=f"narrative/{key}.md"),
+        ]
+    else:
+        section = ["_Not documented upstream._"]
+        if missing_todo:
+            section.extend(["", missing_todo])
+    _emit_section(lines, heading, section)
 
 
 def _endpoint_block(
@@ -107,6 +275,7 @@ def _endpoint_block(
     op: dict[str, Any],
     *,
     spec_url: str | None,
+    mirror: str | None,
     retrieved: str,
     raw_file: str,
     probes_for_endpoint: list[tuple[ProbeFixture, str]],
@@ -136,10 +305,24 @@ def _endpoint_block(
         for p in params:
             if not isinstance(p, dict):
                 continue
-            name = p.get("name", "?")
-            loc = p.get("in", "?")
+            # Every one of these is attacker-controlled: they come out of a
+            # third-party spec. `sanitize_spec_descriptions` only rewrites
+            # values whose *key* is description/summary/title, so it never sees
+            # `name` or `in` — a backtick and a newline in `name` breaks out of
+            # the inline code span below and lets the spec write a forged
+            # `<!-- source: -->` comment plus direct instructions into docs.md,
+            # which is the file another agent reads as ground truth.
+            name = sanitize_text_for_markdown(
+                str(p.get("name", "?")), source_pointer=f"paths/{path}/parameters/name"
+            )
+            loc = sanitize_text_for_markdown(
+                str(p.get("in", "?")), source_pointer=f"paths/{path}/parameters/in"
+            )
             required = " (required)" if p.get("required") else ""
-            desc = p.get("description", "")
+            desc = sanitize_text_for_markdown(
+                str(p.get("description", "")),
+                source_pointer=f"paths/{path}/parameters/{name}/description",
+            )
             lines.append(f"- `{name}` ({loc}){required} — {desc}")
         lines.append("")
 
@@ -150,14 +333,28 @@ def _endpoint_block(
         for code, body in responses.items():
             if not isinstance(body, dict):
                 continue
-            d = body.get("description", "")
-            lines.append(f"- `{code}` — {d}")
+            # The status code is a *dict key* from the spec, so it is arbitrary
+            # attacker-controlled text, not necessarily "200".
+            safe_code = sanitize_text_for_markdown(
+                str(code), source_pointer=f"paths/{path}/responses"
+            )
+            d = sanitize_text_for_markdown(
+                str(body.get("description", "")),
+                source_pointer=f"paths/{path}/responses/{safe_code}/description",
+            )
+            lines.append(f"- `{safe_code}` — {d}")
         lines.append("")
 
     pointer = json_pointer(path, method)
     if spec_url:
         lines.append(
-            emit_source(spec_url, retrieved=retrieved, raw_file=raw_file, spec_pointer=pointer)
+            emit_source(
+                spec_url,
+                retrieved=retrieved,
+                raw_file=raw_file,
+                spec_pointer=pointer,
+                mirror=mirror,
+            )
         )
     else:
         lines.append(
@@ -179,48 +376,154 @@ def _endpoint_block(
     return lines
 
 
-def _match_probe(probe: ProbeFixture, path: str) -> bool:
-    """Match by path suffix."""
-    from urllib.parse import urlparse as _u
-    pp = _u(probe.request.url).path
-    return pp == path or pp.endswith(path)
-
-
-
-
-def _emit_narrative_section(
-    lines: list[str],
+def _authentication_body(
+    spec: dict[str, Any] | None,
+    source_map: dict[str, Any] | None,
     narratives: dict[str, str],
-    key: str,
-    filename: str,
     retrieved: str,
-) -> None:
-    """H6: write a section body sourced from a narrative file, emitting a
-    `<!-- source: narrative file: ... -->` provenance comment so `validate`
-    accepts the section. Falls back to `_Not documented upstream._` when no
-    narrative exists for the section.
-    """
-    body = narratives.get(key)
-    if body:
-        lines.append(body)
+) -> list[str]:
+    auth_body = narratives.get("authentication")
+    spec_url_for_auth = (source_map or {}).get("spec_url")
+    mirror = classify_mirror(spec_url_for_auth, spec)
+    if auth_body:
+        return [
+            auth_body,
+            "",
+            emit_source(
+                spec_url_for_auth or "(narrative)",
+                retrieved=retrieved,
+                raw_file="narrative/authentication.md",
+                mirror=mirror,
+            ),
+        ]
+    sec = (spec or {}).get("components", {}).get("securitySchemes", {})
+    if not sec:
+        return ["_Not documented upstream._"]
+    lines: list[str] = []
+    for name, scheme in sec.items():
+        if not isinstance(scheme, dict):
+            continue
+        # Scheme name is a spec-supplied dict key; `type`/`scheme` are
+        # spec-supplied values. None of the three is a description, so
+        # `sanitize_spec_descriptions` never touched them.
+        safe_name = sanitize_text_for_markdown(
+            str(name), source_pointer="components/securitySchemes"
+        )
+        safe_type = sanitize_text_for_markdown(
+            str(scheme.get("type")), source_pointer=f"components/securitySchemes/{safe_name}/type"
+        )
+        safe_scheme = sanitize_text_for_markdown(
+            str(scheme.get("scheme")),
+            source_pointer=f"components/securitySchemes/{safe_name}/scheme",
+        )
+        lines.append(f"- `{safe_name}`: type=`{safe_type}` scheme=`{safe_scheme}`")
+    lines.append("")
+    lines.append(
+        emit_source(
+            spec_url_for_auth or "(local spec)",
+            retrieved=retrieved,
+            raw_file="raw/spec.json",
+            spec_pointer="/components/securitySchemes",
+            mirror=mirror,
+        )
+    )
+    return lines
+
+
+def _api_reference_body(
+    spec: dict[str, Any] | None,
+    source_map: dict[str, Any] | None,
+    spec_path: str | None,
+    probes: ProbeIndex,
+    walked: WalkedSpec,
+    *,
+    tags_filter: list[str],
+    merge_probes: bool,
+    retrieved: str,
+    warnings: list[str],
+) -> list[str]:
+    if not spec:
+        return ["_No spec available._"]
+
+    spec_url = (source_map or {}).get("spec_url")
+    mirror = classify_mirror(spec_url, spec)
+    spec_raw_rel = (
+        os.path.relpath(spec_path, os.path.dirname(os.path.dirname(spec_path)))
+        if spec_path
+        else "raw/spec.json"
+    )
+    by_tag = walked.by_tag
+    lines: list[str] = []
+
+    if not by_tag:
+        lines.append("_No endpoints match the filter._")
         lines.append("")
+    for tag in sorted(by_tag.keys()):
+        # H8: sanitize tag name before emitting as a heading AND as part
+        # of the spec pointer in the provenance comment. A `\n` in the tag
+        # name would otherwise split the comment across lines.
+        safe_tag = sanitize_text_for_markdown(
+            tag, source_pointer=f"tags/{tag}"
+        )
+        # For pointer use: keep alphanumerics + dash/underscore; replace
+        # anything else with `_`. This keeps the pointer renderable in
+        # a single HTML comment.
+        pointer_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", safe_tag)[:80]
+        lines.append(f"### Tag: {safe_tag}")
+        lines.append("")
+        # H3 tag-level provenance points back to the spec root
         lines.append(
             emit_source(
-                "(narrative)",
+                spec_url or "(local spec)",
                 retrieved=retrieved,
-                raw_file=f"narrative/{filename}",
+                raw_file=spec_raw_rel,
+                spec_pointer=f"/tags/{pointer_tag}",
+                mirror=mirror,
             )
         )
+        lines.append("")
+        ops = sorted(by_tag[tag], key=lambda t: (t[0], t[1]))
+        for path, method, op in ops:
+            lines.extend(
+                _endpoint_block(
+                    path,
+                    method,
+                    op,
+                    spec_url=spec_url,
+                    mirror=mirror,
+                    retrieved=retrieved,
+                    raw_file=spec_raw_rel,
+                    probes_for_endpoint=probes.for_path(path) if merge_probes else [],
+                )
+            )
+        if merge_probes and not any(probes.has_match(p) for p, _m, _op in ops):
+            lines.append(f"<!-- TODO: no probe captured for tag {tag} -->")
+            lines.append("")
+
+    # One orphan-probe scan. There used to be two, differing only in guard and
+    # message, and they were mutually exclusive on `tags_filter`: a probe that
+    # matches nothing is either outside the requested slice or outside the spec.
+    if tags_filter:
+        orphan_msg: str | None = "references endpoint outside --tag filter"
+    elif merge_probes:
+        orphan_msg = "does not match any spec endpoint"
     else:
-        lines.append("_Not documented upstream._")
+        orphan_msg = None
+    if orphan_msg:
+        for probe, _filename in probes.unmatched(walked.paths):
+            warnings.append(
+                f"probe {probe.request.method} {probe.request.url} {orphan_msg}"
+            )
+    return lines
 
 
 def _build_docs_md(
     spec: dict[str, Any] | None,
     source_map: dict[str, Any] | None,
     spec_path: str | None,
-    probes: list[tuple[ProbeFixture, str]],
+    probes: ProbeIndex,
     narratives: dict[str, str],
+    walked: WalkedSpec,
     *,
     tags_filter: list[str],
     merge_probes: bool,
@@ -236,465 +539,60 @@ def _build_docs_md(
         lines.append(f"- spec_url: {source_map['spec_url']}")
     lines.append("")
 
-    # Coverage status
-    lines.append("## Coverage status")
-    lines.append("")
-    lines.append("- [x] OpenAPI spec parsed" if spec else "- [ ] OpenAPI spec not loaded")
-    lines.append(
-        "- [x] Probes merged" if merge_probes and probes else "- [ ] Probes not merged"
+    _emit_section(
+        lines,
+        "Coverage status",
+        [
+            "- [x] OpenAPI spec parsed" if spec else "- [ ] OpenAPI spec not loaded",
+            "- [x] Probes merged" if merge_probes and probes else "- [ ] Probes not merged",
+        ],
     )
-    lines.append("")
-
-    # Installation
-    lines.append("## Installation")
-    lines.append("")
-    _emit_narrative_section(lines, narratives, "installation", "installation.md", retrieved)
-    lines.append("")
-
-    # Authentication
-    lines.append("## Authentication")
-    lines.append("")
-    auth_body = narratives.get("authentication")
-    spec_url_for_auth = (source_map or {}).get("spec_url")
-    if auth_body:
-        lines.append(auth_body)
-        lines.append("")
-        lines.append(
-            emit_source(
-                spec_url_for_auth or "(narrative)",
-                retrieved=retrieved,
-                raw_file="narrative/authentication.md",
-            )
-        )
-    else:
-        sec = (spec or {}).get("components", {}).get("securitySchemes", {})
-        if sec:
-            for name, scheme in sec.items():
-                if not isinstance(scheme, dict):
-                    continue
-                lines.append(f"- `{name}`: type=`{scheme.get('type')}` scheme=`{scheme.get('scheme')}`")
-            lines.append("")
-            lines.append(
-                emit_source(
-                    spec_url_for_auth or "(local spec)",
-                    retrieved=retrieved,
-                    raw_file="raw/spec.json",
-                    spec_pointer="/components/securitySchemes",
-                )
-            )
-        else:
-            lines.append("_Not documented upstream._")
-    lines.append("")
-
-    # Core concepts
-    lines.append("## Core concepts")
-    lines.append("")
-    _emit_narrative_section(lines, narratives, "core-concepts", "core-concepts.md", retrieved)
-    lines.append("")
-
-    # API reference
-    lines.append("## API reference")
-    lines.append("")
-    if spec:
-        spec_url = (source_map or {}).get("spec_url")
-        spec_raw_rel = (
-            os.path.relpath(spec_path, os.path.dirname(os.path.dirname(spec_path)))
-            if spec_path
-            else "raw/spec.json"
-        )
-        by_tag = _group_ops_by_tag(spec)
-        by_tag = _filter_tags(by_tag, tags_filter)
-
-        # Detect probes outside the filter
-        if tags_filter:
-            for probe, _filename in probes:
-                hits = 0
-                for tag, ops in by_tag.items():
-                    if any(_match_probe(probe, path) for path, _m, _op in ops):
-                        hits += 1
-                if hits == 0:
-                    warnings.append(
-                        f"probe {probe.request.method} {probe.request.url} references endpoint outside --tag filter"
-                    )
-
-        if not by_tag:
-            lines.append("_No endpoints match the filter._")
-            lines.append("")
-        for tag in sorted(by_tag.keys()):
-            # H8: sanitize tag name before emitting as a heading AND as part
-            # of the spec pointer in the provenance comment. A `\n` in the tag
-            # name would otherwise split the comment across lines.
-            safe_tag = sanitize_text_for_markdown(
-                tag, source_pointer=f"tags/{tag}"
-            )
-            # For pointer use: keep alphanumerics + dash/underscore; replace
-            # anything else with `_`. This keeps the pointer renderable in
-            # a single HTML comment.
-            pointer_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", safe_tag)[:80]
-            lines.append(f"### Tag: {safe_tag}")
-            lines.append("")
-            # H3 tag-level provenance points back to the spec root
-            lines.append(
-                emit_source(
-                    spec_url or "(local spec)",
-                    retrieved=retrieved,
-                    raw_file=spec_raw_rel,
-                    spec_pointer=f"/tags/{pointer_tag}",
-                )
-            )
-            lines.append("")
-            ops = sorted(by_tag[tag], key=lambda t: (t[0], t[1]))
-            tagged_probes = (
-                [(p, fn) for p, fn in probes if any(_match_probe(p, op_path) for op_path, _, _ in ops)]
-                if merge_probes
-                else []
-            )
-            for path, method, op in ops:
-                if merge_probes:
-                    relevant = [(p, fn) for p, fn in probes if _match_probe(p, path)]
-                else:
-                    relevant = []
-                lines.extend(
-                    _endpoint_block(
-                        path,
-                        method,
-                        op,
-                        spec_url=spec_url,
-                        retrieved=retrieved,
-                        raw_file=spec_raw_rel,
-                        probes_for_endpoint=relevant,
-                    )
-                )
-            if not tagged_probes and merge_probes:
-                lines.append(f"<!-- TODO: no probe captured for tag {tag} -->")
-                lines.append("")
-        # Detect probes for endpoints not in spec at all
-        if merge_probes:
-            for probe, _filename in probes:
-                any_match = False
-                for tag, ops in by_tag.items():
-                    if any(_match_probe(probe, path) for path, _m, _op in ops):
-                        any_match = True
-                        break
-                if not any_match and not tags_filter:
-                    warnings.append(
-                        f"probe {probe.request.method} {probe.request.url} does not match any spec endpoint"
-                    )
-    else:
-        lines.append("_No spec available._")
-        lines.append("")
-
-    # Minimal working example
-    lines.append("## Minimal working example")
-    lines.append("")
-    if "example" in narratives:
-        lines.append(narratives["example"])
-        lines.append("")
-        lines.append(
-            emit_source(
-                "(narrative)",
-                retrieved=retrieved,
-                raw_file="narrative/example.md",
-            )
-        )
-    else:
-        lines.append("_Not documented upstream._")
-        lines.append("")
-        lines.append("<!-- TODO: provide a minimal working example -->")
-    lines.append("")
-
-    # Errors
-    lines.append("## Errors")
-    lines.append("")
-    _emit_narrative_section(lines, narratives, "errors", "errors.md", retrieved)
-    lines.append("")
-
-    # Rate limits
-    lines.append("## Rate limits, quotas, versioning")
-    lines.append("")
-    _emit_narrative_section(lines, narratives, "rate-limits", "rate-limits.md", retrieved)
-    lines.append("")
-
-    # Gotchas
-    lines.append("## Gotchas")
-    lines.append("")
-    _emit_narrative_section(lines, narratives, "gotchas", "gotchas.md", retrieved)
-    lines.append("")
+    _emit_narrative_section(
+        lines, _HEADING["Installation"], narratives, "installation", retrieved
+    )
+    _emit_section(
+        lines,
+        _HEADING["Authentication"],
+        _authentication_body(spec, source_map, narratives, retrieved),
+    )
+    _emit_narrative_section(
+        lines, _HEADING["Core concepts"], narratives, "core-concepts", retrieved
+    )
+    _emit_section(
+        lines,
+        _HEADING["API reference"],
+        _api_reference_body(
+            spec,
+            source_map,
+            spec_path,
+            probes,
+            walked,
+            tags_filter=tags_filter,
+            merge_probes=merge_probes,
+            retrieved=retrieved,
+            warnings=warnings,
+        ),
+    )
+    _emit_narrative_section(
+        lines,
+        _HEADING["Minimal working example"],
+        narratives,
+        "example",
+        retrieved,
+        missing_todo="<!-- TODO: provide a minimal working example -->",
+    )
+    _emit_narrative_section(lines, _HEADING["Errors"], narratives, "errors", retrieved)
+    _emit_narrative_section(
+        lines, _HEADING["Rate limits"], narratives, "rate-limits", retrieved
+    )
+    _emit_narrative_section(lines, _HEADING["Gotchas"], narratives, "gotchas", retrieved)
 
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _collect_auth_method_signals(
-    probes: list[tuple[ProbeFixture, str]],
-) -> tuple[str | None, list[str]]:
-    """Find the auth-discovery probe (if any) and lift its auth_method +
-    security_warnings out of the fixture manifest so they can flow into
-    handoff.content_shape_signals. Returns (auth_method, warnings).
-
-    skill-creator reads auth_method (`bearer` | `auth_token_header` |
-    `api_key_header` | `basic` | `query_string`) to decide what the generated
-    integration skill must warn users about and how it loads credentials.
-    """
-    for fixture, _name in probes:
-        if fixture.scope != "auth-discovery":
-            continue
-        method = fixture.manifest.auth_method
-        if method is None:
-            continue
-        return method, list(fixture.manifest.security_warnings)
-    return None, []
-
-
-def _build_handoff(
-    workspace: str,
-    spec: dict[str, Any] | None,
-    source_map: dict[str, Any] | None,
-    probes: list[tuple[ProbeFixture, str]],
-    retrieved: str,
-    docs_md_text: str,
-    *,
-    tag_filter: list[str],
-) -> dict[str, Any]:
-    info = (spec or {}).get("info", {})
-    title = info.get("title", "tool")
-    proposed_name = f"{title.lower().replace(' ', '-')}-integration"
-    endpoint_count = 0
-    tags_seen: set[str] = set()
-    for _path, _method, op in iter_operations(spec):
-        endpoint_count += 1
-        tags_seen.update(op.get("tags") or [])
-    tag_count = len(tags_seen)
-
-    spec_url = (source_map or {}).get("spec_url")
-    spec_format = (source_map or {}).get("format")
-
-    provenance_index: dict[str, Any] = {}
-    if spec:
-        by_tag = _group_ops_by_tag(spec)
-        by_tag = _filter_tags(by_tag, tag_filter)
-        for tag, ops in by_tag.items():
-            # tag-level entry for the H3 section in docs.md
-            tag_section_key = f"API reference > Tag: {tag}"
-            provenance_index.setdefault(tag_section_key, {"sources": [], "probes": []})
-            provenance_index[tag_section_key]["sources"].append(
-                {
-                    "type": "spec",
-                    "url": spec_url,
-                    "pointer": f"/tags/{tag}",
-                    "raw_file": "raw/spec.json",
-                }
-            )
-            for path, method, _op in ops:
-                section_key = f"API reference > Tag: {tag} > {method} {path}"
-                provenance_index.setdefault(section_key, {"sources": [], "probes": []})
-                pointer = json_pointer(path, method)
-                provenance_index[section_key]["sources"].append(
-                    {
-                        "type": "spec",
-                        "url": spec_url,
-                        "pointer": pointer,
-                        "raw_file": "raw/spec.json",
-                    }
-                )
-                for probe, filename in probes:
-                    if _match_probe(probe, path):
-                        provenance_index[section_key]["probes"].append(
-                            {
-                                "method": probe.request.method,
-                                "url": probe.request.url,
-                                "status": probe.response.status,
-                                "scope": probe.scope,
-                                "fixture": f"probes/{filename}",
-                            }
-                        )
-
-    # H9: populate coverage_checklist from sections actually present in docs.md.
-    coverage_checklist = _derive_coverage_checklist(docs_md_text, spec_url)
-
-    # H9: derive 3-5 suggested test cases from spec tags + endpoint summaries.
-    suggested_test_cases = _derive_test_cases(spec, title)
-
-    # H9: pull user_declared_scope from manifest if a prior probe run recorded
-    # a --scope. Otherwise leave empty (harvest agent fills it in).
-    declared_scope, declared_languages = _read_user_declarations(workspace, spec)
-
-    # Lift auth_method + security_warnings from any auth-discovery probe so
-    # skill-creator can read them from handoff.content_shape_signals and
-    # decide what the generated integration skill must warn users about.
-    auth_method, auth_security_warnings = _collect_auth_method_signals(probes)
-
-    content_shape_signals: dict[str, Any] = {
-        "has_openapi_spec": bool(spec),
-        "spec_url": spec_url,
-        "spec_format": spec_format,
-        "endpoint_count": endpoint_count,
-        "tag_count": tag_count,
-    }
-    if auth_method is not None:
-        content_shape_signals["auth_method"] = auth_method
-        content_shape_signals["security_warnings"] = auth_security_warnings
-
-    handoff = {
-        "version": HANDOFF_VERSION,
-        "proposed_name": proposed_name,
-        "tool_summary": info.get("description", "")[:1024],
-        "user_declared_scope": declared_scope,
-        "user_declared_languages": declared_languages,
-        "archetype_primary": 4 if spec else None,
-        "content_shape_signals": content_shape_signals,
-        "coverage_checklist": coverage_checklist,
-        "gap_list": [],
-        "provenance_index": provenance_index,
-        "image_inventory": [],
-        "suggested_test_cases": suggested_test_cases,
-        "harvest_metadata": {
-            "retrieved_date": retrieved[:10],
-            "tool_version": __version__,
-            "raw_page_count": _count_raw_files(workspace),
-            "docs_md_token_count": len(docs_md_text.split()),
-        },
-    }
-    # Detect TODO markers to add to gap_list.
-    for line_num, line in enumerate(docs_md_text.splitlines(), start=1):
-        if "<!-- TODO" in line:
-            handoff["gap_list"].append({"line": line_num, "text": line.strip()})
-
-    # Assert the packet we emit satisfies its own contract. skill-creator reads
-    # this file in another process; a shape error should fail here, loudly,
-    # rather than surface downstream as a confusing interview.
-    problems = lint_handoff(handoff)
-    if problems:  # pragma: no cover - guards against future edits to this dict
-        raise AssertionError(
-            "internal error: emitted handoff.json violates its own contract: "
-            + "; ".join(problems)
-        )
-    return handoff
-
-
-def _derive_coverage_checklist(
-    docs_md_text: str, spec_url: str | None
-) -> list[dict[str, Any]]:
-    """H9: walk docs.md and decide coverage status for each of the 8 canonical
-    sections. A section is `covered` if it has a non-empty body (not just
-    `_Not documented upstream._`), `partial` if it has a `<!-- TODO -->`
-    marker, and `missing` otherwise.
-    """
-    items_spec = [
-        ("Installation", "## Installation"),
-        ("Authentication", "## Authentication"),
-        ("Core concepts", "## Core concepts"),
-        ("API reference", "## API reference"),
-        ("Minimal working example", "## Minimal working example"),
-        ("Errors", "## Errors"),
-        ("Rate limits", "## Rate limits"),
-        ("Gotchas", "## Gotchas"),
-    ]
-    lines = docs_md_text.splitlines()
-    out: list[dict[str, Any]] = []
-    for name, heading in items_spec:
-        status = "missing"
-        # Find the heading; capture the body lines until the next H2.
-        idx = next((i for i, ln in enumerate(lines) if ln.startswith(heading)), None)
-        if idx is not None:
-            body = []
-            j = idx + 1
-            while j < len(lines) and not lines[j].startswith("## "):
-                body.append(lines[j])
-                j += 1
-            body_text = "\n".join(body).strip()
-            if not body_text or body_text == "_Not documented upstream._":
-                status = "missing"
-            elif "<!-- TODO" in body_text:
-                status = "partial"
-            else:
-                status = "covered"
-        sources = [spec_url] if spec_url else []
-        out.append({"name": name, "status": status, "sources": sources})
-    return out
-
-
-def _derive_test_cases(
-    spec: dict[str, Any] | None, title: str
-) -> list[dict[str, Any]]:
-    """H9: derive 3-5 trigger-phrase test cases from the spec. We surface the
-    first three endpoint summaries as natural-language phrases plus two
-    catch-all phrases (`use {title}`, `integrate with {title}`).
-    """
-    cases: list[dict[str, Any]] = []
-    if spec:
-        paths = spec.get("paths") or {}
-        seen = 0
-        for path, methods in paths.items():
-            if seen >= 3:
-                break
-            if not isinstance(methods, dict):
-                continue
-            for method, op in methods.items():
-                if not isinstance(op, dict):
-                    continue
-                summary = op.get("summary") or f"{method.upper()} {path}"
-                cases.append(
-                    {
-                        "trigger_phrase": f"{summary} via {title}",
-                        "endpoint": f"{method.upper()} {path}",
-                        "status": "suggestion",
-                    }
-                )
-                seen += 1
-                break
-    # Always pad with two catch-all phrases so the list is in the 3-5 range.
-    cases.append(
-        {
-            "trigger_phrase": f"use {title}",
-            "endpoint": None,
-            "status": "suggestion",
-        }
-    )
-    cases.append(
-        {
-            "trigger_phrase": f"integrate with {title}",
-            "endpoint": None,
-            "status": "suggestion",
-        }
-    )
-    # Cap at 5
-    return cases[:5]
-
-
-def _read_user_declarations(
-    workspace: str, spec: dict[str, Any] | None
-) -> tuple[str, list[str]]:
-    """H9: peek at manifest.json for a `--scope` arg from a previous run; peek
-    at `info.x-language` for spec-declared SDK languages. Both default to
-    empty (harvest agent fills them in)."""
-    declared_scope = ""
-    declared_languages: list[str] = []
-    try:
-        from ._manifest import load_manifest
-
-        data = load_manifest(workspace)
-        for run in data.get("runs", []):
-            args = run.get("args") or {}
-            scope = args.get("scope")
-            if isinstance(scope, str) and scope and scope != "ad-hoc":
-                declared_scope = scope
-                break
-    except Exception:
-        pass
-    if spec is not None:
-        x_lang = (spec.get("info") or {}).get("x-language")
-        if isinstance(x_lang, list):
-            declared_languages = [str(x) for x in x_lang]
-        elif isinstance(x_lang, str):
-            declared_languages = [x_lang]
-    return declared_scope, declared_languages
-
-
-def _count_raw_files(workspace: str) -> int:
-    raw = os.path.join(workspace, "raw")
-    if not os.path.isdir(raw):
-        return 0
-    return sum(1 for _ in os.listdir(raw))
+# --------------------------------------------------------------------------
+# Driver
+# --------------------------------------------------------------------------
 
 
 def run(args) -> int:
@@ -720,7 +618,7 @@ def run(args) -> int:
                 file=sys.stderr,
             )
 
-    probes = _load_probes(workspace) if args.merge_probes else []
+    probes = _load_probes(workspace) if args.merge_probes else ProbeIndex()
     narratives = _load_narratives(workspace, args.narrative_dir)
     if args.sanitize:
         sanitized_narratives: dict[str, str] = {}
@@ -729,6 +627,9 @@ def run(args) -> int:
             sanitized_narratives[k] = result.text
         narratives = sanitized_narratives
 
+    # The one spec traversal. Both builders read this value.
+    walked = WalkedSpec.walk(spec, tags_filter=args.tag)
+
     warnings: list[str] = []
     docs_md = _build_docs_md(
         spec,
@@ -736,6 +637,7 @@ def run(args) -> int:
         spec_path,
         probes,
         narratives,
+        walked,
         tags_filter=args.tag,
         merge_probes=args.merge_probes,
         retrieved=retrieved,
@@ -748,8 +650,8 @@ def run(args) -> int:
         if args.emit_handoff:
             print("\n=== handoff.json ===")
             print(json.dumps(
-                _build_handoff(
-                    workspace, spec, source_map, probes, retrieved, docs_md, tag_filter=args.tag
+                build_handoff(
+                    workspace, spec, source_map, probes, retrieved, docs_md, walked=walked
                 ),
                 indent=2,
             ))
@@ -758,19 +660,21 @@ def run(args) -> int:
         return 0
 
     docs_path = os.path.join(workspace, "docs.md")
-    with open(docs_path, "w", encoding="utf-8") as f:
-        f.write(docs_md)
+    # Atomic for the same reason manifest.json is, even though this one is not
+    # read-modify-write: the manifest entry attesting docs.md's sha256 is
+    # written *after* it, so an interrupt part-way through leaves a truncated
+    # docs.md carrying the previous run's digest, and `validate` calls the
+    # workspace corrupt. It is also the deliverable skill-creator reads.
+    write_text(docs_path, docs_md)
 
     outputs = [file_entry(workspace, docs_path)]
 
     if args.emit_handoff:
-        handoff = _build_handoff(
-            workspace, spec, source_map, probes, retrieved, docs_md, tag_filter=args.tag
+        handoff = build_handoff(
+            workspace, spec, source_map, probes, retrieved, docs_md, walked=walked
         )
         handoff_path = os.path.join(workspace, "handoff.json")
-        with open(handoff_path, "w", encoding="utf-8") as f:
-            json.dump(handoff, f, indent=2)
-            f.write("\n")
+        write_json(handoff_path, handoff)
         outputs.append(file_entry(workspace, handoff_path))
 
     for w in warnings:

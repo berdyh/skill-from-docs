@@ -14,11 +14,6 @@ import httpx
 from conftest import make_mock_transport
 
 from skill_from_docs import cmd_fetch
-from skill_from_docs._http import build_client
-
-
-def _make_client(routes):
-    return build_client(transport=make_mock_transport(routes), timeout=5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -32,17 +27,16 @@ def test_staleness_github_warns_when_stale(fixtures_dir: Path):
         "https://api.github.com/repos/foo/bar/commits"
         "?path=spec.json&sha=main&per_page=1"
     )
-    client = _make_client(
+    transport = make_mock_transport(
         {api_url: httpx.Response(200, text=stale.read_text())}
     )
     messages: list[str] = []
     cmd_fetch._check_staleness(
         "https://raw.githubusercontent.com/foo/bar/main/spec.json",
         90,
-        client,
         log=messages.append,
+        transport=transport,
     )
-    client.close()
     assert any("days old" in m for m in messages), messages
     assert any("github" in m for m in messages), messages
 
@@ -53,17 +47,16 @@ def test_staleness_github_fresh_silent(fixtures_dir: Path):
         "https://api.github.com/repos/foo/bar/commits"
         "?path=spec.json&sha=main&per_page=1"
     )
-    client = _make_client(
+    transport = make_mock_transport(
         {api_url: httpx.Response(200, text=fresh.read_text())}
     )
     messages: list[str] = []
     cmd_fetch._check_staleness(
         "https://raw.githubusercontent.com/foo/bar/main/spec.json",
         365 * 5,
-        client,
         log=messages.append,
+        transport=transport,
     )
-    client.close()
     assert not any("days old" in m for m in messages)
 
 
@@ -82,17 +75,16 @@ def test_staleness_gitlab_via_gitlab_raw(fixtures_dir: Path):
         "https://gitlab.com/api/v4/projects/foo%2Fbar/repository/commits"
         "?path=openapi.yaml&ref_name=main&per_page=1"
     )
-    client = _make_client(
+    transport = make_mock_transport(
         {api_url: httpx.Response(200, text=fresh.read_text())}
     )
     messages: list[str] = []
     cmd_fetch._check_staleness(
         "https://gitlab.com/foo/bar/-/raw/main/openapi.yaml",
         365 * 5,  # fresh — no warning expected
-        client,
         log=messages.append,
+        transport=transport,
     )
-    client.close()
     # Successful parse, no "days old" warning because the date is recent.
     assert not any("days old" in m for m in messages)
     # And no fall-through note about unsupported hosts.
@@ -113,17 +105,16 @@ def test_staleness_gitea_via_codeberg_raw(fixtures_dir: Path):
         "https://codeberg.org/api/v1/repos/foo/bar/commits"
         "?path=openapi.json&sha=main&limit=1"
     )
-    client = _make_client(
+    transport = make_mock_transport(
         {api_url: httpx.Response(200, text=fresh.read_text())}
     )
     messages: list[str] = []
     cmd_fetch._check_staleness(
         "https://codeberg.org/foo/bar/raw/branch/main/openapi.json",
         365 * 5,
-        client,
         log=messages.append,
+        transport=transport,
     )
-    client.close()
     assert not any("days old" in m for m in messages)
     assert not any("unavailable" in m for m in messages)
 
@@ -141,17 +132,16 @@ def test_staleness_bitbucket_via_bitbucket_raw(fixtures_dir: Path):
         "https://api.bitbucket.org/2.0/repositories/team/repo/commits"
         "?include=main&path=openapi.json&pagelen=1"
     )
-    client = _make_client(
+    transport = make_mock_transport(
         {api_url: httpx.Response(200, text=fresh.read_text())}
     )
     messages: list[str] = []
     cmd_fetch._check_staleness(
         "https://bitbucket.org/team/repo/raw/main/openapi.json",
         365 * 5,
-        client,
         log=messages.append,
+        transport=transport,
     )
-    client.close()
     assert not any("days old" in m for m in messages)
     assert not any("unavailable" in m for m in messages)
 
@@ -170,19 +160,18 @@ def test_staleness_self_hosted_explicit_flags(fixtures_dir: Path):
         "https://git.example.com/api/v1/repos/foo/bar/commits"
         "?path=openapi.json&sha=main&limit=1"
     )
-    client = _make_client(
+    transport = make_mock_transport(
         {api_url: httpx.Response(200, text=fresh.read_text())}
     )
     messages: list[str] = []
     cmd_fetch._check_staleness(
         "https://git.example.com/foo/bar/raw/branch/main/openapi.json",
         365 * 5,
-        client,
         log=messages.append,
+        transport=transport,
         explicit_host="git.example.com",
         explicit_style="gitea",
     )
-    client.close()
     # No unavailable-host note; the explicit flags satisfied the resolver.
     assert not any("unavailable" in m for m in messages)
 
@@ -191,15 +180,14 @@ def test_staleness_unknown_host_emits_actionable_note():
     """When neither auto-derive nor explicit flags resolve a target, the
     contributor gets a clear stderr note naming the flags that would enable
     the check."""
-    client = _make_client({})
+    transport = make_mock_transport({})
     messages: list[str] = []
     cmd_fetch._check_staleness(
         "https://api.example.com/openapi.json",
         90,
-        client,
         log=messages.append,
+        transport=transport,
     )
-    client.close()
     full = "\n".join(messages)
     assert "staleness check unavailable" in full
     assert "--staleness-api-host" in full

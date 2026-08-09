@@ -216,6 +216,39 @@ def test_5xx_exponential_backoff_max_3(tmp_path: Path):
     assert sleeps == [1.0, 2.0, 4.0]
 
 
+def test_transient_network_errors_are_retried(tmp_path: Path):
+    """B2: `probe` is the subcommand most likely to hit a flaky live API and
+    the only one exposing `--max-retries` — and it was the one that did NOT
+    retry network errors, because its local retry loop was forked from
+    `request_with_retry` before that helper grew the behaviour. The fork is
+    gone; this pins what deleting it bought."""
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    def h(req):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise httpx.ConnectError("connection reset", request=req)
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(workspace=str(tmp_path), max_retries=3)
+    assert cmd_probe.run(args, transport=_mock(h), sleeper=sleeps.append) == 0
+    assert calls["n"] == 3
+    assert sleeps == [1.0, 2.0]
+
+
+def test_network_errors_still_give_up_after_max_retries(tmp_path: Path):
+    """Retrying is bounded by --max-retries, and exhausting it is exit 2."""
+    sleeps: list[float] = []
+
+    def h(req):
+        raise httpx.ConnectError("connection reset", request=req)
+
+    args = _args(workspace=str(tmp_path), max_retries=2)
+    assert cmd_probe.run(args, transport=_mock(h), sleeper=sleeps.append) == 2
+    assert sleeps == [1.0, 2.0]
+
+
 def test_redirect_blocked_by_default(tmp_path: Path):
     def h(req):
         # Return a 302 with a Location header. With follow_redirects=False
@@ -381,3 +414,108 @@ def test_nan_body_falls_through_to_text(tmp_path: Path):
     raw = next((tmp_path / "probes").iterdir()).read_text()
     json.loads(raw)  # fixture must be strictly valid JSON
     assert json.loads(raw)["request"]["body"] == '{"lat": NaN}'
+
+
+@pytest.mark.parametrize("bad", [0, 0.0, -1.0])
+def test_non_positive_timeout_is_a_config_error_not_a_network_one(
+    tmp_path: Path, capsys, bad
+):
+    """The same class as fetch's A10, one step less severe.
+
+    Nothing rejected the degenerate value, so what happened next was the
+    transport's business: against a real socket `request_with_retry` burns its
+    whole 1s/2s/4s backoff on a request that could never be issued and then
+    reports exit 2 — the code that means "retry" — never naming `--timeout`.
+    Under the mock transport here it was worse still and simply passed, which is
+    exactly what this test observes without the guard (rc 0, request issued).
+
+    Reject it as user error, before a client exists and before the workspace is
+    touched.
+    """
+    calls: list[str] = []
+
+    def h(req):
+        calls.append(str(req.url))
+        return httpx.Response(200, json={"ok": True})
+
+    args = _args(workspace=str(tmp_path), timeout=bad)
+    assert cmd_probe.run(args, transport=_mock(h)) == 1
+    assert "--timeout" in capsys.readouterr().err
+    assert calls == []
+    assert not (tmp_path / "probes").exists()
+
+
+# --------------------------------------------------------------------------
+# Workspace resolution
+#
+# `probe` used to derive its workspace from its own `--url`. In an archetype-4
+# harvest the spec host and the live API host differ, so `fetch` populated one
+# directory and `probe` silently created a second one next to it; `consolidate`
+# then exited 3 on a workspace the user believed they had just populated. That
+# is the documented Hetzner walkthrough, and it did not work.
+# --------------------------------------------------------------------------
+
+
+def _harvested(root: Path, name: str) -> Path:
+    ws = root / ".claude" / "skill-from-docs" / name
+    (ws / "raw").mkdir(parents=True)
+    (ws / "raw" / "spec.json").write_text("{}")
+    return ws
+
+
+def test_probe_without_workspace_writes_into_the_harvested_one(
+    tmp_path: Path, monkeypatch
+):
+    """The regression. `--url` names api.example.com; the harvest lives under a
+    raw.githubusercontent.com slug. The fixture must land in the harvest."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ws = _harvested(tmp_path, "raw.githubusercontent.com-acme-widgets")
+
+    args = _args(workspace=None)
+    assert cmd_probe.run(args, transport=_mock(lambda r: httpx.Response(200, json={}))) == 0
+
+    assert len(list((ws / "probes").iterdir())) == 1
+    siblings = sorted(p.name for p in (tmp_path / ".claude" / "skill-from-docs").iterdir())
+    assert siblings == ["raw.githubusercontent.com-acme-widgets"]
+
+
+def test_probe_without_workspace_refuses_when_no_harvest_exists(
+    tmp_path: Path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def h(req):
+        raise AssertionError("must not reach the network")
+
+    assert cmd_probe.run(_args(workspace=None), transport=_mock(h)) == 1
+    err = capsys.readouterr().err
+    assert "--workspace" in err and "fetch" in err
+    assert not (tmp_path / ".claude" / "skill-from-docs").exists()
+
+
+def test_probe_without_workspace_refuses_when_ambiguous(
+    tmp_path: Path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    a = _harvested(tmp_path, "alpha")
+    b = _harvested(tmp_path, "beta")
+
+    def h(req):
+        raise AssertionError("must not reach the network")
+
+    assert cmd_probe.run(_args(workspace=None), transport=_mock(h)) == 1
+    err = capsys.readouterr().err
+    assert str(a) in err and str(b) in err
+    assert not list((a / "probes").iterdir()) if (a / "probes").exists() else True
+
+
+def test_probe_dry_run_needs_no_workspace(tmp_path: Path, monkeypatch, capsys):
+    """A dry run writes nothing, so it must not be gated on a harvest."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def h(req):
+        raise AssertionError("must not reach the network")
+
+    assert cmd_probe.run(_args(workspace=None, dry_run=True), transport=_mock(h)) == 0
+    assert json.loads(capsys.readouterr().out)["dry_run"] is True
+    assert not (tmp_path / ".claude").exists()

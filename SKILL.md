@@ -52,11 +52,31 @@ The two hard-fail rows are non-negotiable. The skill-creator hard-fail is the si
 
 ### Cache detection
 
-Compute the workspace path: `~/.claude/skill-from-docs/<tool-slug>/`. Slug convention: `<host>-<path-tail>` based on the entry-point URL, so two unrelated tools that share a name (e.g. two GitHub repos both named `agent-tools`) end up at distinct paths. Examples:
+Compute the workspace path: `~/.claude/skill-from-docs/<tool-slug>/`.
 
-- `https://github.com/humanlayer/12-factor-agents/tree/main/content` → `github.com-humanlayer-12-factor-agents/`
-- `https://docs.stripe.com/api` → `docs.stripe.com/`
-- `https://api-docs.didox.uz/ru/integration-registration` → `api-docs.didox.uz/`
+**Slug rule**, applied to the entry-point URL: `<host>` plus up to **three** identifying path segments, joined with `-`. Derive it like this:
+
+1. Lowercase everything; percent-decode path segments.
+2. Drop userinfo, port, query string and fragment. None of them identify the tool, and a credential must never reach a directory name.
+3. Drop path segments naming a VCS ref or a hosting-provider view: `main`, `master`, `trunk`, `blob`, `raw`, `tree`, `refs`, `heads`, `tags`, and GitLab's `-`.
+4. Treat the last segment as a filename only if it ends in `.json`, `.yaml`, `.yml`, `.html`, `.htm`, `.md` or `.txt`. Drop it entirely when its stem is generic (`openapi`, `openapi2`, `openapi3`, `swagger`, `spec`, `schema`, `api-docs`, `apidocs`, `api_docs`, `index`, `readme`); otherwise keep the stem and drop the extension.
+5. Keep the first three surviving segments. Replace any character outside `[a-z0-9._-]` with `-`, collapse runs of `-` and `.`, then strip leading and trailing `-`, `.` and `_`.
+6. If the result exceeds 80 characters, truncate to 71 and append `-` plus the first 8 hex characters of the sha256 of the untruncated slug. Use a real digest, never Python's `hash()` — it is salted per process and would name a different directory on every run.
+7. An empty result becomes `workspace`. `@-` (stdin) becomes `stdin`. A local path uses the last identifying component of the path under the same rules.
+
+Examples:
+
+- `https://raw.githubusercontent.com/OwnerA/agent-tools/main/openapi.json` → `raw.githubusercontent.com-ownera-agent-tools/`
+- `https://raw.githubusercontent.com/OwnerB/agent-tools/main/openapi.json` → `raw.githubusercontent.com-ownerb-agent-tools/`
+- `https://github.com/humanlayer/12-factor-agents/tree/main/content` → `github.com-humanlayer-12-factor-agents-content/`
+- `https://docs.stripe.com/api` → `docs.stripe.com-api/`
+- `https://api-docs.didox.uz/ru/integration-registration` → `api-docs.didox.uz-ru-integration-registration/`
+
+The first two examples are the whole point: two unrelated repos that share a name no longer share a workspace. A bare-host slug collided them, and so would a `<host>-<path-tail>` rule, because the *tail* of that URL is `openapi.json` — the least distinguishing part of it.
+
+The reverse property matters just as much. The same tool spelled differently — trailing slash, `http` instead of `https`, an explicit port, userinfo, a query string, different capitalisation — must produce **one** slug, because the cache lookup below is by slug. A slug that moves when the URL is re-typed loses a real cached harvest silently, which is worse than the collision it replaces.
+
+**Harvests made before this rule existed** live under the bare hostname (`raw.githubusercontent.com/`, `api.hetzner.cloud/`). They are intact, but the lookup below no longer finds them. `openapi-harvest fetch` prints a notice naming both paths when it sees one. Nothing is migrated automatically — move the directory yourself, or pass `--workspace <old-path>`.
 
 If the workspace path already exists, read its `harvest_metadata.retrieved_date` from `handoff.json` (or `mtime` of `docs.md` as a fallback) and prompt the user with three options:
 
@@ -76,7 +96,15 @@ Record the result in one short line before starting Phase 1, e.g. *"Preflight: W
 
 Target workspace: `~/.claude/skill-from-docs/<tool-slug>/` — a user-scoped, deterministic directory created on first run. **Never use a relative path or write into the current project directory.** The harvest must not pollute the user's working repo; cross-project re-use of cached harvests depends on this canonical location.
 
-Slug rules: `<host>-<path-tail>` based on the entry-point URL host (so two GitHub repos named `agent-tools` don't collide). Disambiguator examples are listed in Phase 0.5 cache detection.
+Slug rules: `<host>` plus up to three identifying path segments of the entry-point URL (so two GitHub repos named `agent-tools` don't collide). The full derivation and its examples are in Phase 0.5 cache detection.
+
+**`openapi-harvest` implements that same rule**, in `_slug.slug_from_url` — the CLI's default workspace and this file's convention are one rule, not two that have to be kept in agreement. How each subcommand finds its workspace still differs, and that difference is worth knowing:
+
+- `fetch` defaults to `~/.claude/skill-from-docs/<tool-slug>/` derived from `--source`.
+- `auth` and `probe` never derive a workspace from their own URL. In an archetype-4 harvest the spec host and the live API host are different, so deriving used to send `fetch` and `probe` into *separate* workspaces and `consolidate` then reported `no spec at .../raw/spec.json`. Without `--workspace` they now adopt the single harvested workspace under `~/.claude/skill-from-docs/` (a workspace holding `raw/spec.json`), and exit 1 — naming every candidate — when there is none or more than one, rather than guessing.
+- `consolidate` and `validate` take the workspace as an **optional positional that defaults to `$PWD`**, not to any slug path. A bare `openapi-harvest consolidate` walks the current directory and exits 3.
+
+Passing `--workspace ~/.claude/skill-from-docs/<tool-slug>/` explicitly to `fetch`, `auth` and `probe`, and the same directory positionally to `consolidate` and `validate`, is still the clearest way to run a multi-step harvest, and every example in `references/probing-tools.md` does exactly that.
 
 Workspace layout at the end of Phase 1:
 
@@ -95,6 +123,8 @@ Workspace layout at the end of Phase 1:
 ├── probes/                  # archetype-4: captured live response fixtures (redacted, scope-labeled)
 └── url-queue.json           # discovered URLs (used by "Refresh" cache option)
 ```
+
+**One file in the workspace is not safe to share.** For archetype-4 harvests, `raw/source-map.json` records `fetch_url` — the spec URL verbatim, credentials and all — so that `validate --network` has something re-fetchable after redaction has replaced a benign `?key=petstore` with `?key=<redacted>`. It is written `0o600` and nothing else in the workspace copies it; every other artifact carries only the redacted `spec_url`. Treat the workspace as safe to hand to skill-creator and safe to read, but never copy it wholesale into a repo, an archive, or a bug report without excluding that file.
 
 Lifecycle: workspaces persist after handoff. Two reasons — a future refresh against upstream changes is cheap when the cache exists, and the workspace is the audit trail for skill-creator's anti-hallucination check. Cleanup is never automatic; users own deletion (`rm -rf ~/.claude/skill-from-docs/<tool-slug>/`). Workspaces are typically <50 MB; aggressive eviction isn't worth the risk of nuking a working set the user wanted to refresh.
 
@@ -138,7 +168,7 @@ The default priority order below is tuned for an unknown docs site. If Step 0 cl
 
 For the detailed per-platform patterns (Docusaurus, Mintlify, ReadTheDocs, MkDocs, GitBook, Swagger UI, Notion docs) see `references/discovery.md`.
 
-For archetype 4 (OpenAPI-only), the discovery cascade is implemented in `openapi-harvest fetch`. The cascade tries direct fetch → common spec paths (`/openapi.json`, `/openapi.yaml`, `/swagger.json`, `/v3/api-docs`, `/api-docs`, `/api/v1/openapi.json`, `/spec.json`) → renderer-config extraction from HTML view-source (Swagger UI, ReDoc, Stoplight Elements, Scalar, RapiDoc — see `references/discovery.md` for the patterns). See `references/case-study-hetzner-openapi.md` for a worked example.
+For archetype 4 (OpenAPI-only), the discovery cascade is implemented in `openapi-harvest fetch`. Three steps, in order: direct fetch → renderer-config extraction from HTML view-source (Swagger UI, ReDoc, Stoplight Elements, Scalar, RapiDoc — see `references/discovery.md` for the patterns) → common spec paths against the origin (`/openapi.json`, `/openapi.yaml`, `/swagger.json`, `/v3/api-docs`, `/api-docs`, `/api/v1/openapi.json`, `/spec.json`). If all three fail, `fetch` exits 1; locating a community mirror is your judgement call, and you then re-run `fetch` against the mirror URL. See `references/case-study-hetzner-openapi.md` for a worked example.
 
 **Handling the partial-URL case.** If the user gave `site.com/ru/integration-registration`:
 - Fetch the page itself *and* the section root (`site.com/ru/`) *and* the docs root (`site.com/`).

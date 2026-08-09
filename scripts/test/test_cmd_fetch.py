@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import stat
 from pathlib import Path
 
 import httpx
@@ -230,25 +231,21 @@ def test_fetch_local_path_skips_allow_host(tmp_path: Path, fixtures_dir: Path):
 def test_staleness_only_allows_api_github_com():
     """B2: the staleness check function constructs a URL that always targets
     api.github.com — never user-controllable."""
-    import httpx as _httpx
-
     captured_urls: list[str] = []
 
-    def handler(req: _httpx.Request) -> _httpx.Response:
+    def handler(req: httpx.Request) -> httpx.Response:
         captured_urls.append(str(req.url))
-        return _httpx.Response(
+        return httpx.Response(
             200,
             json=[{"commit": {"committer": {"date": "2026-04-01T00:00:00Z"}}}],
         )
 
-    transport = _httpx.MockTransport(handler)
-    with _httpx.Client(transport=transport, trust_env=False) as client:
-        cmd_fetch._check_staleness(
-            "https://raw.githubusercontent.com/owner/repo/main/openapi.json",
-            days=1,
-            client=client,
-            log=lambda m: None,
-        )
+    cmd_fetch._check_staleness(
+        "https://raw.githubusercontent.com/owner/repo/main/openapi.json",
+        days=1,
+        log=lambda m: None,
+        transport=httpx.MockTransport(handler),
+    )
     assert captured_urls
     for url in captured_urls:
         host = re.match(r"https://([^/]+)/", url).group(1)
@@ -428,16 +425,64 @@ def test_source_map_json_pointers_correct(tmp_path: Path):
 def test_spec_url_credentials_are_redacted_at_the_source(tmp_path: Path):
     """The spec URL is copied into source-map.json, every `<!-- source: -->`
     comment in docs.md, handoff.json, and every probe fixture. Redacting it
-    once here closes all of those paths at the same time."""
-    source_map = cmd_fetch._build_source_map(
-        {"paths": {}},
-        spec_url="https://specs.example.com/openapi.json?api_key=SUPERSECRET&page=2",
-        sha256="abc",
-    )
-    assert "SUPERSECRET" not in json.dumps(source_map)
+    once here closes all of those paths at the same time.
+
+    A8 added a second spelling, `fetch_url`, holding the URL verbatim so the
+    audit trail names something re-fetchable. This asserts the boundary rather
+    than "the credential is absent": `fetch_url` is the *only* key that may
+    carry it.
+    """
+    raw = "https://specs.example.com/openapi.json?api_key=SUPERSECRET&page=2"
+    source_map = cmd_fetch._build_source_map({"paths": {}}, spec_url=raw, sha256="abc")
+
     assert source_map["spec_url"] == (
         "https://specs.example.com/openapi.json?api_key=<redacted>&page=2"
     )
+    assert source_map["fetch_url"] == raw
+
+    others = {k: v for k, v in source_map.items() if k != "fetch_url"}
+    assert "SUPERSECRET" not in json.dumps(others)
+
+
+def test_local_file_harvest_records_no_fetch_url(tmp_path: Path, fixtures_dir: Path):
+    """There is no URL to re-fetch for `fetch ./spec.json`, so the credential-
+    bearing key must simply be absent rather than present-and-null."""
+    spec_path = tmp_path / "in.json"
+    spec_path.write_text((fixtures_dir / "tiny-openapi-3.json").read_text())
+    ws = tmp_path / "ws"
+    assert cmd_fetch.run(_make_args(source=str(spec_path), workspace=str(ws))) == 0
+
+    source_map = json.loads((ws / "raw" / "source-map.json").read_text())
+    assert "fetch_url" not in source_map
+    assert source_map["spec_url"] is None
+
+
+def test_source_map_is_written_owner_readable_only(tmp_path: Path):
+    """A8 put a live credential in a file that never held one before, so the
+    file is created 0o600 — and stays 0o600 when `fetch` overwrites a
+    world-readable source map left by an older run, where `O_CREAT`'s mode
+    argument is ignored."""
+    spec = {"openapi": "3.0.0", "info": {"title": "t"}, "paths": {}}
+    fetch_source = "https://api.example.com/openapi.json?key=petstore"
+    transport = _transport(
+        {
+            fetch_source: httpx.Response(
+                200,
+                content=json.dumps(spec).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+        }
+    )
+    ws = tmp_path / "ws"
+    args = _make_args(source=fetch_source, workspace=str(ws), allow_host=["api.example.com"])
+    assert cmd_fetch.run(args, transport=transport) == 0
+
+    map_path = ws / "raw" / "source-map.json"
+    assert stat.S_IMODE(map_path.stat().st_mode) == 0o600
+
+    map_path.chmod(0o644)
+    assert cmd_fetch.run(args, transport=transport) == 0
+    assert stat.S_IMODE(map_path.stat().st_mode) == 0o600
 
 
 def test_recorded_spec_hash_matches_the_written_file(tmp_path: Path, fixtures_dir: Path):
@@ -479,6 +524,92 @@ def test_discovery_probes_do_not_inherit_the_download_timeout(tmp_path: Path):
     assert {t for _u, t in probes} == {cmd_fetch.DISCOVERY_PROBE_TIMEOUT}
 
 
+@pytest.mark.parametrize("bad", [0, 0.0, -1.0])
+def test_non_positive_timeout_is_reported_as_a_config_error(tmp_path: Path, capsys, bad):
+    """A10: `min(--timeout, DISCOVERY_PROBE_TIMEOUT)` forwarded the degenerate
+    value to httpx, which raises before issuing anything, and `_discover`
+    swallowed it once per candidate. All seven probes were skipped and `fetch`
+    reported "could not discover an OpenAPI spec" — a network-shaped message
+    for a config mistake. Reject it where the cause is still visible."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(404, text="")
+
+    args = _make_args(workspace=str(tmp_path), timeout=bad)
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 1
+    err = capsys.readouterr().err
+    assert "--timeout" in err
+    assert "could not discover" not in err
+    # And nothing was attempted: this is rejected before any client is built.
+    assert calls == []
+
+
+def test_a_request_that_cannot_be_issued_is_not_reported_as_a_404(
+    tmp_path: Path, capsys
+):
+    """B5/A10 second half: the probe loop must tell "this candidate 404'd"
+    apart from "the request could not be issued at all". httpx raises
+    ValueError (not a RequestError) for a timeout out of range; swallowing it
+    per candidate is what turned a config mistake into "could not discover"."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise ValueError("Timeout value out of range")
+
+    args = _make_args(source="https://api.example.com/docs", workspace=str(tmp_path))
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 1
+    err = capsys.readouterr().err
+    assert "could not issue" in err
+    assert "could not discover" not in err
+
+
+def test_an_unreachable_origin_still_falls_through_to_common_paths(
+    tmp_path: Path, fixtures_dir: Path
+):
+    """The other half of the same distinction: a genuine network failure on
+    the URL the user named is *not* fatal — the origin may still serve a spec
+    at one of the common paths."""
+    spec_text = (fixtures_dir / "tiny-openapi-3.json").read_text()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/docs":
+            raise httpx.ConnectError("refused", request=request)
+        if request.url.path == "/openapi.json":
+            return httpx.Response(
+                200,
+                content=spec_text.encode(),
+                headers={"Content-Type": "application/json"},
+            )
+        return httpx.Response(404, text="")
+
+    args = _make_args(source="https://api.example.com/docs", workspace=str(tmp_path))
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 0
+    assert json.loads((tmp_path / "raw" / "spec.json").read_text())["info"]["title"] == (
+        "Tiny API"
+    )
+
+
+def test_common_path_probes_cannot_leave_the_origin(tmp_path: Path):
+    """The speculative probes run under a narrowed client: same-origin only,
+    even when --allow-host names more hosts. They get a short leash on reach
+    for the same reason they get one on time."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(404, text="")
+
+    args = _make_args(
+        source="https://docs.example.com/api/",
+        workspace=str(tmp_path),
+        allow_host=["docs.example.com", "api.example.com"],
+    )
+    assert cmd_fetch.run(args, transport=httpx.MockTransport(handler)) == 1
+    hosts = {httpx.URL(u).host for u in seen}
+    assert hosts == {"docs.example.com"}
+
+
 def test_discovery_probe_timeout_never_exceeds_the_user_timeout(tmp_path: Path):
     """A --timeout tighter than the clamp wins; the clamp is a ceiling."""
     seen: list[float | None] = []
@@ -492,3 +623,109 @@ def test_discovery_probe_timeout_never_exceeds_the_user_timeout(tmp_path: Path):
     )
     cmd_fetch.run(args, transport=httpx.MockTransport(handler))
     assert set(seen[1:]) == {1.0}
+
+
+# --------------------------------------------------------------------------
+# Slug migration
+#
+# The workspace slug changed from the bare hostname to a project-identifying
+# one. Old harvests are still on disk, but nothing looks for them under the new
+# name, so a user with a cached harvest would silently get a fresh one.
+# --------------------------------------------------------------------------
+
+
+_MIGRATION_SOURCE = "https://raw.githubusercontent.com/acme/widgets/main/openapi.json"
+
+
+def _migration_args(fixtures_dir: Path):
+    return _make_args(
+        source=_MIGRATION_SOURCE,
+        allow_host=["raw.githubusercontent.com"],
+        workspace=None,
+        quiet=False,
+    )
+
+
+def _spec_transport(fixtures_dir: Path):
+    return _transport(
+        {
+            _MIGRATION_SOURCE: httpx.Response(
+                200,
+                content=(fixtures_dir / "tiny-openapi-3.json").read_bytes(),
+                headers={"Content-Type": "application/json"},
+            )
+        }
+    )
+
+
+def test_fetch_names_both_paths_when_an_old_slug_workspace_exists(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from skill_from_docs import _slug
+
+    old = Path(_slug.legacy_workspace(_MIGRATION_SOURCE))
+    old.mkdir(parents=True)
+    (old / "docs.md").write_text("previous harvest")
+    new = Path(_slug.default_workspace(_MIGRATION_SOURCE))
+    assert old != new
+
+    rc = cmd_fetch.run(
+        _migration_args(fixtures_dir), transport=_spec_transport(fixtures_dir)
+    )
+    assert rc == 0
+
+    err = capsys.readouterr().err
+    assert str(old) in err
+    assert str(new) in err
+    assert "--workspace" in err
+
+    # Named, never moved. Both directories are intact and the old one is whole.
+    assert (old / "docs.md").read_text() == "previous harvest"
+    assert (new / "raw" / "spec.json").exists()
+
+
+def test_fetch_is_silent_when_there_is_no_old_workspace(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    rc = cmd_fetch.run(
+        _migration_args(fixtures_dir), transport=_spec_transport(fixtures_dir)
+    )
+    assert rc == 0
+    assert "NOTICE" not in capsys.readouterr().err
+
+
+def test_fetch_workspace_slug_distinguishes_owners(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch
+):
+    """Two repos with the same name under different owners are two workspaces."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from skill_from_docs import _slug
+
+    a = "https://raw.githubusercontent.com/OwnerA/agent-tools/main/openapi.json"
+    b = "https://raw.githubusercontent.com/OwnerB/agent-tools/main/openapi.json"
+    spec = (fixtures_dir / "tiny-openapi-3.json").read_bytes()
+    for source in (a, b):
+        args = _make_args(
+            source=source, allow_host=["raw.githubusercontent.com"], workspace=None
+        )
+        rc = cmd_fetch.run(
+            args,
+            transport=_transport(
+                {
+                    source: httpx.Response(
+                        200, content=spec, headers={"Content-Type": "application/json"}
+                    )
+                }
+            ),
+        )
+        assert rc == 0
+
+    assert _slug.default_workspace(a) != _slug.default_workspace(b)
+    roots = sorted(p.name for p in (tmp_path / ".claude" / "skill-from-docs").iterdir())
+    assert len(roots) == 2
+    for name in roots:
+        assert (
+            tmp_path / ".claude" / "skill-from-docs" / name / "raw" / "spec.json"
+        ).exists()

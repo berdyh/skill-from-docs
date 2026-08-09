@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import __version__
+from ._io import write_json
 from ._redaction import redact_url
 
 
@@ -19,6 +20,13 @@ def _redact_recursive(value: Any) -> Any:
     """Walk a JSON-like value and apply redact_url to any string that looks
     like an http(s) URL with sensitive query params. Used so manifest entries
     never persist raw credential-bearing URLs to disk. (B1)
+
+    This is unconditional, and `manifest.json` is therefore **not** where A8's
+    fetchable spec URL lives — that is `raw/source-map.json`'s `fetch_url`.
+    Putting it here would need an exemption from this walk, which is the
+    per-call-site judgement §D2 rejected a write-boundary choke point for
+    reintroducing; the manifest is also read-modify-written on every run, where
+    the source map is written once. Do not add one.
     """
     if isinstance(value, dict):
         return {k: _redact_recursive(v) for k, v in value.items()}
@@ -59,11 +67,16 @@ def load_manifest(workspace: str) -> dict[str, Any]:
 
 
 def write_manifest(workspace: str, data: dict[str, Any]) -> None:
+    """Replace `manifest.json` atomically.
+
+    `record_run` reads-modifies-writes this file on every subcommand, so it is
+    the one artifact an interrupt could truncate into a state `verify_hashes`
+    reports as a corrupt workspace. `_io.write_text` swaps it in with
+    `os.replace`, so a reader sees either the previous run's manifest or this
+    one.
+    """
     os.makedirs(workspace, exist_ok=True)
-    path = manifest_path(workspace)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=False)
-        f.write("\n")
+    write_json(manifest_path(workspace), data)
 
 
 def record_run(
