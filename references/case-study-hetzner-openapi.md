@@ -115,7 +115,9 @@ This is where the tool stops and you start. There is no fourth cascade step; not
 https://raw.githubusercontent.com/MaximilianKoestler/hcloud-openapi/main/openapi/hcloud.json
 ```
 
-This is the spec the harvest uses. Mark it as `mirror: unofficial` in every provenance comment downstream — `skill-creator`'s verifier applies stricter trust to first-party spec sources than to community mirrors, and the label is what drives that decision. **That marking is yours to do.** `mirror` is a field the provenance parser and emitter both support, but `consolidate` does not set it from a spec harvest: it has no way to know the source is a mirror. If the distinction matters for a workspace, add the field to the emitted comments deliberately.
+This is the spec the harvest uses, and `consolidate` marks it as `mirror: unofficial` in every spec-source provenance comment **automatically** — `skill-creator`'s verifier applies stricter trust to first-party spec sources than to community mirrors, and the label is what drives that decision.
+
+The rule is mechanical: the spec came from `raw.githubusercontent.com`, while the spec's own `servers` block declares `api.hetzner.cloud`, so the two differ and the label is stamped. It is a statement of fact rather than a verdict on the maintainer — a vendor publishing its own spec to GitHub trips the same rule, because from here the two are indistinguishable. Read it as "verify this source". When either host is unknown (a local spec, or a spec with no absolute `servers` entry) the label is omitted, so its absence is not a claim of first-party provenance either.
 
 The mirror staleness check runs automatically. `openapi-harvest fetch` recognizes the `raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>` shape, calls the GitHub commits API for the file path on `main`, and warns on stderr if the most recent commit is older than `--staleness-days` (default 90):
 
