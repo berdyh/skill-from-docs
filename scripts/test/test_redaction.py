@@ -397,3 +397,35 @@ def test_header_only_sensitivity_does_not_leak_into_query_keys():
     # reconciliation this guard sits on top of is gone.
     for spelling in ("authorization", "x-api-key", "api-key", "x-auth-token"):
         assert _normalize_key(spelling) in SENSITIVE_QUERY_KEYS
+
+
+def test_a_body_that_stayed_a_string_is_still_redacted_by_key():
+    """Key-based redaction only reaches values found by walking a dict, so a
+    response body that is form-encoded or plain text never entered that walk.
+
+    `probe`/`auth --scope auth-discovery` exist to interrogate a live API's
+    authentication, which is exactly the endpoint class that answers with a
+    form-encoded token payload or a plain-text error quoting the credential —
+    and the fixture is written at 0644 with a CLI promise that it is redacted.
+    Recurring failure mode 2, after JSON bodies, form-encoded bodies and a
+    base64 blob landing in a dict key.
+    """
+    form = "access_token=SUPERSECRETTOKEN123&token_type=bearer&expires_in=3600"
+    out = redact_body(form)
+    assert "SUPERSECRETTOKEN123" not in out
+    assert "token_type=bearer" in out, "only sensitive keys should be redacted"
+
+    plain = "error: internal debug token=REALSECRETVALUE99 rejected"
+    assert "REALSECRETVALUE99" not in redact_body(plain)
+
+    nested = {"detail": "retry with api_key=LEAKED", "region": "eu-central"}
+    cleaned = redact_body(nested)
+    assert "LEAKED" not in cleaned["detail"]
+    assert cleaned["region"] == "eu-central"
+
+    # Ordinary text must survive untouched, or every fixture becomes unreadable.
+    benign = "region=eu-central&sort=name&page=2"
+    assert redact_body(benign) == benign
+
+    for case in (form, plain, benign):
+        assert redact_body(redact_body(case)) == redact_body(case)

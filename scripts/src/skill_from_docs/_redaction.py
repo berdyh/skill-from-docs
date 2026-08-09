@@ -187,16 +187,36 @@ def _redact_url_fallback(url: str) -> str:
         return f"{m.group(1)}{REDACTED}@"
 
     out = _FALLBACK_USERINFO_RE.sub(_redact_userinfo, url, count=1)
+    return redact_kv_in_text(out)
+
+
+def redact_kv_in_text(text: str) -> str:
+    """Redact `key=value` pairs anywhere in raw text, by key name.
+
+    Two callers with the same need: a URL `urlparse` could not parse (where
+    there is no query component to isolate), and a request/response body that
+    stayed a **string** instead of becoming a dict — form-encoded or plain
+    text. Key-based redaction only reaches values reached by walking a dict, so
+    without this a form-encoded token response is written to a fixture verbatim.
+
+    Only keys normalizing into `SENSITIVE_QUERY_KEYS` are redacted, so ordinary
+    `region=eu-central` text survives untouched.
+
+    Idempotent: the value pattern matches the literal `<redacted>` sentinel
+    whole. Without that alternative `[^&\\s"'<>\\\\]*` would stop at the leading
+    `<`, leave a one-character-short match, and a second pass would append a
+    second sentinel.
+    """
 
     def _redact_kv(m: re.Match[str]) -> str:
-        # Working from raw text here (no `parse_qsl` to decode for us), so
-        # decode before the sensitivity check — same reasoning as the
-        # parseable path's `?%74oken=x`.
+        # Working from raw text (no `parse_qsl` to decode for us), so decode
+        # before the sensitivity check — same reasoning as the parseable path's
+        # `?%74oken=x`.
         if _is_sensitive_query_key(unquote(m.group("key"))):
             return f"{m.group('key')}={REDACTED}"
         return m.group(0)
 
-    return _FALLBACK_KV_RE.sub(_redact_kv, out)
+    return _FALLBACK_KV_RE.sub(_redact_kv, text)
 
 
 def redact_url(url: str) -> str:
@@ -315,7 +335,19 @@ def redact_body(
         if isinstance(value, list):
             return [_walk(v) for v in value]
         if isinstance(value, str):
-            text = value
+            # Key-based redaction only reaches values reached by walking a dict.
+            # A body that stayed a string never enters that walk, so
+            # `access_token=REAL` in a form-encoded or plain-text **response**
+            # was written to a probe fixture verbatim: the request path
+            # structures its body first (`cmd_probe._decode_request_body`), the
+            # response path only got structure when the payload happened to be
+            # JSON. Recurring failure mode 2, the fourth time.
+            #
+            # So redact `key=value` inside the text as well. Only keys in
+            # SENSITIVE_QUERY_KEYS match, so an ordinary `region=eu` is
+            # untouched, and URLs embedded in the text go through `redact_text`
+            # for the same reason exception messages do.
+            text = redact_kv_in_text(redact_text(value))
             for pat in patterns:
                 text = pat.sub(REDACTED, text)
             return text
