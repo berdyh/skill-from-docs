@@ -255,3 +255,63 @@ def test_slug_is_deterministic_across_processes():
             ).stdout.strip()
         )
     assert len(outputs) == 1, outputs
+
+
+# --------------------------------------------------------------------------
+# Migration notice
+# --------------------------------------------------------------------------
+
+
+def test_old_slug_collided_on_the_bare_host():
+    """Pin what the bug was, so the notice path keeps pointing somewhere real."""
+    assert _slug.legacy_slug_from_url(AGENT_TOOLS_A) == "raw.githubusercontent.com"
+    assert _slug.legacy_slug_from_url(AGENT_TOOLS_A) == _slug.legacy_slug_from_url(
+        AGENT_TOOLS_B
+    )
+
+
+def test_legacy_notice_names_both_paths_when_only_the_old_one_exists(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    old = Path(_slug.legacy_workspace(AGENT_TOOLS_A))
+    old.mkdir(parents=True)
+
+    notice = _slug.legacy_workspace_notice(AGENT_TOOLS_A)
+    assert notice is not None
+    assert str(old) in notice
+    assert _slug.default_workspace(AGENT_TOOLS_A) in notice
+    assert "--workspace" in notice
+
+
+def test_legacy_notice_does_not_move_anything(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    old = Path(_slug.legacy_workspace(AGENT_TOOLS_A))
+    old.mkdir(parents=True)
+    (old / "docs.md").write_text("harvested")
+
+    _slug.legacy_workspace_notice(AGENT_TOOLS_A)
+
+    assert (old / "docs.md").read_text() == "harvested"
+    assert not Path(_slug.default_workspace(AGENT_TOOLS_A)).exists()
+
+
+def test_no_legacy_notice_when_the_new_workspace_exists(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    Path(_slug.legacy_workspace(AGENT_TOOLS_A)).mkdir(parents=True)
+    Path(_slug.default_workspace(AGENT_TOOLS_A)).mkdir(parents=True)
+    assert _slug.legacy_workspace_notice(AGENT_TOOLS_A) is None
+
+
+def test_no_legacy_notice_when_nothing_was_harvested(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert _slug.legacy_workspace_notice(AGENT_TOOLS_A) is None
+
+
+def test_no_legacy_notice_when_the_slug_did_not_change(tmp_path: Path, monkeypatch):
+    """A bare host URL slugs the same under both rules; there is nothing to say."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    source = "https://example.com"
+    assert _slug.slug_from_url(source) == _slug.legacy_slug_from_url(source)
+    Path(_slug.default_workspace(source)).mkdir(parents=True)
+    assert _slug.legacy_workspace_notice(source) is None

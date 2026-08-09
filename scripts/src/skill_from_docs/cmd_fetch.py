@@ -25,7 +25,7 @@ from ._io import write_text
 from ._manifest import file_entry, now_iso, record_run, sha256_bytes
 from ._redaction import redact_url
 from ._schema import FETCH_URL_KEY, write_source_map
-from ._slug import default_workspace
+from ._slug import default_workspace, legacy_workspace_notice
 from ._spec import count_operations, iter_operations, json_pointer
 
 
@@ -690,7 +690,17 @@ def run(args, *, log=None, transport=None) -> int:
     if not require_positive_timeout(args.timeout, subcommand="fetch"):
         return 1
 
-    workspace = args.workspace or default_workspace(args.source)
+    workspace = args.workspace
+    if not workspace:
+        workspace = default_workspace(args.source)
+        # The slug changed from "bare hostname" to a project-identifying one.
+        # An older harvest is still on disk under the old name, but nothing
+        # looks there any more, so say so before writing a second copy. Checked
+        # before makedirs, which would otherwise create the new path and hide
+        # the mismatch.
+        notice = legacy_workspace_notice(args.source)
+        if notice:
+            print(notice, file=sys.stderr)
     os.makedirs(workspace, exist_ok=True)
     os.makedirs(os.path.join(workspace, "raw"), exist_ok=True)
     allowlist = HostAllowlist(args.allow_host)

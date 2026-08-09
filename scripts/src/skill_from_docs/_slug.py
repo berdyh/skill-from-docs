@@ -31,8 +31,11 @@ from urllib.parse import unquote, urlparse
 
 __all__ = [
     "slug_from_url",
+    "legacy_slug_from_url",
     "workspace_root",
     "default_workspace",
+    "legacy_workspace",
+    "legacy_workspace_notice",
 ]
 
 
@@ -180,6 +183,25 @@ def slug_from_url(source: str) -> str:
     return _finalize(segments[-1] if segments else "")
 
 
+def legacy_slug_from_url(source: str) -> str:
+    """The pre-disambiguation slug: bare hostname, or the basename stem.
+
+    Kept only so :func:`legacy_workspace_notice` can point a user at a harvest
+    made before the slug changed. Nothing else should call this.
+    """
+    parsed = urlparse(source)
+    if parsed.scheme in ("http", "https") and parsed.netloc:
+        host = parsed.netloc.split("@")[-1]
+        host = host.split(":")[0]
+        return re.sub(r"[^a-zA-Z0-9._-]+", "-", host).strip("-")
+
+    if source == "@-":
+        return "stdin"
+    base = os.path.basename(source) or "workspace"
+    stem = os.path.splitext(base)[0]
+    return re.sub(r"[^a-zA-Z0-9._-]+", "-", stem).strip("-") or "workspace"
+
+
 def workspace_root() -> str:
     """The canonical parent directory every workspace lives under."""
     return os.path.join(os.path.expanduser("~"), ".claude", "skill-from-docs")
@@ -188,3 +210,34 @@ def workspace_root() -> str:
 def default_workspace(source: str) -> str:
     """Return the default workspace path for a given source URL/path."""
     return os.path.join(workspace_root(), slug_from_url(source))
+
+
+def legacy_workspace(source: str) -> str:
+    """Where a pre-disambiguation harvest of `source` would have been written."""
+    return os.path.join(workspace_root(), legacy_slug_from_url(source))
+
+
+def legacy_workspace_notice(source: str) -> str | None:
+    """Explain a slug-change miss, or return None when there is nothing to say.
+
+    A harvest made before the slug changed still sits on disk under the bare
+    hostname, but cache detection looks up by the new slug and will not find
+    it — so a user with an existing harvest would silently get a fresh one.
+    This names both paths. It deliberately does **not** move anything:
+    relocating a user's directory without asking is not ours to do.
+    """
+    new = default_workspace(source)
+    old = legacy_workspace(source)
+    if os.path.abspath(new) == os.path.abspath(old):
+        return None
+    if os.path.isdir(new) or not os.path.isdir(old):
+        return None
+    return (
+        "NOTICE: the workspace slug now identifies the project, not just the "
+        "host.\n"
+        f"  this run writes to: {new}\n"
+        f"  an older harvest is intact at: {old}\n"
+        "Nothing was moved or deleted. To re-use the older harvest, either move "
+        "that directory to the new path yourself, or pass "
+        f"`--workspace {old}`."
+    )

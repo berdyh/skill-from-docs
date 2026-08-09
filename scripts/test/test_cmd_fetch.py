@@ -625,6 +625,77 @@ def test_discovery_probe_timeout_never_exceeds_the_user_timeout(tmp_path: Path):
     assert set(seen[1:]) == {1.0}
 
 
+# --------------------------------------------------------------------------
+# Slug migration
+#
+# The workspace slug changed from the bare hostname to a project-identifying
+# one. Old harvests are still on disk, but nothing looks for them under the new
+# name, so a user with a cached harvest would silently get a fresh one.
+# --------------------------------------------------------------------------
+
+
+_MIGRATION_SOURCE = "https://raw.githubusercontent.com/acme/widgets/main/openapi.json"
+
+
+def _migration_args(fixtures_dir: Path):
+    return _make_args(
+        source=_MIGRATION_SOURCE,
+        allow_host=["raw.githubusercontent.com"],
+        workspace=None,
+        quiet=False,
+    )
+
+
+def _spec_transport(fixtures_dir: Path):
+    return _transport(
+        {
+            _MIGRATION_SOURCE: httpx.Response(
+                200,
+                content=(fixtures_dir / "tiny-openapi-3.json").read_bytes(),
+                headers={"Content-Type": "application/json"},
+            )
+        }
+    )
+
+
+def test_fetch_names_both_paths_when_an_old_slug_workspace_exists(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from skill_from_docs import _slug
+
+    old = Path(_slug.legacy_workspace(_MIGRATION_SOURCE))
+    old.mkdir(parents=True)
+    (old / "docs.md").write_text("previous harvest")
+    new = Path(_slug.default_workspace(_MIGRATION_SOURCE))
+    assert old != new
+
+    rc = cmd_fetch.run(
+        _migration_args(fixtures_dir), transport=_spec_transport(fixtures_dir)
+    )
+    assert rc == 0
+
+    err = capsys.readouterr().err
+    assert str(old) in err
+    assert str(new) in err
+    assert "--workspace" in err
+
+    # Named, never moved. Both directories are intact and the old one is whole.
+    assert (old / "docs.md").read_text() == "previous harvest"
+    assert (new / "raw" / "spec.json").exists()
+
+
+def test_fetch_is_silent_when_there_is_no_old_workspace(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    rc = cmd_fetch.run(
+        _migration_args(fixtures_dir), transport=_spec_transport(fixtures_dir)
+    )
+    assert rc == 0
+    assert "NOTICE" not in capsys.readouterr().err
+
+
 def test_fetch_workspace_slug_distinguishes_owners(
     tmp_path: Path, fixtures_dir: Path, monkeypatch
 ):
