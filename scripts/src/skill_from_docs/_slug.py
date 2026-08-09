@@ -24,9 +24,12 @@ its stem and loses its extension.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from urllib.parse import unquote, urlparse
+
+from ._spec import declared_api_hosts
 
 
 __all__ = [
@@ -263,8 +266,18 @@ def find_harvested_workspaces(root: str | None = None) -> list[str]:
     ]
 
 
+def workspace_api_hosts(workspace: str) -> set[str]:
+    """Hosts the workspace's harvested spec says its API lives on."""
+    try:
+        with open(os.path.join(workspace, "raw", "spec.json"), encoding="utf-8") as fh:
+            spec = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    return declared_api_hosts(spec if isinstance(spec, dict) else None)
+
+
 def resolve_existing_workspace(
-    subcommand: str, root: str | None = None
+    subcommand: str, target_url: str | None = None, root: str | None = None
 ) -> tuple[str | None, str]:
     """Pick the harvested workspace a `--workspace`-less run belongs to.
 
@@ -279,7 +292,32 @@ def resolve_existing_workspace(
     root = root or workspace_root()
     candidates = find_harvested_workspaces(root)
     if len(candidates) == 1:
-        return candidates[0], ""
+        only = candidates[0]
+        # One candidate is not the same as the right candidate. Adopting the
+        # only harvest on the machine regardless of what is being probed files
+        # this run's fixtures under an unrelated tool — quieter than the split
+        # workspace it replaced, and harder to notice, because the directory
+        # already looks populated. Refuse when the spec positively describes
+        # different hosts; stay silent when it declares none, since then there
+        # is nothing to contradict.
+        declared = workspace_api_hosts(only)
+        target_host = None
+        if target_url:
+            try:
+                target_host = urlparse(target_url).hostname
+            except ValueError:
+                target_host = None
+        if declared and target_host and target_host.lower() not in declared:
+            return None, (
+                f"ERROR: `{subcommand}` needs a workspace and --workspace was "
+                f"not given. The only harvested workspace is:\n  {only}\n"
+                f"but its spec describes {', '.join(sorted(declared))}, not "
+                f"{target_host}. Writing there would file this run under an "
+                "unrelated harvest.\n"
+                "Pass --workspace DIR with the workspace this run belongs to, "
+                "or run `fetch` for this API first."
+            )
+        return only, ""
     if not candidates:
         return None, (
             f"ERROR: `{subcommand}` needs a workspace and --workspace was not "

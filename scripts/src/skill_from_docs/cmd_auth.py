@@ -536,7 +536,7 @@ def run(args, *, transport=None) -> int:
     # harvested the spec, because the API host and the spec host differ.
     workspace = args.workspace
     if not workspace:
-        workspace, error = resolve_existing_workspace("auth")
+        workspace, error = resolve_existing_workspace("auth", args.endpoint)
         if workspace is None:
             print(error, file=sys.stderr)
             return 1

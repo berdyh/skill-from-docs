@@ -209,7 +209,7 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
             # A dry run writes nothing, so it needs no workspace at all.
             workspace = None
         else:
-            workspace, error = resolve_existing_workspace("probe")
+            workspace, error = resolve_existing_workspace("probe", args.url)
             if workspace is None:
                 print(error, file=sys.stderr)
                 return 1

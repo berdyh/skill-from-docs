@@ -17,6 +17,7 @@ disambiguation does.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -345,13 +346,13 @@ def test_find_harvested_workspaces_on_a_missing_root(tmp_path: Path):
 
 def test_resolve_picks_the_single_harvested_workspace(tmp_path: Path):
     ws = _seed(tmp_path, "raw.githubusercontent.com-acme-widgets")
-    resolved, error = _slug.resolve_existing_workspace("probe", str(tmp_path))
+    resolved, error = _slug.resolve_existing_workspace("probe", root=str(tmp_path))
     assert resolved == str(ws)
     assert error == ""
 
 
 def test_resolve_refuses_when_there_is_nothing_to_adopt(tmp_path: Path):
-    resolved, error = _slug.resolve_existing_workspace("probe", str(tmp_path))
+    resolved, error = _slug.resolve_existing_workspace("probe", root=str(tmp_path))
     assert resolved is None
     assert "--workspace" in error
     assert "fetch" in error
@@ -360,7 +361,55 @@ def test_resolve_refuses_when_there_is_nothing_to_adopt(tmp_path: Path):
 def test_resolve_refuses_and_lists_when_ambiguous(tmp_path: Path):
     a = _seed(tmp_path, "alpha")
     b = _seed(tmp_path, "beta")
-    resolved, error = _slug.resolve_existing_workspace("auth", str(tmp_path))
+    resolved, error = _slug.resolve_existing_workspace("auth", root=str(tmp_path))
     assert resolved is None
     assert str(a) in error and str(b) in error
     assert "--workspace" in error
+
+
+def _harvest(root, name, servers):
+    ws = root / name
+    (ws / "raw").mkdir(parents=True)
+    (ws / "raw" / "spec.json").write_text(
+        json.dumps({"openapi": "3.0.0", "info": {"title": name, "version": "1"},
+                    "servers": [{"url": u} for u in servers], "paths": {}})
+    )
+    return ws
+
+
+def test_the_only_workspace_is_not_automatically_the_right_one(tmp_path: Path):
+    """Adopting the single harvest on the machine regardless of what is being
+    probed files this run's fixtures under an unrelated tool.
+
+    That is quieter than the split workspace it replaced and harder to notice,
+    because the directory already looks populated — `consolidate` then emits a
+    docs.md carrying another API's captures. Refuse when the spec positively
+    describes different hosts.
+    """
+    _harvest(tmp_path, "toolA", ["https://api.toola.com/v1"])
+
+    resolved, error = _slug.resolve_existing_workspace(
+        "probe", "https://api.toolb.com/v1/widgets", root=str(tmp_path)
+    )
+    assert resolved is None
+    assert "api.toola.com" in error and "api.toolb.com" in error
+    assert "--workspace" in error
+
+
+def test_the_only_workspace_is_adopted_when_the_host_matches(tmp_path: Path):
+    ws = _harvest(tmp_path, "toolA", ["https://api.toola.com/v1"])
+    resolved, error = _slug.resolve_existing_workspace(
+        "probe", "https://api.toola.com/v1/widgets", root=str(tmp_path)
+    )
+    assert resolved == str(ws) and error == ""
+
+
+def test_a_spec_declaring_no_host_does_not_veto_adoption(tmp_path: Path):
+    """A relative `servers` entry names no host, so there is nothing to
+    contradict — refusing there would break local-spec harvests, which are the
+    common offline case."""
+    ws = _harvest(tmp_path, "local", ["/v1"])
+    resolved, error = _slug.resolve_existing_workspace(
+        "probe", "https://anything.example/v1/x", root=str(tmp_path)
+    )
+    assert resolved == str(ws) and error == ""
