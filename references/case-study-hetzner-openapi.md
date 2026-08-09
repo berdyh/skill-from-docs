@@ -142,7 +142,7 @@ openapi-harvest fetch \
   --workspace ~/.claude/skill-from-docs/api.hetzner.cloud
 ```
 
-`--workspace` is not optional bookkeeping here. Left off, `fetch` derives the workspace from the *source* host and writes to `~/.claude/skill-from-docs/raw.githubusercontent.com/`, while every later `probe` against `api.hetzner.cloud` derives `~/.claude/skill-from-docs/api.hetzner.cloud/` — two workspaces, and a `consolidate` on either one missing half the harvest. Pin it once and pass the same value everywhere.
+`--workspace` is what makes every later command in this walkthrough point at the same directory. Left off, `fetch` derives one from the *source* URL — `~/.claude/skill-from-docs/raw.githubusercontent.com-maximiliankoestler-hcloud-openapi/`, since the slug identifies the project and not just the host — which is a perfectly good workspace, just not one named after the API you are documenting. `auth` and `probe` would then adopt it (they scan for the workspace holding `raw/spec.json` rather than deriving from `api.hetzner.cloud`), so the harvest no longer splits in two the way it used to. Pinning the name is still worth it: `api.hetzner.cloud` is what you will look for later, and `consolidate`/`validate` need the path spelled out regardless. Pin it once and pass the same value everywhere.
 
 `--allow-host api.github.com` is *not* needed and would not help: the staleness check runs on its own client bound to the commits-API host, and the fetch allowlist neither widens nor restricts it.
 

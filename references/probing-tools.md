@@ -4,22 +4,30 @@ Reference inventory for the `openapi-harvest` console script and its six subcomm
 
 The tool installs once (`pip install -e ~/.claude/skills/skill-from-docs/scripts`) and is invoked from any directory as `openapi-harvest <subcommand> [options]`. All subcommands share a single redaction policy, host-allowlist enforcement, run manifest, error contract, User-Agent, and Python ≥3.10 check.
 
-**How each subcommand finds its workspace differs, and getting it wrong fails silently.** There is no universal positional `WORKSPACE`:
+**How each subcommand finds its workspace differs.** There is no universal positional `WORKSPACE`:
 
 | Subcommand | Workspace comes from |
 |---|---|
-| `fetch`, `auth`, `probe` | derived from the target URL, overridable with `--workspace DIR` |
+| `fetch` | derived from `SOURCE` via the slug rule, overridable with `--workspace DIR` |
+| `auth`, `probe` | the single harvested workspace under `~/.claude/skill-from-docs/`; **never** derived from the target URL. Overridable with `--workspace DIR` |
 | `consolidate`, `validate` | an **optional positional** argument; **defaults to the current directory**, not to any slug path |
 | `quick-diff` | none — it takes two file paths and writes no workspace artifacts |
 
 A bare `openapi-harvest consolidate` after a `fetch` therefore walks `$PWD`, not the workspace `fetch` just wrote, and exits 3 with `no spec at ./raw/spec.json`; a bare `validate` exits 1 on a missing `docs.md`. Always pass the workspace to those two explicitly. See the composition examples below, which all do.
 
-**The derived slug is the bare host, and that is not the convention `SKILL.md` describes.** `_slug.default_workspace` takes the URL's hostname and nothing else — `https://raw.githubusercontent.com/o/r/main/openapi.json` derives `~/.claude/skill-from-docs/raw.githubusercontent.com/`, and `https://api.example.com/v1/locations` derives `~/.claude/skill-from-docs/api.example.com/`. Two consequences that bite in practice:
+**`auth` and `probe` adopt a workspace; they never invent one.** They used to derive it from their own endpoint, and in an archetype-4 harvest the spec host and the live API host are different — the Hetzner walkthrough fetches from `raw.githubusercontent.com` and probes `api.hetzner.cloud`. So `fetch` populated one directory, `probe` silently populated another, and `consolidate` exited 3 on a workspace you had just filled. Now, when `--workspace` is absent, both scan `~/.claude/skill-from-docs/` for workspaces containing `raw/spec.json` — the artifact only a `fetch` creates — and:
 
-1. A spec on a mirror and the live API it describes are **different hosts**, so `fetch` and `probe` land in different workspaces unless you say otherwise. This is the single easiest way to get `consolidate` exiting 3 on a workspace you just populated.
-2. `SKILL.md`'s workspace convention is `<host>-<path-tail>`, chosen so two unrelated tools on the same host do not collide. The CLI does not implement it.
+- exactly one candidate: adopt it (named on stderr unless `--quiet`);
+- none: **exit 1**, telling you to run `fetch` first or pass `--workspace DIR`;
+- more than one: **exit 1**, listing every candidate.
 
-Pass `--workspace` explicitly on every `fetch` / `auth` / `probe` in a multi-host harvest, and use the same value for `consolidate` and `validate`. Every multi-step example in this file does; the one that does not is `fetch --count-endpoints`, which writes nothing worth finding again.
+Both refusals land before any network call, so `auth` in particular never puts a real token on the wire for a run with nowhere to write. A `probe --dry-run` writes nothing and needs no workspace at all.
+
+**The slug identifies the project, not just the host.** `_slug.slug_from_url` is `<host>` plus up to three identifying path segments, lowercased: userinfo, port, query and fragment are dropped (a credential must never reach a directory name), as are VCS ref/view segments (`main`, `master`, `trunk`, `blob`, `raw`, `tree`, `refs`, `heads`, `tags`, GitLab's `-`) and a trailing generic spec filename (`openapi.json`, `swagger.yaml`, `index.html`, `README.md`, ...). So `https://raw.githubusercontent.com/o/r/main/openapi.json` derives `~/.claude/skill-from-docs/raw.githubusercontent.com-o-r/`, and `https://api.example.com/v1/locations` derives `~/.claude/skill-from-docs/api.example.com-v1-locations/`. `SKILL.md` Phase 0.5 spells out the same derivation step by step; there is one rule, in one place.
+
+Workspaces harvested before that rule existed sit under the bare hostname and the new lookup will not find them. `fetch` prints a notice naming both paths when it sees one; nothing is migrated automatically.
+
+Pass `--workspace` explicitly on every `fetch` / `auth` / `probe` in a multi-host harvest anyway, and use the same value for `consolidate` and `validate` — it is the clearest thing to read six months later. Every multi-step example in this file does; the one that does not is `fetch --count-endpoints`, which writes nothing worth finding again.
 
 For the worked walkthrough that exercises every subcommand against a real API, see `case-study-hetzner-openapi.md`.
 

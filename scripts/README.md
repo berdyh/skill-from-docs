@@ -67,18 +67,34 @@ whole workspace corrupt.
 
 ## Workspaces
 
-`fetch`, `auth` and `probe` derive a workspace from their target and take
-`--workspace DIR` to override it. `consolidate` and `validate` take the workspace
-as an **optional positional that defaults to `$PWD`** — there is no universal
-positional `WORKSPACE`, and a bare `openapi-harvest consolidate` after a `fetch`
-walks the current directory and exits 3.
+`fetch` derives a workspace from `SOURCE`. `auth` and `probe` **adopt** one rather
+than deriving it. All three take `--workspace DIR` to override. `consolidate` and
+`validate` take the workspace as an **optional positional that defaults to `$PWD`**
+— there is no universal positional `WORKSPACE`, and a bare
+`openapi-harvest consolidate` after a `fetch` walks the current directory and
+exits 3.
 
-The derived default is the **bare hostname** of the target URL, nothing more:
-`https://raw.githubusercontent.com/o/r/main/openapi.json` derives
-`~/.claude/skill-from-docs/raw.githubusercontent.com/`. In an archetype-4 harvest
-the spec host and the API host usually differ, so `fetch` and `probe` default into
-*different* workspaces. Pass `--workspace` explicitly and use the same value
-everywhere.
+The derived slug is `<host>` plus up to three identifying path segments of the
+URL, lowercased. Userinfo, port, query and fragment are dropped — a credential
+must never reach a directory name — as are VCS ref/view segments (`main`,
+`master`, `blob`, `raw`, `tree`, `refs/heads`, `tags`, GitLab's `-`) and a
+trailing generic spec filename (`openapi.json`, `index.html`, `README.md`, ...).
+So `https://raw.githubusercontent.com/o/r/main/openapi.json` derives
+`~/.claude/skill-from-docs/raw.githubusercontent.com-o-r/`, and two repos sharing
+a name under different owners get different workspaces. Spelling the same URL
+differently (trailing slash, scheme, explicit port, query string, case) gives one
+slug, so cache lookups keep finding the harvest.
+
+In an archetype-4 harvest the spec host and the API host usually differ, which is
+why `auth` and `probe` do not derive: without `--workspace` they take the single
+workspace under `~/.claude/skill-from-docs/` that contains `raw/spec.json`, and
+exit 1 — listing candidates — when there is none or more than one. Passing
+`--workspace` explicitly and using the same value everywhere is still the
+clearest way to run a multi-step harvest.
+
+Workspaces harvested before the slug rule changed sit under the bare hostname.
+They are intact but no longer found by slug; `fetch` names both paths when it
+notices, and migrates nothing.
 
 ## Timeouts
 
