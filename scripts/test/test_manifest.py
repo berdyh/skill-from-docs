@@ -10,7 +10,6 @@ from skill_from_docs._manifest import (
     load_manifest,
     now_iso,
     record_run,
-    superseded_mismatches,
     verify_hashes,
     write_manifest,
 )
@@ -202,72 +201,6 @@ def test_verify_hashes_uses_the_newest_entry_per_path(tmp_path: Path):
 
     target.write_text("tampered\n")
     assert [f for f in verify_hashes(str(ws)) if "docs.md" in f]
-
-
-def test_an_appended_run_hides_an_edit_from_verify_hashes_but_not_from_the_audit(tmp_path: Path):
-    """A9: newest-wins means a file can be edited and then re-attested.
-
-    Writing a new digest for a file you just edited satisfies `verify_hashes`
-    completely — that is the price of the newest-wins rule, and it is not being
-    undone here. What must not also be true is that the manifest stops recording
-    the contradiction: the superseded entry is still on disk, and something has
-    to be able to see it.
-    """
-    ws = tmp_path
-    target = ws / "docs.md"
-
-    target.write_text("harvested\n")
-    _record(ws, "docs.md")
-    target.write_text("edited by hand\n")
-    _record(ws, "docs.md")  # the attacker's (or the re-run's) fresh attestation
-
-    assert verify_hashes(str(ws)) == []
-    findings = superseded_mismatches(str(ws))
-    assert [rel for rel, _msg in findings] == ["docs.md"]
-    assert "1 earlier run (consolidate)" in findings[0][1]
-
-
-def test_superseded_mismatches_is_silent_when_the_digest_never_changed(tmp_path: Path):
-    """Two runs over unchanged input record the same digest twice. That is the
-    single most common shape in a real manifest and must produce nothing."""
-    ws = tmp_path
-    (ws / "docs.md").write_text("harvested\n")
-    _record(ws, "docs.md")
-    _record(ws, "docs.md")
-
-    assert superseded_mismatches(str(ws)) == []
-
-
-def test_superseded_mismatches_defers_to_verify_hashes_on_a_live_mismatch(tmp_path: Path):
-    """When the *newest* digest is the one that mismatches, `verify_hashes`
-    already fails the workspace. Reporting the older entries too would print an
-    advisory alongside the error that supersedes it."""
-    ws = tmp_path
-    target = ws / "docs.md"
-
-    target.write_text("first\n")
-    _record(ws, "docs.md")
-    target.write_text("second\n")
-    _record(ws, "docs.md")
-    target.write_text("tampered, and not re-attested\n")
-
-    assert [f for f in verify_hashes(str(ws)) if "hash mismatch" in f]
-    assert superseded_mismatches(str(ws)) == []
-
-
-def test_superseded_mismatches_ignores_a_path_that_is_gone(tmp_path: Path):
-    """A deleted file is `verify_hashes`'s "missing:" failure, not an advisory."""
-    ws = tmp_path
-    target = ws / "docs.md"
-
-    target.write_text("first\n")
-    _record(ws, "docs.md")
-    target.write_text("second\n")
-    _record(ws, "docs.md")
-    target.unlink()
-
-    assert [f for f in verify_hashes(str(ws)) if f.startswith("missing:")]
-    assert superseded_mismatches(str(ws)) == []
 
 
 def test_file_entry_handles_a_relative_workspace(tmp_path: Path, monkeypatch):

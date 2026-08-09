@@ -11,7 +11,7 @@ Effort tags are estimates: **S** ≈ under an hour, **M** ≈ half a day, **L** 
 see §F. §D is decided, and D1 was implemented in the process. What remains is §G:
 four things that are known, bounded and deliberately left, none of which is a defect.
 
-The sweep that closed this list also found **nine defects that were not on it**, six of
+The sweep that closed this list also found **nine defects that were not on it**, seven of
 them introduced by fixes made during the sweep itself. That ratio is the reason §F is
 long: the record of what a fix broke is worth more than the record of what it fixed.
 
@@ -65,7 +65,7 @@ a counterpart introduced a credential-forwarding hole that httpx's own follower 
 have. Removing the capability was the right fix. Ask what a new option obliges you to
 maintain before adding it.
 
-**7. A fix's failure mode is often quieter than the bug's.** Six defects in this sweep
+**7. A fix's failure mode is often quieter than the bug's.** Seven defects in this sweep
 were introduced by its own fixes, and every one was *harder* to notice than what it
 replaced. Reconciling the three credential key sets folded `location` into the query set,
 so `?location=eu-central` — an ordinary parameter, and one this repo's own case study
@@ -78,6 +78,18 @@ exited 3 any more. In each case the test suite was green and the fix was *correc
 was wrong was the blast radius. After fixing something, ask what the new code does on
 inputs the old code never reached, and check that the fix's own tests fail against the
 unfixed source — several here did not.
+
+The sharpest case: A9's superseded-digest warning fired on **every** ordinary
+`consolidate` re-run, because `consolidate` is not byte-deterministic (each `retrieved:`
+timestamp moves) — and `--strict` promoted it to `fail`, breaking the very CI sequence
+that exists to prove the tool works. Its tests passed because they ran inside one clock
+second and never produced a superseded entry. A test whose setup is faster than the
+resolution of the thing it depends on is not testing that thing. It was found by running
+the documented commands by hand *after* the suite and the doc-guards were all green,
+which is the only reason it did not ship.
+
+The sweep also found nine defects on no list, of which seven came from its own fixes;
+the ratio is the argument for reviewing a fix as hostilely as the bug.
 ---
 
 ## A. Defects — none open
@@ -360,7 +372,7 @@ more useful than the fixes.
 |---|---|
 | A7 | `redact_url` no longer returns the URL verbatim when `urlparse` raises. A regex `key=value` fallback redacts sensitive keys and userinfo from the raw string. Failing closed was rejected: it destroys the audit trail for a malformed-but-harmless URL |
 | A8 | The display/fetchable split. `raw/source-map.json` gained `fetch_url` at mode `0o600`; `read_source_map` **strips** it, so `consolidate`/`probe` cannot leak a value they are never handed. `manifest.json` was rejected as the home — `_redact_recursive` would have needed an exemption, which is the per-call-site judgement §D2 rejected |
-| A9 | Superseded manifest digests are reported as advisory `warnings`, keeping newest-wins for the verdict. Deliberately *not* a `checks` entry with `severity: warn` — that would make `warn` the verdict of every workspace where `consolidate` ran twice, which is the A2 regression below |
+| A9 | **Closed as won't-fix, after building it and finding it does not work.** The proposed fix — report superseded digests as advisory `warnings` — was implemented, then removed. Two independent reasons, both found by executing it: (1) `consolidate` is *not* byte-deterministic across runs, since every `retrieved:` timestamp moves, so an ordinary re-run supersedes the previous digest and the report fired on **every** re-run; under `--strict` that is a `fail`, which broke the documented consolidate → validate → re-consolidate → `validate --strict` sequence CI runs. (2) More fundamentally it carries no information: an older entry mismatching is *exactly* what a legitimate re-run and a tampered file both look like, so there is nothing to discriminate on. The underlying observation stands — `verify_hashes` is newest-wins, so a file can be edited and re-attested by appending a run — but manifest-internal tamper detection cannot work while the manifest lives inside the directory it attests. `test_a_consolidate_rerun_keeps_strict_green_across_a_clock_tick` pins the contract that the attempt broke |
 | A10 | `--timeout <= 0` rejected with exit 1 in `run()`. **The write-up's prescribed fix was wrong**: an argparse `type=` exits 2, colliding with the network code the fix exists to disambiguate, and misses the hand-built `Namespace` path the tests and `SKILL.md` use |
 | A11 | `spec_sha256` prose corrected in both places, including the migration consequence: a workspace fetched by an older version carries a body-hash that reports false drift until re-fetched |
 | A12 | Tests added for the `record_run` guard, the `summary` contract, and the `allow_host` audit records. **Item 1 was half-wrong**: the guard *was* tested, but the test's workspace was a path that never existed, so weakening the guard to `os.path.exists(workspace)` left it green |
@@ -382,6 +394,7 @@ Nine. Six were introduced by the sweep's own fixes, which is failure mode 7.
 |---|---|
 | **`location` folded into `SENSITIVE_QUERY_KEYS`**, so `?location=eu-central` was recorded redacted — the A8 damage pattern, freshly introduced by the key-set reconciliation. The agent's own test had encoded it as intended behaviour | Reading the diff of a *fix*, then executing `redact_url` on an ordinary URL |
 | **`probe`/`auth` adopted the only harvested workspace regardless of what was being probed**, filing one API's fixtures under another's harvest. Quieter than the split-workspace bug it fixed, because the directory already looks populated | Constructing the two-tool case by hand after reading the resolution logic |
+| **A9's own fix broke the documented CI sequence.** The superseded-digest warning fired on every ordinary `consolidate` re-run, and `--strict` promoted it to `fail`. The A9 tests passed only because they ran inside one clock second, so no digest was ever superseded | Running the `cli-contract` sequence by hand with a real clock, after `docs-guard` and the test suite were both green |
 | **`validate` check ids derived from Python's salted `hash()`** — the same file produced `13db`, `48a6`, `4506` on three runs, and `id` is documented as a stable contract | Snapshot-diffing `validate --json` across a refactor; the ids were the only fields that moved between two runs of identical code |
 | **`validate` check 10 keyed on `item["source"]`** while `consolidate` writes `sources` — the check had never fired on any workspace this tool has produced | Executing it against a real `handoff.json` |
 | **`cmd_auth` told users to pass `--no-prefer-header-automatically`**, a flag that has never existed. The first instance of failure mode 1 found in code rather than prose | Grepping every quoted stderr string in the docs against the source |

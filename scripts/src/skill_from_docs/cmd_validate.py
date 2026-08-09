@@ -9,7 +9,7 @@ import os
 from typing import Any
 
 from . import _cli
-from ._manifest import now_iso, record_run, superseded_mismatches, verify_hashes
+from ._manifest import now_iso, record_run, verify_hashes
 from ._http import require_allowlist
 from ._provenance import find_all_provenance
 from ._redaction import redact_text
@@ -383,16 +383,17 @@ def run(args, *, transport=None) -> int:
                 _add_check(checks, f"manifest_hash_{_id_suffix(f)}", False, f)
         else:
             _add_check(checks, "manifest_hash_verify", True, None)
-        # `verify_hashes` deliberately checks only the newest digest per path,
-        # so a file can be edited and re-attested by appending a run. Surfacing
-        # the superseded entries restores the visibility without restoring the
-        # false positive — but it goes in `warnings`, not `checks`, because a
-        # second `consolidate` over a changed spec produces a superseded digest
-        # every time. In `checks` it would make `warn` the verdict of the
-        # ordinary re-run, which is the exact defect the advisory channel exists
-        # to avoid.
-        for rel, message in superseded_mismatches(workspace):
-            _warn(warnings, f"superseded_digest_{rel.replace('/', '_')}", message)
+        # `verify_hashes` deliberately checks only the newest digest per path.
+        # Reporting the superseded entries as well was tried (A9) and removed
+        # after executing it: `consolidate` is not byte-deterministic across
+        # runs — every `retrieved:` timestamp moves — so an ordinary re-run
+        # leaves an older entry whose digest differs from the file, and the
+        # report fired on every one. Under --strict that is a `fail`, which
+        # broke the consolidate → validate → re-consolidate → validate --strict
+        # sequence CI runs. It also could not have worked: an older entry
+        # mismatching is exactly what a legitimate re-run and a tampered file
+        # both look like, so the signal carries no information. Read DEFERRED.md
+        # §F before re-proposing it.
     else:
         _add_check(checks, "manifest_exists", False, "manifest.json missing")
 

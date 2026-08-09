@@ -16,7 +16,6 @@ import httpx
 from conftest import make_mock_transport
 
 from skill_from_docs import cmd_consolidate, cmd_fetch, cmd_validate
-from skill_from_docs._manifest import file_entry, now_iso, record_run
 
 
 def _validate_args(workspace: str, **overrides):
@@ -280,65 +279,6 @@ def test_orphan_and_missing_target_checks_keep_their_order_and_multiplicity(
     assert ids.index("orphan_capture_raw_extra.json") < ids.index(
         "missing_provenance_target_raw_gone.json"
     )
-
-
-def test_appending_a_run_cannot_hide_an_edit_from_the_report(
-    tmp_path: Path, fixtures_dir: Path, capsys
-):
-    """A9: re-attesting a hand-edited file satisfies the hash check.
-
-    `verify_hashes` compares against the newest recorded digest, so editing
-    `docs.md` and appending a run that records the new digest verifies clean —
-    `manifest_hash_verify` passes and nothing in `checks` says otherwise. The
-    superseded entry is the only remaining trace, so `validate` has to report
-    it or the "complete append-only audit trail" is a claim nothing checks.
-    """
-    ws = _seed_workspace(tmp_path, fixtures_dir)
-    (ws / "docs.md").write_text("# hand-edited\n")
-    record_run(
-        str(ws), subcommand="consolidate", args={}, started_at=now_iso(),
-        finished_at=now_iso(), outputs=[file_entry(str(ws), "docs.md")],
-    )
-
-    rc = cmd_validate.run(_validate_args(str(ws), json_out=True))
-    payload = json.loads(capsys.readouterr().out)
-
-    assert rc == 0
-    assert not [
-        c for c in payload["checks"] if "hash mismatch" in (c["message"] or "")
-    ], "the appended run really does satisfy verify_hashes — that is the premise"
-    assert any(w["id"] == "superseded_digest_docs.md" for w in payload["warnings"])
-
-
-def test_a_legitimate_consolidate_rerun_warns_without_moving_the_verdict(
-    tmp_path: Path, fixtures_dir: Path, capsys
-):
-    """The superseded-digest report must not read as an accusation.
-
-    Two `consolidate` runs over a changed spec legitimately record two different
-    `docs.md` digests — the common case, not an attack. So the finding lives in
-    the advisory `warnings` channel: visible, never verdict-moving, and worded
-    as the expected outcome of a re-run. Putting it in `checks` would make
-    `warn` the verdict of the ordinary re-run, which is the defect the advisory
-    channel exists to avoid.
-    """
-    ws = _seed_workspace(tmp_path, fixtures_dir)
-    spec_path = ws / "raw" / "spec.json"
-    spec = json.loads(spec_path.read_text())
-    spec["info"]["version"] = "2.0.0"
-    spec_path.write_text(json.dumps(spec, indent=2))
-    assert cmd_consolidate.run(_consolidate_args(str(ws))) == 0
-
-    rc = cmd_validate.run(_validate_args(str(ws), json_out=True))
-    payload = json.loads(capsys.readouterr().out)
-
-    assert rc == 0
-    assert payload["verdict"] == "pass"
-    warning = next(
-        w for w in payload["warnings"] if w["id"] == "superseded_digest_docs.md"
-    )
-    assert "normal result of re-running" in warning["message"]
-    assert "hash mismatch" not in warning["message"]
 
 
 def test_local_file_harvest_still_verdicts_pass(tmp_path: Path, fixtures_dir: Path, capsys):
@@ -744,3 +684,42 @@ def test_coverage_checklist_unknown_source_actually_fires(
     # move the non-strict verdict. (The `fail` this workspace does report comes
     # from the manifest digest, because the test rewrote handoff.json.)
     assert not [c for c in payload["checks"] if c["id"] == "coverage_checklist_unknown_source"]
+
+
+def test_a_consolidate_rerun_keeps_strict_green_across_a_clock_tick(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch
+):
+    """The documented CI sequence is consolidate -> validate -> consolidate ->
+    `validate --strict`, and the last step must exit 0.
+
+    `consolidate` is **not** byte-deterministic across runs: every `retrieved:`
+    timestamp moves, so a re-run one second later rewrites 16 lines of docs.md
+    and supersedes the previous digest. A9 added a superseded-digest warning on
+    exactly that condition, which `--strict` promotes to `fail`, so an ordinary
+    re-run broke the contract. It survived review because the A9 tests ran
+    inside a single clock second and never produced a superseded entry.
+
+    Advances the clock rather than sleeping, so this costs no wall time.
+    """
+    ws = tmp_path
+    (ws / "raw").mkdir()
+    (ws / "probes").mkdir()
+    offline = fixtures_dir / "hcloud-offline"
+    for name in ("spec.json", "source-map.json"):
+        shutil.copy(offline / name, ws / "raw" / name)
+    for probe in offline.glob("*-200.json"):
+        shutil.copy(probe, ws / "probes" / probe.name)
+
+    args = _consolidate_args(str(ws), merge_probes=True)
+    cmd_consolidate.run(args)
+    assert cmd_validate.run(_validate_args(str(ws), strict=True)) == 0, (
+        "the seeded workspace must start green, or this pins nothing"
+    )
+
+    monkeypatch.setattr(cmd_consolidate, "now_iso", lambda: "2099-01-01T00:00:00Z")
+    cmd_consolidate.run(args)
+
+    assert "2099-01-01" in (ws / "docs.md").read_text(), "the clock tick must reach docs.md"
+    assert cmd_validate.run(_validate_args(str(ws), strict=True)) == 0, (
+        "a legitimate re-run must not make --strict fail"
+    )
