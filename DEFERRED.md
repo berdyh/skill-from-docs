@@ -11,7 +11,7 @@ Effort tags are estimates: **S** ≈ under an hour, **M** ≈ half a day, **L** 
 see §F. §D is decided, and D1 was implemented in the process. What remains is §G:
 four things that are known, bounded and deliberately left, none of which is a defect.
 
-The sweep that closed this list also found **nine defects that were not on it**, seven of
+The sweep that closed this list also found **eleven defects that were not on it**, seven of
 them introduced by fixes made during the sweep itself. That ratio is the reason §F is
 long: the record of what a fix broke is worth more than the record of what it fixed.
 
@@ -38,7 +38,9 @@ about behaviour as unverified until something runs it.
 **2. Redaction that silently does nothing.** `redact_body` only redacts by key while
 walking a **dict**. Any body left as a string skips key-based redaction entirely — that
 was the JSON request-body leak, then the form-encoded leak, then a padded-base64 blob
-becoming a dict *key* where the pattern pass never looked. Whenever data reaches
+becoming a dict *key* where the pattern pass never looked, and then — after the request
+side had been fixed and its docstring claimed the response side "gets this for free via
+`resp.json()`" — the same leak in every non-JSON *response* body. Whenever data reaches
 `redact_body`, ask what type it actually is at that point.
 
 **3. Credentials travel further than the call that produced them.** `spec_url` was
@@ -88,8 +90,9 @@ resolution of the thing it depends on is not testing that thing. It was found by
 the documented commands by hand *after* the suite and the doc-guards were all green,
 which is the only reason it did not ship.
 
-The sweep also found nine defects on no list, of which seven came from its own fixes;
+The sweep also found eleven defects on no list, of which seven came from its own fixes;
 the ratio is the argument for reviewing a fix as hostilely as the bug.
+
 ---
 
 ## A. Defects — none open
@@ -388,12 +391,17 @@ more useful than the fixes.
 
 ### Defects found by this sweep that were on no list
 
-Nine. Six were introduced by the sweep's own fixes, which is failure mode 7.
+Eleven. Seven were introduced by the sweep's own fixes, which is failure mode 7. The
+last two were found by an adversarial security review run over the finished branch,
+after the suite, the doc-guards and the CI contract were all green — which is the
+argument for running one.
 
 | Defect | How it was found |
 |---|---|
 | **`location` folded into `SENSITIVE_QUERY_KEYS`**, so `?location=eu-central` was recorded redacted — the A8 damage pattern, freshly introduced by the key-set reconciliation. The agent's own test had encoded it as intended behaviour | Reading the diff of a *fix*, then executing `redact_url` on an ordinary URL |
 | **`probe`/`auth` adopted the only harvested workspace regardless of what was being probed**, filing one API's fixtures under another's harvest. Quieter than the split-workspace bug it fixed, because the directory already looks populated | Constructing the two-tool case by hand after reading the resolution logic |
+| **A third-party spec could forge provenance comments and inject agent instructions into `docs.md`.** `sanitize_spec_descriptions` only rewrites values keyed description/summary/title, so a parameter's `name`/`in`, a response status code (a *dict key*, so arbitrary text) and a securityScheme's name/`type`/`scheme` all reached the renderer raw. A backtick plus a newline escapes the inline code span. The neighbouring path/method/tag sites were already sanitized for exactly this reason | A security review of the branch, executing a hostile spec through `consolidate` and parsing the output with `find_all_provenance` |
+| **A response body that stayed a string bypassed key-based redaction**, so a form-encoded `access_token=...` or a plain-text error quoting a credential was written verbatim to `probes/*.json` at 0644 — weaker than the `0o600` the branch gives the one file meant to hold a credential. The request path had already solved this; its docstring claimed the response path "gets this for free via `resp.json()`", true only for JSON payloads | Same review, mocking a form-encoded token response through `probe --scope auth-discovery` |
 | **A9's own fix broke the documented CI sequence.** The superseded-digest warning fired on every ordinary `consolidate` re-run, and `--strict` promoted it to `fail`. The A9 tests passed only because they ran inside one clock second, so no digest was ever superseded | Running the `cli-contract` sequence by hand with a real clock, after `docs-guard` and the test suite were both green |
 | **`validate` check ids derived from Python's salted `hash()`** — the same file produced `13db`, `48a6`, `4506` on three runs, and `id` is documented as a stable contract | Snapshot-diffing `validate --json` across a refactor; the ids were the only fields that moved between two runs of identical code |
 | **`validate` check 10 keyed on `item["source"]`** while `consolidate` writes `sources` — the check had never fired on any workspace this tool has produced | Executing it against a real `handoff.json` |
