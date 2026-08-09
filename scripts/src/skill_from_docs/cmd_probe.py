@@ -34,7 +34,7 @@ from ._schema import (
     ProbeResponse,
     read_source_map,
 )
-from ._slug import default_workspace
+from ._slug import resolve_existing_workspace
 
 
 VALID_SCOPES = ("case-study", "drift-validation", "auth-discovery", "ad-hoc")
@@ -198,10 +198,30 @@ def run(args, *, transport=None, sleeper=time.sleep) -> int:
         print(f"ERROR: can't read --data: {e}", file=sys.stderr)
         return 1
 
-    workspace = args.workspace or default_workspace(args.url)
-    os.makedirs(workspace, exist_ok=True)
-    os.makedirs(os.path.join(workspace, "probes"), exist_ok=True)
-    spec_url, spec_sha = _load_spec_meta(workspace)
+    # `probe` must never derive its workspace from `args.url`. The spec host
+    # and the live API host differ in most archetype-4 harvests, so deriving
+    # sent `fetch` and `probe` to two different directories and `consolidate`
+    # exited 3 on a workspace the user had just populated. Adopt the harvested
+    # workspace or refuse; never guess.
+    workspace: str | None = args.workspace
+    if not workspace:
+        if args.dry_run:
+            # A dry run writes nothing, so it needs no workspace at all.
+            workspace = None
+        else:
+            workspace, error = resolve_existing_workspace("probe")
+            if workspace is None:
+                print(error, file=sys.stderr)
+                return 1
+            if not args.quiet:
+                print(f"using workspace {workspace}", file=sys.stderr)
+
+    spec_url: str | None = None
+    spec_sha: str | None = None
+    if workspace is not None:
+        os.makedirs(workspace, exist_ok=True)
+        os.makedirs(os.path.join(workspace, "probes"), exist_ok=True)
+        spec_url, spec_sha = _load_spec_meta(workspace)
 
     redact_keys = args.redact_body_key
     redact_patterns = compile_patterns(args.redact_body_pattern)

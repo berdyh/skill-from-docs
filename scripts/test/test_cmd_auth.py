@@ -689,3 +689,62 @@ def test_non_positive_timeout_is_a_config_error_not_a_network_one(
     assert cmd_auth.run(args, transport=_make_transport(h)) == 1
     assert "--timeout" in capsys.readouterr().err
     assert calls == []
+
+
+# --------------------------------------------------------------------------
+# Workspace resolution — see the matching block in test_cmd_probe.py.
+# --------------------------------------------------------------------------
+
+
+def _harvested(root: Path, name: str) -> Path:
+    ws = root / ".claude" / "skill-from-docs" / name
+    (ws / "raw").mkdir(parents=True)
+    (ws / "raw" / "spec.json").write_text("{}")
+    return ws
+
+
+def test_auth_without_workspace_writes_into_the_harvested_one(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ws = _harvested(tmp_path, "raw.githubusercontent.com-acme-widgets")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.headers.get("Authorization") == "Bearer real-secret-token":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(401, json={"error": "unauthorized"})
+
+    assert cmd_auth.run(_args(workspace=None), transport=_make_transport(handler)) == 0
+
+    assert (ws / "manifest.json").exists()
+    siblings = sorted(p.name for p in (tmp_path / ".claude" / "skill-from-docs").iterdir())
+    assert siblings == ["raw.githubusercontent.com-acme-widgets"]
+
+
+def test_auth_without_workspace_refuses_before_the_token_goes_anywhere(
+    tmp_path: Path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not reach the network")
+
+    assert cmd_auth.run(_args(workspace=None), transport=_make_transport(handler)) == 1
+    err = capsys.readouterr().err
+    assert "--workspace" in err and "fetch" in err
+    assert not (tmp_path / ".claude" / "skill-from-docs").exists()
+
+
+def test_auth_without_workspace_refuses_when_ambiguous(
+    tmp_path: Path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    a = _harvested(tmp_path, "alpha")
+    b = _harvested(tmp_path, "beta")
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not reach the network")
+
+    assert cmd_auth.run(_args(workspace=None), transport=_make_transport(handler)) == 1
+    err = capsys.readouterr().err
+    assert str(a) in err and str(b) in err

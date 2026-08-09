@@ -24,7 +24,7 @@ from ._manifest import file_entry, now_iso, record_run
 from ._provenance import emit_probe
 from ._redaction import redact_body, redact_headers, redact_text, redact_url
 from ._schema import ProbeFixture, ProbeManifest, ProbeRequest, ProbeResponse
-from ._slug import default_workspace
+from ._slug import resolve_existing_workspace
 
 
 FIXED_BAD_TOKEN = "aaaaaaaa-bad-token-bbbbbbbb"
@@ -531,7 +531,17 @@ def run(args, *, transport=None) -> int:
     if basic_exit != 0:
         return basic_exit
 
-    workspace = args.workspace or default_workspace(args.endpoint)
+    # See `_slug.resolve_existing_workspace`: deriving the workspace from
+    # `args.endpoint` put `auth` in a different directory from the `fetch` that
+    # harvested the spec, because the API host and the spec host differ.
+    workspace = args.workspace
+    if not workspace:
+        workspace, error = resolve_existing_workspace("auth")
+        if workspace is None:
+            print(error, file=sys.stderr)
+            return 1
+        if not args.quiet:
+            print(f"using workspace {workspace}", file=sys.stderr)
     os.makedirs(workspace, exist_ok=True)
     started = now_iso()
 

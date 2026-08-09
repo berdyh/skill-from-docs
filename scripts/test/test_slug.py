@@ -315,3 +315,52 @@ def test_no_legacy_notice_when_the_slug_did_not_change(tmp_path: Path, monkeypat
     assert _slug.slug_from_url(source) == _slug.legacy_slug_from_url(source)
     Path(_slug.default_workspace(source)).mkdir(parents=True)
     assert _slug.legacy_workspace_notice(source) is None
+
+
+# --------------------------------------------------------------------------
+# Workspace discovery
+# --------------------------------------------------------------------------
+
+
+def _seed(root: Path, name: str, *, with_spec: bool = True) -> Path:
+    ws = root / name
+    (ws / "raw").mkdir(parents=True)
+    if with_spec:
+        (ws / "raw" / "spec.json").write_text("{}")
+    return ws
+
+
+def test_find_harvested_workspaces_requires_a_spec(tmp_path: Path):
+    _seed(tmp_path, "with-spec")
+    _seed(tmp_path, "no-spec", with_spec=False)
+    (tmp_path / "loose-file.json").write_text("{}")
+    assert _slug.find_harvested_workspaces(str(tmp_path)) == [
+        str(tmp_path / "with-spec")
+    ]
+
+
+def test_find_harvested_workspaces_on_a_missing_root(tmp_path: Path):
+    assert _slug.find_harvested_workspaces(str(tmp_path / "nope")) == []
+
+
+def test_resolve_picks_the_single_harvested_workspace(tmp_path: Path):
+    ws = _seed(tmp_path, "raw.githubusercontent.com-acme-widgets")
+    resolved, error = _slug.resolve_existing_workspace("probe", str(tmp_path))
+    assert resolved == str(ws)
+    assert error == ""
+
+
+def test_resolve_refuses_when_there_is_nothing_to_adopt(tmp_path: Path):
+    resolved, error = _slug.resolve_existing_workspace("probe", str(tmp_path))
+    assert resolved is None
+    assert "--workspace" in error
+    assert "fetch" in error
+
+
+def test_resolve_refuses_and_lists_when_ambiguous(tmp_path: Path):
+    a = _seed(tmp_path, "alpha")
+    b = _seed(tmp_path, "beta")
+    resolved, error = _slug.resolve_existing_workspace("auth", str(tmp_path))
+    assert resolved is None
+    assert str(a) in error and str(b) in error
+    assert "--workspace" in error

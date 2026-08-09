@@ -36,6 +36,8 @@ __all__ = [
     "default_workspace",
     "legacy_workspace",
     "legacy_workspace_notice",
+    "find_harvested_workspaces",
+    "resolve_existing_workspace",
 ]
 
 
@@ -240,4 +242,58 @@ def legacy_workspace_notice(source: str) -> str | None:
         "Nothing was moved or deleted. To re-use the older harvest, either move "
         "that directory to the new path yourself, or pass "
         f"`--workspace {old}`."
+    )
+
+
+def find_harvested_workspaces(root: str | None = None) -> list[str]:
+    """Return every workspace under `root` that a `fetch` has populated.
+
+    "Populated" means it holds ``raw/spec.json`` — the artifact `consolidate`
+    and `validate` need and the one `probe`/`auth` alone never create.
+    """
+    root = root or workspace_root()
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    return [
+        os.path.join(root, name)
+        for name in names
+        if os.path.isfile(os.path.join(root, name, "raw", "spec.json"))
+    ]
+
+
+def resolve_existing_workspace(
+    subcommand: str, root: str | None = None
+) -> tuple[str | None, str]:
+    """Pick the harvested workspace a `--workspace`-less run belongs to.
+
+    Returns ``(path, "")`` when exactly one candidate exists, else
+    ``(None, message)``. Deriving the workspace from the subcommand's own URL
+    is what used to split a harvest in two: in an archetype-4 run the spec host
+    and the live API host differ, so `fetch` wrote one directory and `probe`
+    another, and `consolidate` then exited 3 on a workspace the user believed
+    they had just populated. Guessing is the bug; there is no third option that
+    both guesses and is safe.
+    """
+    root = root or workspace_root()
+    candidates = find_harvested_workspaces(root)
+    if len(candidates) == 1:
+        return candidates[0], ""
+    if not candidates:
+        return None, (
+            f"ERROR: `{subcommand}` needs a workspace and --workspace was not "
+            f"given. No harvested workspace exists under {root} (a harvested "
+            "workspace contains raw/spec.json).\n"
+            "Run `openapi-harvest fetch <spec-url> --allow-host <host> "
+            "--workspace DIR` first, or pass --workspace DIR here to write into "
+            "a directory of your choosing."
+        )
+    listing = "\n".join(f"  {path}" for path in candidates)
+    return None, (
+        f"ERROR: `{subcommand}` needs a workspace and --workspace was not "
+        f"given. {len(candidates)} harvested workspaces exist and guessing "
+        "between them is how a harvest ends up split across two directories:\n"
+        f"{listing}\n"
+        "Pass --workspace DIR with the one this run belongs to."
     )

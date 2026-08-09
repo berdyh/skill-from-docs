@@ -443,3 +443,79 @@ def test_non_positive_timeout_is_a_config_error_not_a_network_one(
     assert "--timeout" in capsys.readouterr().err
     assert calls == []
     assert not (tmp_path / "probes").exists()
+
+
+# --------------------------------------------------------------------------
+# Workspace resolution
+#
+# `probe` used to derive its workspace from its own `--url`. In an archetype-4
+# harvest the spec host and the live API host differ, so `fetch` populated one
+# directory and `probe` silently created a second one next to it; `consolidate`
+# then exited 3 on a workspace the user believed they had just populated. That
+# is the documented Hetzner walkthrough, and it did not work.
+# --------------------------------------------------------------------------
+
+
+def _harvested(root: Path, name: str) -> Path:
+    ws = root / ".claude" / "skill-from-docs" / name
+    (ws / "raw").mkdir(parents=True)
+    (ws / "raw" / "spec.json").write_text("{}")
+    return ws
+
+
+def test_probe_without_workspace_writes_into_the_harvested_one(
+    tmp_path: Path, monkeypatch
+):
+    """The regression. `--url` names api.example.com; the harvest lives under a
+    raw.githubusercontent.com slug. The fixture must land in the harvest."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ws = _harvested(tmp_path, "raw.githubusercontent.com-acme-widgets")
+
+    args = _args(workspace=None)
+    assert cmd_probe.run(args, transport=_mock(lambda r: httpx.Response(200, json={}))) == 0
+
+    assert len(list((ws / "probes").iterdir())) == 1
+    siblings = sorted(p.name for p in (tmp_path / ".claude" / "skill-from-docs").iterdir())
+    assert siblings == ["raw.githubusercontent.com-acme-widgets"]
+
+
+def test_probe_without_workspace_refuses_when_no_harvest_exists(
+    tmp_path: Path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def h(req):
+        raise AssertionError("must not reach the network")
+
+    assert cmd_probe.run(_args(workspace=None), transport=_mock(h)) == 1
+    err = capsys.readouterr().err
+    assert "--workspace" in err and "fetch" in err
+    assert not (tmp_path / ".claude" / "skill-from-docs").exists()
+
+
+def test_probe_without_workspace_refuses_when_ambiguous(
+    tmp_path: Path, monkeypatch, capsys
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    a = _harvested(tmp_path, "alpha")
+    b = _harvested(tmp_path, "beta")
+
+    def h(req):
+        raise AssertionError("must not reach the network")
+
+    assert cmd_probe.run(_args(workspace=None), transport=_mock(h)) == 1
+    err = capsys.readouterr().err
+    assert str(a) in err and str(b) in err
+    assert not list((a / "probes").iterdir()) if (a / "probes").exists() else True
+
+
+def test_probe_dry_run_needs_no_workspace(tmp_path: Path, monkeypatch, capsys):
+    """A dry run writes nothing, so it must not be gated on a harvest."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def h(req):
+        raise AssertionError("must not reach the network")
+
+    assert cmd_probe.run(_args(workspace=None, dry_run=True), transport=_mock(h)) == 0
+    assert json.loads(capsys.readouterr().out)["dry_run"] is True
+    assert not (tmp_path / ".claude").exists()
