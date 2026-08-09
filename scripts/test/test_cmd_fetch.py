@@ -623,3 +623,38 @@ def test_discovery_probe_timeout_never_exceeds_the_user_timeout(tmp_path: Path):
     )
     cmd_fetch.run(args, transport=httpx.MockTransport(handler))
     assert set(seen[1:]) == {1.0}
+
+
+def test_fetch_workspace_slug_distinguishes_owners(
+    tmp_path: Path, fixtures_dir: Path, monkeypatch
+):
+    """Two repos with the same name under different owners are two workspaces."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    from skill_from_docs import _slug
+
+    a = "https://raw.githubusercontent.com/OwnerA/agent-tools/main/openapi.json"
+    b = "https://raw.githubusercontent.com/OwnerB/agent-tools/main/openapi.json"
+    spec = (fixtures_dir / "tiny-openapi-3.json").read_bytes()
+    for source in (a, b):
+        args = _make_args(
+            source=source, allow_host=["raw.githubusercontent.com"], workspace=None
+        )
+        rc = cmd_fetch.run(
+            args,
+            transport=_transport(
+                {
+                    source: httpx.Response(
+                        200, content=spec, headers={"Content-Type": "application/json"}
+                    )
+                }
+            ),
+        )
+        assert rc == 0
+
+    assert _slug.default_workspace(a) != _slug.default_workspace(b)
+    roots = sorted(p.name for p in (tmp_path / ".claude" / "skill-from-docs").iterdir())
+    assert len(roots) == 2
+    for name in roots:
+        assert (
+            tmp_path / ".claude" / "skill-from-docs" / name / "raw" / "spec.json"
+        ).exists()
