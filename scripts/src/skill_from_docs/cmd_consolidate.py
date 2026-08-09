@@ -305,10 +305,24 @@ def _endpoint_block(
         for p in params:
             if not isinstance(p, dict):
                 continue
-            name = p.get("name", "?")
-            loc = p.get("in", "?")
+            # Every one of these is attacker-controlled: they come out of a
+            # third-party spec. `sanitize_spec_descriptions` only rewrites
+            # values whose *key* is description/summary/title, so it never sees
+            # `name` or `in` — a backtick and a newline in `name` breaks out of
+            # the inline code span below and lets the spec write a forged
+            # `<!-- source: -->` comment plus direct instructions into docs.md,
+            # which is the file another agent reads as ground truth.
+            name = sanitize_text_for_markdown(
+                str(p.get("name", "?")), source_pointer=f"paths/{path}/parameters/name"
+            )
+            loc = sanitize_text_for_markdown(
+                str(p.get("in", "?")), source_pointer=f"paths/{path}/parameters/in"
+            )
             required = " (required)" if p.get("required") else ""
-            desc = p.get("description", "")
+            desc = sanitize_text_for_markdown(
+                str(p.get("description", "")),
+                source_pointer=f"paths/{path}/parameters/{name}/description",
+            )
             lines.append(f"- `{name}` ({loc}){required} — {desc}")
         lines.append("")
 
@@ -319,8 +333,16 @@ def _endpoint_block(
         for code, body in responses.items():
             if not isinstance(body, dict):
                 continue
-            d = body.get("description", "")
-            lines.append(f"- `{code}` — {d}")
+            # The status code is a *dict key* from the spec, so it is arbitrary
+            # attacker-controlled text, not necessarily "200".
+            safe_code = sanitize_text_for_markdown(
+                str(code), source_pointer=f"paths/{path}/responses"
+            )
+            d = sanitize_text_for_markdown(
+                str(body.get("description", "")),
+                source_pointer=f"paths/{path}/responses/{safe_code}/description",
+            )
+            lines.append(f"- `{safe_code}` — {d}")
         lines.append("")
 
     pointer = json_pointer(path, method)
@@ -381,7 +403,20 @@ def _authentication_body(
     for name, scheme in sec.items():
         if not isinstance(scheme, dict):
             continue
-        lines.append(f"- `{name}`: type=`{scheme.get('type')}` scheme=`{scheme.get('scheme')}`")
+        # Scheme name is a spec-supplied dict key; `type`/`scheme` are
+        # spec-supplied values. None of the three is a description, so
+        # `sanitize_spec_descriptions` never touched them.
+        safe_name = sanitize_text_for_markdown(
+            str(name), source_pointer="components/securitySchemes"
+        )
+        safe_type = sanitize_text_for_markdown(
+            str(scheme.get("type")), source_pointer=f"components/securitySchemes/{safe_name}/type"
+        )
+        safe_scheme = sanitize_text_for_markdown(
+            str(scheme.get("scheme")),
+            source_pointer=f"components/securitySchemes/{safe_name}/scheme",
+        )
+        lines.append(f"- `{safe_name}`: type=`{safe_type}` scheme=`{safe_scheme}`")
     lines.append("")
     lines.append(
         emit_source(
